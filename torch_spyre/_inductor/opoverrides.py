@@ -74,6 +74,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.sigmoid({x})"
 
     @staticmethod
+    def softplus(x, y, z):
+        return f"spyre.softplus({x}, {y}, {z})"
+
+    @staticmethod
     def sqrt(x):
         return f"spyre.sqrt({x})"
 

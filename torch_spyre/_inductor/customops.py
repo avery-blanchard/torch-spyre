@@ -73,6 +73,20 @@ def _(input):
     return output
 
 
+@torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
+def softplus(
+    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
+) -> torch.Tensor:
+    pass
+
+
+@softplus.register_fake
+def _(input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0):
+    output = input.new_empty(input.size())
+    output.spyre_layout = output.get_spyre_layout()
+    return output
+
+
 @torch.library.custom_op("spyre::layer_norm", mutates_args=())
 def layer_norm(
     x: torch.Tensor,

@@ -71,3 +71,18 @@ def spyre_gelu(
 
 
 torch.nn.functional.gelu = spyre_gelu
+
+
+orig_softplus = torch.nn.functional.softplus
+
+
+def spyre_softplus(
+    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
+) -> torch.Tensor:
+    if input.device.type == "spyre":
+        return torch.ops.spyre.softplus(input, beta, threshold)
+    else:
+        return orig_softplus(input, beta, threshold)
+
+
+torch.nn.functional.softplus = spyre_softplus

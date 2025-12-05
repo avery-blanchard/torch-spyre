@@ -183,6 +183,7 @@ _meta_ops = {
     aten.relu.default: spyre_pointwise_unary,
     aten.rsqrt.default: spyre_pointwise_unary,
     aten.sigmoid.default: spyre_pointwise_unary,
+    aten.softplus.default: spyre_pointwise_unary,
     aten.sqrt.default: spyre_pointwise_unary,
     aten.tanh.default: spyre_pointwise_unary,
     # Other ops

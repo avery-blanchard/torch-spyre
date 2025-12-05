@@ -219,3 +219,35 @@ def lower_gelu(x, approximate="none"):
     )
     pw.realize()
     return pw
+
+
+lowering.register_op_dtype_propagation_rules(
+    "softplus", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
+)
+
+
+@lowering.register_lowering(torch.ops.spyre.softplus)
+def lower_softplus(x, beta=1.0, threshold=20.0):
+    op_info = {
+        "constants": {
+            "softplusBeta": beta,
+            "softplusThresh": threshold,
+        }
+    }
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)
+
+    def inner_fn(index):
+        return fn(x.make_loader()(index), beta, threshold)
+
+    pw = SpyrePointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+        op_info=op_info,
+    )
+    pw.realize()
+    return pw

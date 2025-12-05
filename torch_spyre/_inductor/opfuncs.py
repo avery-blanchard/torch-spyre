@@ -60,6 +60,7 @@ def _initialize_opfunc_mapping():
         "reciprocal",
         "rsqrt",
         "sigmoid",
+        "softplus",
         "sqrt",
         "sub",
         "tanh",
