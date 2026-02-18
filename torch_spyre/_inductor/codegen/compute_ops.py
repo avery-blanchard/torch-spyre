@@ -100,8 +100,6 @@ class DimInfos:
         self.rows[name] = info_list
 
     def make_dim_infos(self, fields=[], index_order=None, additional_rows={}):
-        print(f"{additional_rows=}")
-        print(f"{index_order=}")
         rows = self.rows | additional_rows
         if not index_order:
             index_order = self.dim_indices
