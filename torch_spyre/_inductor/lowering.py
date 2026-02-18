@@ -197,34 +197,6 @@ def ensure_default_handler(op_name):
         setattr(cls, op_name, method)
 
 
-# @register_spyre_lowering(torch.ops.aten.mm.default)
-# def lower_mm(x, y):
-#     def inner_fn(index, reduction_index):
-#         i0, i1 = index
-#         (r0,) = reduction_index
-#         return (x_loader([i0, r0]), y_loader([r0, i1]))
-
-#     x = V.graph.get_buffer(x.realize())
-#     y = V.graph.get_buffer(y.realize())
-#     x_loader = x.make_loader()
-#     y_loader = y.make_loader()
-
-#     result = Reduction.create(
-#         reduction_type=MATMUL_REDUCTION_OP,
-#         input_node=[x, y],
-#         device=x.get_device(),
-#         dst_dtype=x.get_dtype(),
-#         src_dtype=x.get_dtype(),
-#         inner_fn=inner_fn,
-#         ranges=[x.get_size()[0], y.get_size()[1]],
-#         reduction_ranges=[x.get_size()[1]],
-#     )
-
-#     result.realize()
-
-#     return result
-
-
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
     x = V.graph.get_buffer(x.realize())
