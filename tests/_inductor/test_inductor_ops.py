@@ -166,6 +166,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((3, 17, 128, 256), (3, 17, 256, 128)),
+                    ((2, 64, 128), (128, 16384)),
                 ]
             ),
         },
