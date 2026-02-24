@@ -37,6 +37,31 @@ def spyre__mm_out(
     return compiled_mm(self, mat2, out=out)
 
 
+@torch.library.register_kernel("aten::addmm", ["spyre"])
+def spyre__addmm_default(
+    self: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    beta: Union[int, float, bool, complex] = 1,
+    alpha: Union[int, float, bool, complex] = 1,
+) -> torch.Tensor:
+    mm_result = torch.ops.aten.mm(mat1, mat2)
+    return torch.ops.aten.add.Tensor(mm_result, self, alpha=alpha)
+
+
+@torch.library.register_kernel("aten::addmm.out", ["spyre"])
+def spyre__addmm_out(
+    self: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    beta: Union[int, float, bool, complex] = 1,
+    alpha: Union[int, float, bool, complex] = 1,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    mm_result = torch.ops.aten.mm(mat1, mat2)
+    return torch.ops.aten.add.out(mm_result, self, alpha=alpha, out=out)
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])
 def spyre__fill_scalar(
     self: torch.Tensor, other: Union[int, float, bool, complex]
