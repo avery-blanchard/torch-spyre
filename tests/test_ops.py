@@ -221,7 +221,6 @@ class TestOps(TestCase):
             y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.expectedFailure
     def test_silu_larger_input(self):
         x = torch.rand([2, 100, 12800], dtype=self.dtype)
         x_spyre = x.to("spyre")
