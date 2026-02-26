@@ -27,7 +27,7 @@ import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
-
+from .errors import Unsupported
 import threading
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
@@ -261,8 +261,7 @@ def lower_bmm(x, y):
     y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()
     y_loader = y.make_loader()
-    d3 = len(x.get_size()) == 3
-    if d3:
+    if len(x.get_size()) == 3 and len(y.get_size()) == 3:
 
         def inner_fn(index, reduction_index):
             i0, i1, i2 = index
@@ -281,7 +280,7 @@ def lower_bmm(x, y):
             ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[2]],  # B, M, N
             reduction_ranges=[x.get_size()[2]],  # K
         )
-    else:  # 4d
+    elif len(x.get_size()) == 4 and len(y.get_size()) == 4:
 
         def inner_fn(index, reduction_index):
             i0, i1, i2, i3 = index
@@ -305,7 +304,46 @@ def lower_bmm(x, y):
             ],
             reduction_ranges=[x.get_size()[-1]],
         )
+    elif len(x.get_size()) == 3 and len(y.get_size()) == 2:
 
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            tmp1 = x_loader([i0, i1, r0])
+            tmp2 = y_loader([r0, i2])
+            return (tmp1, tmp2)
+
+        result = Reduction.create(
+            reduction_type=BATCH_MATMUL_OP,
+            input_node=[x, y],
+            device=x.get_device(),
+            dst_dtype=x.get_dtype(),
+            src_dtype=x.get_dtype(),
+            inner_fn=inner_fn,
+            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[1]],  # B, M, N
+            reduction_ranges=[x.get_size()[2]],  # K
+        )
+    elif len(x.get_size()) == 2 and len(y.get_size()) == 3:
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            tmp1 = x_loader([i1, r0])
+            tmp2 = y_loader([i0, r0, i2])
+            return (tmp1, tmp2)
+
+        result = Reduction.create(
+            reduction_type=BATCH_MATMUL_OP,
+            input_node=[x, y],
+            device=x.get_device(),
+            dst_dtype=x.get_dtype(),
+            src_dtype=x.get_dtype(),
+            inner_fn=inner_fn,
+            ranges=[x.get_size()[0], y.get_size()[1], y.get_size()[2]],  # B, M, N
+            reduction_ranges=[x.get_size()[1]],  # K
+        )
+    else:
+        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
     result.realize()
     return result
 
