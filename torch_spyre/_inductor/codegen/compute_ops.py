@@ -156,7 +156,7 @@ class DimInfos:
     def get_tensor_op_infos(self, tensor, op):
         result = self.make_dim_infos(
             additional_rows={"scale": get_scales_sdsc_format(tensor, op)},
-            index_order=self.get_tensor_op_index_order(tensor, op),
+            index_order=self.get_tensor_op_index_order(tensor),
         )
         return result
 
