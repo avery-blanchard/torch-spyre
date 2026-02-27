@@ -160,17 +160,23 @@ class DimInfos:
         )
         return result
 
-    # Get labels corresponding to tensor layout
-    # Rank of returned list == num tensor dimensions
+    # Get dimension labels, for the dimensions of the tensor,
+    # in the tensor's device layout order.
+    # Length of returned list == num tensor dimensions
     def get_tensor_layout_order(self, tensor):
         dl = tensor["device_layout"]
         scale = tensor["scale"]
         dev_dim_order = dl.dim_map[::-1][1:]
         return [self.rows["label"][scale.index(dmv)] for dmv in dev_dim_order]
 
+    # Returns dim infos for dimensions of the tensor,
+    # in the tensor's device layout order.
+    # Length of returned list == num tensor dimensions
     def get_tensor_infos(self, tensor, op):
-        tensor_op_infos = self.get_tensor_op_infos(tensor, op)
-        return [di for di in tensor_op_infos if di.scale >= 0]
+        layout_order = self.get_tensor_layout_order(tensor)
+        op_infos = self.get_tensor_op_infos(tensor, op)
+        info_dict = {di.label: di for di in op_infos}
+        return [info_dict[label] for label in layout_order]
 
     def get_tensor_stick_dim_labels(self, tensor):
         dl = tensor["device_layout"]
@@ -639,19 +645,17 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
-                                            + c
-                                            # calculate the prod of dim sizes
-                                            # less significant than chosen split dim i.e. the stick
-                                            * math.prod(
-                                                dim_infos.get_padded_sizes()[:2]
+                                            + core_idx_to_slice_offset(
+                                                dim_infos.get_tensor_op_infos(
+                                                    tensor, op
+                                                ),
+                                                core_id_to_wk_slice[str(c)],
+                                                tensor["device_layout"].device_size,
                                             )
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
                                             )
-                                            // cores
                                         )
-                                        if tensor["lx_addr"] is None
-                                        else tensor["lx_addr"]
                                         for c in range(cores)
                                     },
                                 },
@@ -800,7 +804,6 @@ def _generate_matmul_common(
         padded_dimensions,
         dim_splits,
     )
-    dim_info_dict = {di.label: di for di in dim_infos.get_op_infos()}
 
     layouts = create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=True)
 
@@ -828,8 +831,8 @@ def _generate_matmul_common(
                         "N_": {
                             "name_": "n",
                             **{
-                                label + "_": di.padded_size
-                                for label, di in dim_info_dict.items()
+                                di.label + "_": di.padded_size
+                                for di in dim_infos.get_op_infos()
                             },
                         },
                         "dataStageParam_": {
@@ -837,15 +840,15 @@ def _generate_matmul_common(
                                 "ss_": {
                                     "name_": "core",
                                     **{
-                                        label + "_": di.split_size
-                                        for label, di in dim_info_dict.items()
+                                        di.label + "_": di.split_size
+                                        for di in dim_infos.get_op_infos()
                                     },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
-                                        label + "_": di.split_size
-                                        for label, di in dim_info_dict.items()
+                                        di.label + "_": di.split_size
+                                        for di in dim_infos.get_op_infos()
                                     },
                                 },
                             }
@@ -888,12 +891,7 @@ def _generate_matmul_common(
                                         f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
                                             + core_idx_to_slice_offset(
-                                                [
-                                                    dim_info_dict[label]
-                                                    for label in dim_infos.get_tensor_layout_order(
-                                                        tensor
-                                                    )
-                                                ],
+                                                dim_infos.get_tensor_infos(tensor, op),
                                                 coreid_to_wk_slice[str(c)],
                                                 tensor["device_layout"].device_size,
                                             )
