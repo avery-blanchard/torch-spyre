@@ -423,15 +423,21 @@ def gen_coord_info_value(
     )
 
 
-def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
+def create_padding_mask_info(
+    dim_infos: DimInfos, kwargs, tensor, reduction
+) -> tuple[dict, int]:
     coordinateMasking = {}
     maskingConstId = -1
+    dl = tensor["device_layout"]
+    stick_reduction = reduction and dl.host_stick_dim() is None
 
-    for di in dim_infos.get_op_infos():
-        if di.padding > 0:
-            coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
-    if coordinateMasking:
-        maskingConstId = add_constant(kwargs, "samv-maskvalue", 0)
+    if stick_reduction:
+        # Coordinate masking required for stick reductions
+        for di in dim_infos.get_op_infos():
+            if di.padding > 0:
+                coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
+        if coordinateMasking:
+            maskingConstId = add_constant(kwargs, "samv-maskvalue", 0)
 
     return coordinateMasking, maskingConstId
 
@@ -531,7 +537,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         dim_splits,
     )
 
-    coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
+    coordinateMasking, maskingConstId = create_padding_mask_info(
+        dim_infos, kwargs, tensors[-1], reduction
+    )
     layouts = create_tensor_specific_layouts(
         tensors, dim_infos, op, op_dims_tensor=op_dims_tensor
     )
