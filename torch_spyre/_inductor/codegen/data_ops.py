@@ -960,7 +960,9 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_splits,
     )
 
-    layouts = create_tensor_specific_layouts(tensors, dim_infos, op)
+    layouts = create_tensor_specific_layouts(
+        tensors, dim_infos, op, op_dims_tensor=op_dims_tensor
+    )
 
     # Compute the stick label from the op tensor.
     op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
