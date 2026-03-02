@@ -379,7 +379,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        return TensorAccess(name, index, layout).unsqueeze_if_sparse()
+        return TensorAccess(name, index, layout)
 
     def store(
         self,

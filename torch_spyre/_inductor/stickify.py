@@ -220,7 +220,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         # Case 1: There exists a non-broadcasting input.
         # Propagate its device_layout to the output.
         for arg in args:
-            if arg.layout.size == output.size:
+            if arg.layout.size == output.size and not is_sparse(
+                arg.layout.device_layout
+            ):
                 stl = device_layout_like(arg.layout, output.dtype)
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
