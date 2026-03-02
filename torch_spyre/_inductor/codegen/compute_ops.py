@@ -45,6 +45,29 @@ def get_scales_sdsc_format(tensor, op):
         return [1 if s >= 0 else s for s in tensor["scale"]]
 
 
+def get_tensor_start_address_core(tensor, wk_slice, dim_infos, op, pointers):
+    sparse = tensor["device_layout"].host_stick_dim() is None
+    if op == "matmul" or op == "batchmatmul":
+        tensor_dims = dim_infos.get_tensor_infos(tensor, op)
+    else:
+        tensor_dims = dim_infos.get_tensor_op_infos(tensor, op)
+
+    if sparse:
+        device_size = []
+        for i in range(len(tensor["device_layout"].dim_map)):
+            if tensor["device_layout"].dim_map[i] != -1:
+                device_size.append(tensor["device_layout"].device_size[i])
+        slice_offset = core_idx_to_slice_offset(tensor_dims, wk_slice, device_size)
+    else:
+        slice_offset = core_idx_to_slice_offset(
+            tensor_dims, wk_slice, tensor["device_layout"].device_size
+        )
+    start_addr = pointers[tensor["name"]] + slice_offset * num_bytes(
+        tensor["device_layout"].device_dtype
+    )
+    return start_addr
+
+
 @dataclass
 class DimInfos:
     """
@@ -525,6 +548,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # Get operation dim map from the tensor that represents the operation space
     op_dims_tensor = inputs[0] if reduction else outputs[0]
+
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
@@ -644,16 +668,12 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     ],
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
-                                            pointers[tensor["name"]]
-                                            + core_idx_to_slice_offset(
-                                                dim_infos.get_tensor_op_infos(
-                                                    tensor, op
-                                                ),
+                                            get_tensor_start_address_core(
+                                                tensor,
                                                 core_id_to_wk_slice[str(c)],
-                                                tensor["device_layout"].device_size,
-                                            )
-                                            * num_bytes(
-                                                tensor["device_layout"].device_dtype
+                                                dim_infos,
+                                                op,
+                                                pointers,
                                             )
                                         )
                                         for c in range(cores)
@@ -768,7 +788,7 @@ def _generate_matmul_common(
     dim_labels,
     dim_indices,
     dim_splits,
-    coreid_to_wk_slice,
+    core_id_to_wk_slice,
     cores,
 ):
     """
@@ -786,7 +806,7 @@ def _generate_matmul_common(
         dim_labels: Dimension labels (e.g., ["mb", "in", "out"] for matmul)
         dim_indices: Dimension indices
         dim_splits: Number of splits per dimension
-        coreid_to_wk_slice: Mapping from core ID to work slice
+        core_id_to_wk_slice: Mapping from core ID to work slice
         cores: Number of cores used
 
     Returns:
@@ -820,7 +840,7 @@ def _generate_matmul_common(
             "numCoresUsed_": cores,
             "coreIdToDsc_": {str(i): 0 for i in range(cores)},
             "numWkSlicesPerDim_": {k: v for k, v in zip(dim_labels, dim_splits)},
-            "coreIdToWkSlice_": coreid_to_wk_slice,
+            "coreIdToWkSlice_": core_id_to_wk_slice,
             "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
             "dscs_": [
                 {
@@ -889,14 +909,12 @@ def _generate_matmul_common(
                                     ],
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
-                                            pointers[tensor["name"]]
-                                            + core_idx_to_slice_offset(
-                                                dim_infos.get_tensor_infos(tensor, op),
-                                                coreid_to_wk_slice[str(c)],
-                                                tensor["device_layout"].device_size,
-                                            )
-                                            * num_bytes(
-                                                tensor["device_layout"].device_dtype
+                                            get_tensor_start_address_core(
+                                                tensor,
+                                                core_id_to_wk_slice[str(c)],
+                                                dim_infos,
+                                                op,
+                                                pointers,
                                             )
                                         )
                                         for c in range(cores)
@@ -1003,7 +1021,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                     # host_dim_idx -> op_dim_idx for nsplit assignment
                     dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
 
-    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
+    core_id_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
     return _generate_matmul_common(
         pointers,
@@ -1014,7 +1032,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_labels=dim_labels,
         dim_indices=dim_indices,
         dim_splits=dim_splits,
-        coreid_to_wk_slice=coreid_to_wk_slice,
+        core_id_to_wk_slice=core_id_to_wk_slice,
         cores=cores,
     )
 
@@ -1052,7 +1070,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                     # host_dim_idx -> op_dim_idx for nsplit assignment
                     dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
 
-    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
+    core_id_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
     return _generate_matmul_common(
         pointers,
@@ -1063,6 +1081,6 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_labels=dim_labels,
         dim_indices=dim_indices,
         dim_splits=dim_splits,
-        coreid_to_wk_slice=coreid_to_wk_slice,
+        core_id_to_wk_slice=core_id_to_wk_slice,
         cores=cores,
     )
