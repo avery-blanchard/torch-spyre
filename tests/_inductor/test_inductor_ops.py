@@ -199,14 +199,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
-        ("test_max_sub_broadcast", "test_max_sub_broadcast"): {
+        ("test_reduction_sub_broadcast", "test_reduction_sub_broadcast"): {
+            "ops_dict": {"sum": torch.sum, "mean": torch.mean},
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((128, 256))),
                 "2d_dim_1": (1, cached_randn((128, 256))),
-                "4d_dim_0": (0, cached_randn((12, 8, 25, 64))),
-                "4d_dim_1": (1, cached_randn((12, 8, 25, 64))),
-                "4d_dim_2": (2, cached_randn((12, 8, 25, 64))),
-                "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
+                "3d_dim_0": (0, cached_randn((128, 256))),
+                "3d_dim_1": (1, cached_randn((128, 256))),
+                "4d_dim_0": (0, cached_randn((12, 8, 64, 64))),
+                "4d_dim_1": (1, cached_randn((12, 8, 64, 64))),
+                "4d_dim_2": (2, cached_randn((12, 8, 64, 64))),
+                "4d_dim_3": (3, cached_randn((12, 8, 64, 64))),
+            },
+        },
+        ("test_stick_reduction_add", "test_reduction_add"): {
+            "ops_dict": {"sum": torch.sum, "mean": torch.mean},
+            "param_sets": {
+                "2d_dim_1": (
+                    1,
+                    cached_randn(
+                        (
+                            128,
+                            64,
+                        )
+                    ),
+                    cached_randn((128)),
+                ),
+                "3d_dim_2": (
+                    2,
+                    cached_randn(
+                        (
+                            2,
+                            128,
+                            64,
+                        )
+                    ),
+                    cached_randn((2, 128)),
+                ),
+                "4d_dim_3": (
+                    3,
+                    cached_randn((2, 128, 64, 4096)),
+                    cached_randn((2, 128, 64)),
+                ),
             },
         },
         (
@@ -891,13 +925,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
-    def test_max_sub_broadcast(self, dim: int, x):
+    def test_reduction_sub_broadcast(self, op, dim: int, x):
         def fn(x):
-            x_max = torch.max(x, dim=dim)[0]
-            z = x - torch.unsqueeze(x_max, dim=dim)
+            y = op(x, dim=dim, keepdim=True)
+            z = x - y
             return z
 
-        compare(fn, x)
+        compare_with_cpu(fn, x)
+
+    def test_reduction_add(self, op, dim: int, x, y):
+        def fn(x, y):
+            x = op(x, dim=dim)
+            z = x + y
+            return z
+
+        compare_with_cpu(fn, x, y)
 
     def test_transpose_2d_cpu(self, x):
         compare_with_cpu(lambda x: x.t().contiguous(), x)
