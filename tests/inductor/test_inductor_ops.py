@@ -171,7 +171,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
-            "ops_dict": {"sum": torch.sum},
+            "ops_dict": {"sum": torch.sum, "amin": torch.amin},
             "param_sets": {
                 "2d_0": (0, cached_randn((63, 129))),
                 "2d_1": (1, cached_randn((63, 129))),
@@ -199,14 +199,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
-        ("test_max_sub_broadcast", "test_max_sub_broadcast"): {
+        ("test_sparse", "test_sparse"): {
+            "ops_dict": {"mean": torch.mean, "mul": torch.mul, "relu": torch.relu},
             "param_sets": {
-                "2d_dim_0": (0, cached_randn((128, 256))),
-                "2d_dim_1": (1, cached_randn((128, 256))),
-                "4d_dim_0": (0, cached_randn((12, 8, 25, 64))),
-                "4d_dim_1": (1, cached_randn((12, 8, 25, 64))),
-                "4d_dim_2": (2, cached_randn((12, 8, 25, 64))),
-                "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
+                "2d": (cached_randn((128, 256)),),
+                "3d": (cached_randn((2, 128, 256)),),
+                "4d": (cached_randn((12, 8, 25, 64)),),
+                "2d_padded": (cached_randn((128, 56)),),
+                "3d_padded": (cached_randn((2, 128, 126)),),
+                "4d_padded": (cached_randn((12, 8, 25, 6)),),
             },
         },
         (
@@ -962,13 +963,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
-    def test_max_sub_broadcast(self, dim: int, x):
+    def test_sparse(self, op, x):
         def fn(x):
-            x_max = torch.max(x, dim=dim)[0]
-            z = x - torch.unsqueeze(x_max, dim=dim)
+            y = torch.sum(x, dim=-1, keepdim=True)
+            if op == torch.mean:
+                z = torch.mean(y, dim=0)
+            elif op == torch.relu:
+                z = op(y)
+            else:
+                z = op(y, x)
             return z
 
-        compare(fn, x)
+        compare_with_cpu(fn, x)
 
     def test_transpose_2d_cpu(self, x):
         compare_with_cpu(lambda x: x.t().contiguous(), x)

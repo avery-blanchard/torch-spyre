@@ -63,12 +63,16 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     Returns:
         The number of parallelizable units along this dimension
     """
-    if host_dim_idx < 0:
-        host_dim_idx = len(layout.size) + host_dim_idx
-
-    assert host_dim_idx < len(layout.size)
-
     dl = layout.device_layout
+
+    # unsqueeze if sparse
+    host_size = (
+        len(layout.size) if dl.host_stick_dim() is not None else len(layout.size) + 1
+    )
+    if host_dim_idx < 0:
+        host_dim_idx = host_size + host_dim_idx
+
+    assert host_dim_idx < host_size
 
     # Use dim_map to find the device dimension that corresponds to this host dimension
     # For tiled dimensions (appearing multiple times in dim_map), we use the first occurrence
@@ -76,9 +80,12 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     try:
         device_dim_idx = dl.dim_map.index(host_dim_idx)
     except ValueError:
-        raise RuntimeError(
-            f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
-        )
+        if dl.host_stick_dim() is None:  # sparse
+            device_dim_idx = dl.dim_map.index(-1)
+        else:
+            raise RuntimeError(
+                f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
+            )
 
     return dl.device_size[device_dim_idx]
 
@@ -175,7 +182,11 @@ def multi_dim_core_split(
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     output: FixedTiledLayout = n.node.get_layout()
-    ndim = len(output.size)
+    ndim = (
+        len(output.size)
+        if output.device_layout.host_stick_dim() is not None
+        else len(output.size) + 1
+    )  # unsqueeze if sparse
     n.n_cores_used = 1
 
     if max_cores == 1:

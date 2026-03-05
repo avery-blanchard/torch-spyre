@@ -329,11 +329,8 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_dev_coords = device_coordinates(x.layout, x.dep)
         out_coords = host_coordinates(output, output_dep)
         x_stick_expr = x_dev_coords[-1]
-        if not isinstance(x_stick_expr, Symbol) or x_stick_expr == 0:
-            # TODO: Not clear if we can do this or not; defer for now
-            raise Unsupported("reduction with transposed stick dim")
-        sparse = x_stick_expr not in out_coords
-        if sparse:
+        stick_reduction = x_stick_expr not in out_coords
+        if stick_reduction:
             out_dim_order = list(range(len(output.size))) + [-1]
         else:
             out_stick_dim = out_coords.index(x_stick_expr)
