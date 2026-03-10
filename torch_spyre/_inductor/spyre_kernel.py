@@ -479,7 +479,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 if (
                     Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
                     and in_stl.device_size != out_stl.device_size
-                ) or in_di != out_di:
+                ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
                     # Transpose:
                     #   - check that the input / output DimensionInfo are the same, but in different order.
                     #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
