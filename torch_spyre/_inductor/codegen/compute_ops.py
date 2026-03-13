@@ -448,14 +448,11 @@ def create_padding_mask_info(
             if di.padding > 0:
                 coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
         if coordinateMasking:
-            if op == "max" and dl.device_dtype == DataFormats.IEEE_FP32:
-                maskvalue = float("-nan")
-            elif op == "max" and dl.device_dtype == DataFormats.SEN169_FP16:
-                maskvalue = 65535
-            elif op == "min" and dl.device_dtype == DataFormats.IEEE_FP32:
-                maskvalue = float("nan")
-            elif op == "min" and dl.device_dtype == DataFormats.SEN169_FP16:
-                maskvalue = 32766
+            # Select mask value based on operation
+            if op == "max":
+                maskvalue = float("-inf")
+            elif op == "min":
+                maskvalue = float("inf")
             else:
                 maskvalue = 0
             maskingConstId = add_constant(kwargs, "samv-maskvalue", maskvalue)
