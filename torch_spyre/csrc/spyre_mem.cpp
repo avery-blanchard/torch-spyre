@@ -77,6 +77,8 @@ auto get_dim_cpu_stride(int dim, int stick_size,
   int cpu_stride;
   if (dim == dev_dim_order.back()) {  // stick_dim
     cpu_stride = stick_size;
+  } else if (dim == -1) {  // device dimension of size 1
+    cpu_stride = 0;
   } else {
     cpu_stride = cpu_strides[dim];
   }
@@ -128,8 +130,7 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   bool sparse = dim_map.back() == -1;
   bool requires_padding =
       !sparse && cpu_shape[dim_map.back()] % stick_size != 0;
-  bool size_less_than_stick =
-      !sparse && cpu_shape[dim_map.back()] < stick_size;
+  bool size_less_than_stick = !sparse && cpu_shape[dim_map.back()] < stick_size;
 
   stride_info.size_ = device_sizes;
 
@@ -141,8 +142,7 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
   for (int i = 1; i < dim_map.size(); i++) {
     auto& dim = dim_map[(dim_map.size() - 1) - i];
-    auto cpu_stride =
-        get_dim_cpu_stride(dim, stick_size, dim_map, cpu_strides);
+    auto cpu_stride = get_dim_cpu_stride(dim, stick_size, dim_map, cpu_strides);
     auto dev_stride = get_dim_device_stride(
         dim, stick_size, device_sizes,
         host2device ? stride_info.stride_dst_ : stride_info.stride_src_);
@@ -204,8 +204,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   bool sparse = dim_map.back() == -1;
   bool requires_padding =
       !sparse && cpu_shape[dim_map.back()] % stick_size != 0;
-  bool size_less_than_stick =
-      !sparse && cpu_shape[dim_map.back()] < stick_size;
+  bool size_less_than_stick = !sparse && cpu_shape[dim_map.back()] < stick_size;
   DataConversionStrideInfo stride_info;
 
   stride_info = get_device_stride_info(sizes, strides, stl, stick_size,
