@@ -18,20 +18,15 @@ from typing import Any
 from torch_spyre._inductor.constants import (
     MATMUL_REDUCTION_OP,
     BATCH_MATMUL_OP,
-    TRANSPOSE_OP,
-    CLONE_OP,
+    RESTICKIFY_OP,
+    IDENTITY_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
-from .data_ops import (
-    generate_transpose,
-    generate_transpose_3d_stick,
-    generate_transpose_4d_stick,
-    generate_identity,
-)
+
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -110,23 +105,14 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             outputs=outputs,
             **kwargs,
         )
-    if op == "swap":
-        return generate_transpose(
-            pointers,
-            op=op,
-            dimensions=[dimensions[0], 64],
-            inputs=inputs,
-            outputs=outputs,
-            **kwargs,
-        )
     if op == "to_dtype":
         if (
             inputs[0]["device_layout"].device_dtype
             == outputs[0]["device_layout"].device_dtype
         ):
-            return generate_identity(
+            return generate_dldsc(
                 pointers,
-                op=CLONE_OP,
+                op=IDENTITY_OP,
                 dimensions=dimensions,
                 inputs=inputs,
                 outputs=outputs,
@@ -137,67 +123,8 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
                 f"to_dtype from {inputs[0]['device_layout'].device_dtype} to {outputs[0]['device_layout'].device_dtype}"
             )
 
-    if op == TRANSPOSE_OP and len(dimensions) == 2:
-        return generate_transpose(
-            pointers,
-            op=op,
-            dimensions=dimensions,
-            inputs=inputs,
-            outputs=outputs,
-            **kwargs,
-        )
-    if op == TRANSPOSE_OP and len(dimensions) == 3:
-        transposed_dims = [
-            dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
-        ]
-        if (
-            inputs[0]["device_layout"].host_stick_dim() in transposed_dims
-        ):  # stick transpose implemented through restickify
-            return generate_transpose_3d_stick(
-                pointers,
-                op=op,
-                dimensions=dimensions,
-                inputs=inputs,
-                outputs=outputs,
-                transposed_dims=transposed_dims,
-                **kwargs,
-            )
-        else:  # non-stick transpose implemented through identity
-            return generate_identity(
-                pointers,
-                op=op,
-                dimensions=dimensions,
-                inputs=inputs,
-                outputs=outputs,
-                **kwargs,
-            )
-    if op == TRANSPOSE_OP and len(dimensions) == 4:
-        transposed_dims = [
-            dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
-        ]
-        if (
-            inputs[0]["device_layout"].host_stick_dim() in transposed_dims
-        ):  # stick transpose implemented through restickify
-            return generate_transpose_4d_stick(
-                pointers,
-                op=op,
-                dimensions=dimensions,
-                inputs=inputs,
-                outputs=outputs,
-                transposed_dims=transposed_dims,
-                **kwargs,
-            )
-        else:  # non-stick transpose implemented through identity
-            return generate_identity(
-                pointers,
-                op=op,
-                dimensions=dimensions,
-                inputs=inputs,
-                outputs=outputs,
-                **kwargs,
-            )
-    if op == CLONE_OP:
-        return generate_identity(
+    if op == RESTICKIFY_OP or op == IDENTITY_OP:
+        return generate_dldsc(
             pointers,
             op=op,
             dimensions=dimensions,

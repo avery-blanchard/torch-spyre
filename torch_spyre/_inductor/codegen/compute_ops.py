@@ -184,6 +184,7 @@ class DimInfos:
         return [info_dict[label] for label in layout_order]
 
     def get_tensor_stick_dim_labels(self, tensor):
+        print(tensor)
         dl = tensor["device_layout"]
         idx = tensor["it_dim_map"].index(dl.host_stick_dim())
         return [self.rows["label"][idx]]
@@ -461,7 +462,7 @@ def create_padding_mask_info(
 
 
 def create_tensor_specific_layouts(
-    tensors, dim_infos, op, is_matmul=False, op_dims_tensor=None
+    tensors, dim_infos, op, check_stick_dim=False, op_dims_tensor=None
 ):
     layouts = {}
     # Compute tensor-specific dimension info
@@ -474,14 +475,22 @@ def create_tensor_specific_layouts(
         # For matmul, the layout order is determined by the tensor's layout
         layout_order = (
             dim_infos.get_tensor_layout_order(tensor)
-            if is_matmul
+            if check_stick_dim
             else dim_infos.get_tensor_op_layout_order(tensor, op)
         )
 
         for label, layout_infos in layouts.items():
             if layout_order == layout_infos["layout_order"]:
-                tensor["ds_type"] = label
-                break
+                if check_stick_dim:
+                    if (
+                        dim_infos.get_tensor_stick_dim_labels(tensor)
+                        == layout_infos["stick_dim_order"]
+                    ):
+                        tensor["ds_type"] = label
+                        break
+                else:
+                    tensor["ds_type"] = label
+                    break
         if tensor["ds_type"] is None:
             tensor["ds_type"] = (
                 LAYOUT_INPUT_LABELS[len(layouts.keys())]
@@ -493,7 +502,7 @@ def create_tensor_specific_layouts(
             layouts[LAYOUT_INPUT_LABELS[len(layouts.keys())]] = {
                 "layout_order": layout_order,
                 "stick_dim_order": dim_infos.get_tensor_stick_dim_labels(tensor)
-                if is_matmul
+                if check_stick_dim
                 else dim_infos.get_tensor_stick_dim_labels(op_dims_tensor),
             }
 
@@ -813,7 +822,9 @@ def _generate_matmul_common(
         dim_splits,
     )
 
-    layouts = create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=True)
+    layouts = create_tensor_specific_layouts(
+        tensors, dim_infos, op, check_stick_dim=True
+    )
 
     # swap_last_two_elements moves the "in" (reduction) dimension to the last
     # so that the core assignment keeps partial sum results that require cross-core
