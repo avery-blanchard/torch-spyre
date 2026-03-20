@@ -35,8 +35,8 @@ from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
-    TRANSPOSE_OP,
-    CLONE_OP,
+    IDENTITY_OP,
+    RESTICKIFY_OP,
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
@@ -498,6 +498,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ]
             in_stl = args[0].device_layout  # type: ignore[union-attr]
             out_stl = args[1].device_layout  # type: ignore[union-attr]
+            transposed_dims = []
             # Determine data op based on tensor args
             if (
                 Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
@@ -506,26 +507,32 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 # Transpose:
                 #   - check that the input / output DimensionInfo are the same, but in different order.
                 #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
-                op = TRANSPOSE_OP
+                transposed_dims = [
+                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
+                ]
+                op = (
+                    RESTICKIFY_OP
+                    if in_stl.host_stick_dim() in transposed_dims
+                    else IDENTITY_OP
+                )
+
             elif all(is_wildcard(d.var) for d in in_di) and not all(
                 is_wildcard(d.var) for d in out_di
             ):
                 # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
-                op = CLONE_OP
+                op = IDENTITY_OP
                 in_di = out_di
                 args[0] = self.create_tensor_arg(True, value.name, value, in_di)
             elif in_stl.device_size == out_stl.device_size:
                 # Clone: check that device layout is the same.
-                op = CLONE_OP
+                op = IDENTITY_OP
             else:
                 # Unsupported data operation on TensorArg
                 raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
             op_spec = create_op_spec(op, False, out_di, args, op_info)
-            if op == TRANSPOSE_OP:
-                op_spec.op_info["transposed_dims"] = [
-                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
-                ]
+            if len(transposed_dims) > 0:
+                op_spec.op_info["transposed_dims"] = transposed_dims
                 # Reorder it_dim_map of the input to implement transpositions
                 (
                     op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]

@@ -13,9 +13,9 @@
 # limitations under the License.
 
 BATCH_MATMUL_OP = "batchmatmul"
-CLONE_OP = "clone"
+IDENTITY_OP = "identity"
 MATMUL_REDUCTION_OP = "matmul"
-TRANSPOSE_OP = "transpose"
+RESTICKIFY_OP = "ReStickifyOpHBM"
 
 DEVICE_NAME = "spyre"
 
@@ -45,7 +45,7 @@ SPYRE_FP32_OPS = [
     "sigmoid",
     "exx2",
     "layernormnorm",
-    "clone",
+    "identity",
 ]
 
 LAYOUT_INPUT_LABELS = ["INPUT", "KERNEL", "KERNEL_IDX"]
