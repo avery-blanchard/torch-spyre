@@ -177,9 +177,11 @@ def normalize_coordinates(var_ranges, size, coordinates):
             tmp[1] = result[1]
             tmp[4] *= result[4]
         else:
-            new_results.append(tmp)
+            if tmp[4] > 1:
+                new_results.append(tmp)
             tmp = result
-    new_results.append(tmp)
+    if tmp[4] > 1:
+        new_results.append(tmp)
     new_results.append(results[-1])
     return new_results
 
@@ -314,5 +316,29 @@ if __name__ == "__main__":
         align_tensors(
             {},
             [{"size": [1, 64], "coordinates": [sympy.S.Zero, sympy.S.Zero]}],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 128, x2: 32, x1: 128},
+            [
+                {
+                    "size": [128, 32, 2, 1, 1, 1, 64],
+                    "coordinates": [
+                        x1,
+                        x2,
+                        floor(x0 / 64),
+                        sympy.S.Zero,
+                        sympy.S.Zero,
+                        sympy.S.Zero,
+                        Mod(x0, 64),
+                    ],
+                },
+                {
+                    "size": [32, 128, 2, 1, 64],
+                    "coordinates": [x2, x1, floor(x0 / 64), sympy.S.Zero, Mod(x0, 64)],
+                },
+            ],
         )
     )
