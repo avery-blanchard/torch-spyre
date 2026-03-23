@@ -22,6 +22,8 @@ from torch_spyre._inductor.constants import (
     LAYOUT_OUTPUT_LABELS,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
+    RESTICKIFY_OP,
+    IDENTITY_OP,
 )
 
 
@@ -184,7 +186,6 @@ class DimInfos:
         return [info_dict[label] for label in layout_order]
 
     def get_tensor_stick_dim_labels(self, tensor):
-        print(tensor)
         dl = tensor["device_layout"]
         idx = tensor["it_dim_map"].index(dl.host_stick_dim())
         return [self.rows["label"][idx]]
@@ -540,6 +541,12 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         cores = 1
         dim_splits = [1] * ndim
 
+    # TODO: implement core division for identity/restickify ops
+    # see issue: https://github.com/torch-spyre/torch-spyre/issues/814
+    if op == RESTICKIFY_OP or op == IDENTITY_OP:
+        cores = 1
+        dim_splits = [1] * ndim
+
     # If the output tensor is sparse, then this is a stick reduction.
     if reduction and tensors[-1]["device_layout"].host_stick_dim() is not None:
         op += "nonstick"
@@ -567,7 +574,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         dim_infos, kwargs, tensors[-1], reduction, op
     )
     layouts = create_tensor_specific_layouts(
-        tensors, dim_infos, op, op_dims_tensor=op_dims_tensor
+        tensors,
+        dim_infos,
+        op,
+        check_stick_dim=True if op == RESTICKIFY_OP else False,
+        op_dims_tensor=op_dims_tensor,
     )
 
     # Compute the stick label from the op tensor.
