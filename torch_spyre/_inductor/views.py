@@ -200,13 +200,16 @@ def align_tensors(var_ranges, tensors):
     n = 0
     remap = {}
     for var, split in splits.items():
-        new_var_ranges[var] = split[1]
-        remap[var] = [var // split[0]]
-        for i in range(2, len(split)):
-            new_var = sympy.symbols(f"z{n}")
-            n += 1
-            new_var_ranges[new_var] = split[i] // split[i - 1]
-            remap[var].append(new_var)
+        if len(split) > 1:
+            new_var_ranges[var] = split[1]
+            remap[var] = [var // split[0]]
+            for i in range(2, len(split)):
+                new_var = sympy.symbols(f"z{n}")
+                n += 1
+                new_var_ranges[new_var] = split[i] // split[i - 1]
+                remap[var].append(new_var)
+        else:
+            new_var_ranges[var] = var_ranges[var]
 
     new_tensors = []
     for intervals in breakdown:
@@ -228,7 +231,13 @@ def align_tensors(var_ranges, tensors):
                 coordinates.append(sympy.S.Zero)
         num, den, var, mod, dim_size = intervals[-1]
         size.append(dim_size)
-        coordinates.append(var % splits[var][0])
+        if var is not None:
+            if len(splits[var]) > 0:
+                coordinates.append(var % splits[var][0])
+            else:
+                coordinates.append(var)
+        else:
+            coordinates.append(sympy.S.Zero)
         new_tensors.append({"size": size, "coordinates": coordinates})
 
     rank = max([len(t["size"]) for t in new_tensors])
@@ -236,6 +245,23 @@ def align_tensors(var_ranges, tensors):
         gap = rank - len(t["size"])
         t["size"] = [sympy.S.One] * gap + t["size"]
         t["coordinates"] = [sympy.S.Zero] * gap + t["coordinates"]
+
+    for t in new_tensors:
+        vars = t["coordinates"][-1].free_symbols
+        if len(vars) == 1:
+            stick_dim_var = next(iter(vars))
+            found = False
+            for i in range(len(t["coordinates"]) - 1):
+                vars = t["coordinates"][i].free_symbols
+                if stick_dim_var in vars:
+                    found = True
+                    continue
+            if not found:
+                for i in range(len(t["coordinates"]) - 1):
+                    if t["size"][i] == 1:
+                        t["coordinates"][i] = stick_dim_var // t["size"][-1]
+                        t["coordinates"][-1] = stick_dim_var % t["size"][-1]
+                        continue
 
     return new_var_ranges, new_tensors
 
@@ -267,5 +293,26 @@ if __name__ == "__main__":
                     "coordinates": [floor(x0 / 64), x1, Mod(x0, 64)],
                 },
             ],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 128},
+            [{"size": [2, 64], "coordinates": [x0 // 64, x0 % 64]}],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 64},
+            [{"size": [1, 64], "coordinates": [sympy.S.Zero, x0]}],
+        )
+    )
+
+    print(
+        align_tensors(
+            {},
+            [{"size": [1, 64], "coordinates": [sympy.S.Zero, sympy.S.Zero]}],
         )
     )
