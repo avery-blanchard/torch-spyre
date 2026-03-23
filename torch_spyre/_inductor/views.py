@@ -189,13 +189,19 @@ def normalize_coordinates(var_ranges, size, coordinates):
 def align_tensors(var_ranges, tensors):
     splits = {var: set() for var in var_ranges.keys()}
     breakdown = []
+    stick_dim = []
+    stick_size = []
     for t in tensors:
         intervals = normalize_coordinates(var_ranges, t["size"], t["coordinates"])
+        stick_dim.append(intervals[-1][2])
+        stick_size.append(intervals[-1][-1])
         breakdown.append(intervals)
-        for num, den, var, mod, _ in intervals[:-1]:
+        for num, den, var, mod, _ in intervals:
             if var is not None:
-                splits[var].add(den)
-                splits[var].add(mod)
+                if den != stick_size[-1] or var != stick_dim[-1]:
+                    splits[var].add(den)
+                if mod != stick_size[-1] or var != stick_dim[-1]:
+                    splits[var].add(mod)
     splits = {var: sorted(val) for var, val in splits.items()}
 
     new_var_ranges = {}
@@ -203,21 +209,21 @@ def align_tensors(var_ranges, tensors):
     remap = {}
     for var, split in splits.items():
         if len(split) > 1:
-            new_var_ranges[var] = split[1]
-            remap[var] = [var // split[0]]
-            for i in range(2, len(split)):
+            new_var_ranges[var] = split[1] // split[0]
+            remap[var] = [var]
+            for i in range(1, len(split) - 1):
                 new_var = sympy.symbols(f"z{n}")
                 n += 1
-                new_var_ranges[new_var] = split[i] // split[i - 1]
+                new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
         else:
             new_var_ranges[var] = var_ranges[var]
 
     new_tensors = []
-    for intervals in breakdown:
+    for j, intervals in enumerate(breakdown):
         size = []
         coordinates = []
-        for num, den, var, mod, dim_size in intervals[:-1]:
+        for num, den, var, mod, dim_size in intervals:
             if var is None:
                 size.append(dim_size)
                 coordinates.append(sympy.S.Zero)
@@ -225,21 +231,25 @@ def align_tensors(var_ranges, tensors):
             if num * mod < dim_size:
                 size.append(dim_size // num // mod)
                 coordinates.append(sympy.S.Zero)
-            for i in reversed(range(splits[var].index(den), splits[var].index(mod))):
-                size.append(splits[var][i + 1] // splits[var][i])
-                coordinates.append(remap[var][i])
+            if var == stick_dim[j] and den == stick_size[j]:
+                for i in reversed(range(1, splits[var].index(mod))):
+                    size.append(splits[var][i + 1] // splits[var][i])
+                    coordinates.append(var)
+                size.append(splits[var][1] // den)
+                coordinates.append(var // den)
+            elif var == stick_dim[j] and mod == stick_size[j]:
+                size.append(mod)
+                coordinates.append(var % mod)
+            else:
+                for i in reversed(
+                    range(splits[var].index(den), splits[var].index(mod))
+                ):
+                    size.append(splits[var][i + 1] // splits[var][i])
+                    coordinates.append(remap[var][i])
             if num > 1:
                 size.append(num)
                 coordinates.append(sympy.S.Zero)
         num, den, var, mod, dim_size = intervals[-1]
-        size.append(dim_size)
-        if var is not None:
-            if len(splits[var]) > 0:
-                coordinates.append(var % splits[var][0])
-            else:
-                coordinates.append(var)
-        else:
-            coordinates.append(sympy.S.Zero)
         new_tensors.append({"size": size, "coordinates": coordinates})
 
     rank = max([len(t["size"]) for t in new_tensors])
@@ -338,6 +348,26 @@ if __name__ == "__main__":
                 {
                     "size": [32, 128, 2, 1, 64],
                     "coordinates": [x2, x1, floor(x0 / 64), sympy.S.Zero, Mod(x0, 64)],
+                },
+            ],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x2: 2, x1: 256, x3: 4096, x0: 4096},
+            [
+                {
+                    "size": [256, 32, 2, 2, 64],
+                    "coordinates": [x1, x3 // 128, x3 % 128 // 64, x2, x3 % 64],
+                },
+                {
+                    "size": [64, 4096, 64],
+                    "coordinates": [x0 // 64, x3, x0 % 64],
+                },
+                {
+                    "size": [256, 64, 2, 64],
+                    "coordinates": [x1, x0 // 64, x2, x0 % 64],
                 },
             ],
         )

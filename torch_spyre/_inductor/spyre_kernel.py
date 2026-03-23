@@ -518,8 +518,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Clone: check that device layout is the same.
                 op = IDENTITY_OP
             else:
-                # Unsupported data operation on TensorArg
-                raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
+                op = CLONE_OP
 
             op_spec = create_op_spec(op, False, out_di, args, op_info)
             if len(transposed_dims) > 0:
