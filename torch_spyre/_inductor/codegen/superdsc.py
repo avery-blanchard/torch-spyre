@@ -18,7 +18,6 @@ from typing import Any
 from torch_spyre._inductor.constants import (
     MATMUL_REDUCTION_OP,
     BATCH_MATMUL_OP,
-    RESTICKIFY_OP,
     IDENTITY_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -122,16 +121,6 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             raise Unsupported(
                 f"to_dtype from {inputs[0]['device_layout'].device_dtype} to {outputs[0]['device_layout'].device_dtype}"
             )
-
-    if op == RESTICKIFY_OP or op == IDENTITY_OP:
-        return generate_dldsc(
-            pointers,
-            op=op,
-            dimensions=dimensions,
-            inputs=inputs,
-            outputs=outputs,
-            **kwargs,
-        )
     return generate_sfp_op(
         pointers,
         op=op,
