@@ -40,7 +40,7 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol, iteration_space
-from .views import compute_coordinates
+from .views import compute_coordinates, align_tensors
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -706,6 +706,9 @@ class SpyreKernel(Kernel[CSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        for op_spec in self.op_specs:
+            simplify_op_spec(op_spec)
+
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
@@ -772,3 +775,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args.extend(self.args.python_argdefs()[1])
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+
+def simplify_op_spec(op_spec):
+    new_var_ranges, new_tensors = align_tensors(
+        op_spec.iteration_space_dict,
+        [
+            {
+                "size": arg.device_size,
+                "coordinates": arg.device_coordinates,
+            }
+            for arg in op_spec.args
+        ],
+    )
+    op_spec.iteration_space_dict = new_var_ranges
+    for arg, t in zip(op_spec.args, new_tensors):
+        arg.device_size = t["size"]
+        arg.device_coordinates = t["coordinates"]

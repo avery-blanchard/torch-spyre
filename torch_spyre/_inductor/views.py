@@ -138,3 +138,134 @@ def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
         return None
     else:
         return dims[0]
+
+
+def normalize_coordinates(var_ranges, size, coordinates):
+    results = []
+    for coordinate, dim_size in zip(coordinates, size):
+        expr = coordinate.replace(sympy.floor, lambda x: x)
+        vars = expr.free_symbols
+        if len(vars) == 0:
+            results.append([1, None, None, None, dim_size])
+        result = []
+        for var in vars:
+            term = expr.subs({v: 0 for v in vars - {var}})
+            if term.is_symbol:
+                result.append(
+                    [sympy.S.One, sympy.S.One, var, var_ranges[var], dim_size]
+                )
+            elif term.func == sympy.Mod:
+                result.append([sympy.S.One, sympy.S.One, var, term.args[1], dim_size])
+            elif term.func == sympy.Mul and term.args[0].is_rational:
+                expr0, expr1 = term.args
+                mod = expr1.args[1] if expr1.func == sympy.Mod else var_ranges[var]
+                result.append([expr0.numerator, expr0.denominator, var, mod, dim_size])
+            else:
+                raise IndexError
+        result.sort()
+        result.reverse()
+        for r in result:
+            r[-1] = dim_size // r[0]
+            dim_size = r[0]
+            results.append(r)
+
+    new_results = []
+    tmp = results[0]
+    for result in results[1:-1]:
+        if tmp[0] == 1 and tmp[1] == result[3] and tmp[2] == result[2]:
+            tmp[0] = result[0]
+            tmp[1] = result[1]
+            tmp[4] *= result[4]
+        else:
+            new_results.append(tmp)
+            tmp = result
+    new_results.append(tmp)
+    new_results.append(results[-1])
+    return new_results
+
+
+def align_tensors(var_ranges, tensors):
+    splits = {var: set() for var in var_ranges.keys()}
+    breakdown = []
+    for t in tensors:
+        intervals = normalize_coordinates(var_ranges, t["size"], t["coordinates"])
+        breakdown.append(intervals)
+        for num, den, var, mod, _ in intervals[:-1]:
+            if var is not None:
+                splits[var].add(den)
+                splits[var].add(mod)
+    splits = {var: sorted(val) for var, val in splits.items()}
+
+    new_var_ranges = {}
+    n = 0
+    remap = {}
+    for var, split in splits.items():
+        new_var_ranges[var] = split[1]
+        remap[var] = [var // split[0]]
+        for i in range(2, len(split)):
+            new_var = sympy.symbols(f"z{n}")
+            n += 1
+            new_var_ranges[new_var] = split[i] // split[i - 1]
+            remap[var].append(new_var)
+
+    new_tensors = []
+    for intervals in breakdown:
+        size = []
+        coordinates = []
+        for num, den, var, mod, dim_size in intervals[:-1]:
+            if var is None:
+                size.append(dim_size)
+                coordinates.append(sympy.S.Zero)
+                continue
+            if num * mod < dim_size:
+                size.append(dim_size // num // mod)
+                coordinates.append(sympy.S.Zero)
+            for i in reversed(range(splits[var].index(den), splits[var].index(mod))):
+                size.append(splits[var][i + 1] // splits[var][i])
+                coordinates.append(remap[var][i])
+            if num > 1:
+                size.append(num)
+                coordinates.append(sympy.S.Zero)
+        num, den, var, mod, dim_size = intervals[-1]
+        size.append(dim_size)
+        coordinates.append(var % splits[var][0])
+        new_tensors.append({"size": size, "coordinates": coordinates})
+
+    rank = max([len(t["size"]) for t in new_tensors])
+    for t in new_tensors:
+        gap = rank - len(t["size"])
+        t["size"] = [sympy.S.One] * gap + t["size"]
+        t["coordinates"] = [sympy.S.Zero] * gap + t["coordinates"]
+
+    return new_var_ranges, new_tensors
+
+
+if __name__ == "__main__":
+    from sympy import floor, Mod
+
+    x0, x1, x2, x3, x4, x5, x6 = sympy.symbols("x0 x1 x2 x3 x4 x5 x6")
+
+    print(
+        align_tensors(
+            {x0: 16384, x1: 256, x2: 30},
+            [
+                {
+                    "size": [2, 128, 256, 64],
+                    "coordinates": [
+                        floor((Mod(x0, 128)) / 64),
+                        floor(x0 / 128),
+                        x1,
+                        Mod(x0, 64),
+                    ],
+                },
+                {
+                    "size": [256, 1200, 64],
+                    "coordinates": [floor(x0 / 64), floor(x2 * 2), Mod(x0, 64)],
+                },
+                {
+                    "size": [256, 256, 64],
+                    "coordinates": [floor(x0 / 64), x1, Mod(x0, 64)],
+                },
+            ],
+        )
+    )
