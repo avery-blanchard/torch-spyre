@@ -19,47 +19,36 @@ from torch_spyre.ops.fallbacks import warn_fallback
 from .errors import Unsupported
 
 
+# TODO: implement as dl-dsc
+# see issue: https://github.com/torch-spyre/torch-spyre/issues/1173
 @torch.library.custom_op("spyre::compact", mutates_args=())
 def compact(input: torch.Tensor) -> torch.Tensor:
-    if len(input.size()) != 1:
-        raise Unsupported("compact not implemented for 1-D tensors")
-    return input.clone()
+    raise Unsupported("compact not implemented")
 
 
 @compact.register_fake
 def _(input):
-    if len(input.size()) != 1:
-        raise Unsupported("compact only implemented for 1-D tensors")
-    return input.new_empty(input.size())
+    raise Unsupported("compact not implemented")
 
 
 @torch.library.custom_op("spyre::swap", mutates_args=(), device_types="spyre")
 def swap(input: torch.Tensor) -> torch.Tensor:
-    if len(input.size()) != 1:
-        raise Unsupported("swap only implemented for 1-D tensors")
-    return input.new_empty_strided(input.size(), [64])
+    raise Unsupported("swap not implemented")
 
 
 @swap.register_fake
 def _(input):
-    if len(input.size()) != 1:
-        raise Unsupported("swap only implemented for 1-D tensors")
-    return input.new_empty_strided(input.size(), [64])
+    raise Unsupported("swap not implemented")
 
 
 @torch.library.custom_op("spyre::slice", mutates_args=(), device_types="spyre")
 def slice(input: torch.Tensor) -> torch.Tensor:
-    if len(input.size()) != 1:
-        raise Unsupported("slice only implemented for 1-D tensors")
-    output = input.new_empty(input.size())
-    return output
+    raise Unsupported("slice not implemented")
 
 
 @slice.register_fake
 def _(input):
-    if len(input.size()) != 1:
-        raise Unsupported("slice only implemented for 1-D tensors")
-    return input.new_empty(input.size())
+    raise Unsupported("slice not implemented")
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")

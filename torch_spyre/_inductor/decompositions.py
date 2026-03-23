@@ -306,9 +306,11 @@ def register_spyre_decompositions_via_dispatchkey(
     return decomposition_decorator
 
 
-@register_spyre_decomposition([torch.ops.spyre.compact])
-def compact_decomp(x: torch.Tensor) -> torch.Tensor:
-    return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
+# TODO: implement using dl-dsc
+# see issue: https://github.com/torch-spyre/torch-spyre/issues/1173
+# @register_spyre_decomposition([torch.ops.spyre.compact])
+# def compact_decomp(x: torch.Tensor) -> torch.Tensor:
+#     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
 
 # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates

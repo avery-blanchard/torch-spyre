@@ -27,7 +27,6 @@ from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (
-    generate_slice,
     generate_transpose,
     generate_transpose_3d_stick,
     generate_transpose_4d_stick,
@@ -116,15 +115,6 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             pointers,
             op=op,
             dimensions=[dimensions[0], 64],
-            inputs=inputs,
-            outputs=outputs,
-            **kwargs,
-        )
-    if op == "slice":
-        return generate_slice(
-            pointers,
-            op=op,
-            dimensions=dimensions,
             inputs=inputs,
             outputs=outputs,
             **kwargs,
