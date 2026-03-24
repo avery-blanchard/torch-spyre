@@ -261,7 +261,18 @@ def align_tensors(var_ranges, tensors, op_it_space_splits={}):
         num, den, var, mod, dim_size = intervals[-1]
         new_tensors.append({"size": size, "coordinates": coordinates})
 
-    rank = max([len(t["size"]) for t in new_tensors])
+    rank = 0
+    for i, t in enumerate(new_tensors):
+        if stick_dim[i] is None:
+            rank = max(rank, len(t["size"]))
+            continue
+        found = 1
+        for c, s in zip(t["coordinates"][:-1], t["size"][:-1]):
+            if stick_dim[i] in c.free_symbols or s == 1:
+                found = 0
+                break
+        rank = max(rank, len(t["size"]) + found)
+
     for t in new_tensors:
         gap = rank - len(t["size"])
         t["size"] = [sympy.S.One] * gap + t["size"]
@@ -282,7 +293,7 @@ def align_tensors(var_ranges, tensors, op_it_space_splits={}):
                     if t["size"][i] == 1:
                         t["coordinates"][i] = stick_dim_var // t["size"][-1]
                         t["coordinates"][-1] = stick_dim_var % t["size"][-1]
-                        continue
+                        break
 
     return new_var_ranges, new_tensors, new_op_it_space_splits
 
