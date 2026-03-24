@@ -57,10 +57,16 @@ class SDSCArgs:
         max_dim_sizes = ", ".join(f"{k}={v}" for k, v in self.max_dim_sizes.items())
         allocation = ", ".join(f"{k}={v}" for k, v in self.allocation.items())
         return (
-            f"SDSCArgs(layout={self.layout}, data_format={self.data_format.name},"
-            f" scales=[{scales}], strides=[{strides}], offsets=[{offsets}],"
-            f" max_dim_sizes=[{max_dim_sizes}], allocation=[{allocation}],"
-            f" start_address={self.start_address})"
+            f"SDSCArgs(\n"
+            f"  layout={self.layout},\n"
+            f"  data_format={self.data_format.name},\n"
+            f"  scales=[{scales}],\n"
+            f"  strides=[{strides}],\n"
+            f"  offsets=[{offsets}],\n"
+            f"  max_dim_sizes=[{max_dim_sizes}],\n"
+            f"  allocation=[{allocation}],\n"
+            f"  start_address={self.start_address}\n"
+            f")"
         )
 
 
@@ -83,36 +89,38 @@ class SDSCSpec:
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
         slices = ", ".join(f"{k}={v}" for k, v in self.work_slices.items())
-        layouts = ", ".join(
-            f"{label}=[{', '.join(str(d) for d in info['dim_order'])}]"
+        layouts = "\n".join(
+            f"    {label}: dim_order=[{', '.join(str(d) for d in info['dim_order'])}],"
+            f" stick_dim_order={info['stick_dim_order']},"
+            f" stick_size={info['stick_size']}"
             for label, info in self.layouts.items()
         )
-        args = ", ".join(str(a) for a in self.args)
+        args = "\n".join("  " + line for a in self.args for line in str(a).splitlines())
         parts = [
-            f"opfunc={self.opfunc}",
-            f"exec_unit={self.execution_unit}",
-            f"data_format={self.data_format.name}",
-            f"num_inputs={self.num_inputs}",
-            f"iteration_space=[{iter_space}]",
-            f"work_slices=[{slices}]",
-            f"layouts=[{layouts}]",
-            f"args=[{args}]",
+            f"  opfunc={self.opfunc}",
+            f"  exec_unit={self.execution_unit}",
+            f"  data_format={self.data_format.name}",
+            f"  num_inputs={self.num_inputs}",
+            f"  iteration_space=[{iter_space}]",
+            f"  work_slices=[{slices}]",
+            f"  layouts=[\n{layouts}\n  ]",
+            f"  args=[\n{args}\n  ]",
         ]
         if self.padding:
             parts.append(
-                f"padding=[{', '.join(f'{k}={v}' for k, v in self.padding.items())}]"
+                f"  padding=[{', '.join(f'{k}={v}' for k, v in self.padding.items())}]"
             )
         if self.coordinate_masking:
             parts.append(
-                "coordinate_masking=["
+                "  coordinate_masking=["
                 + ", ".join(f"{k}={v}" for k, v in self.coordinate_masking.items())
                 + "]"
             )
         if self.constants:
             parts.append(
-                f"constants=[{', '.join(f'{k}={v}' for k, v in self.constants.items())}]"
+                f"  constants=[{', '.join(f'{k}={v}' for k, v in self.constants.items())}]"
             )
-        return "SDSCSpec(" + ", ".join(parts) + ")"
+        return "SDSCSpec(\n" + "\n".join(parts) + "\n)"
 
 
 def _get_mask_value(op: str) -> float:
