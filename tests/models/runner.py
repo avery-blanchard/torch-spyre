@@ -256,7 +256,9 @@ def parse_dtype(spec) -> torch.dtype:
     )
 
 
-def make_SampleInput(case: Dict[str, Any], seed, dtype: torch.dtype) -> SampleInput:
+def make_SampleInput(
+    case: Dict[str, Any], seed, dtype: torch.dtype, test_device: torch.device
+) -> SampleInput:
     dtype_str = str(dtype)
     cpu_args = []
     for i, inp in enumerate(case.get("inputs", [])):
@@ -286,6 +288,11 @@ def make_SampleInput(case: Dict[str, Any], seed, dtype: torch.dtype) -> SampleIn
                     val = ast.literal_eval(val)
                 except (ValueError, SyntaxError):
                     pass
+                # if test target is tensor.to("cuda:0"), replace "cuda:0" with test_device
+                op_name = case.get("op")
+                if test_device is not None and op_name == "torch.to":
+                    if "cuda" in val:
+                        val = test_device
             cpu_args.append(val)  # python scalar or list, etc.
         elif "py" in inp:
             cpu_args.append(parse_py_value(inp["py"]))
@@ -302,6 +309,10 @@ def make_SampleInput(case: Dict[str, Any], seed, dtype: torch.dtype) -> SampleIn
                     value = ast.literal_eval(value)
                 except (ValueError, SyntaxError):
                     pass
+            # if test target has (device="cuda:0"), replace "cuda:0" with test_device
+            if test_device is not None and key == "device":
+                if "cuda" in value:
+                    value = test_device
         attrs[key] = value
 
     args = tuple(cpu_args[1:]) if len(cpu_args) > 1 else None
