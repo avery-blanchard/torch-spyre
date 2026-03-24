@@ -14,6 +14,7 @@
 
 # Helper methods to handle views
 
+import math
 import sympy
 from typing import Optional, Sequence
 
@@ -186,7 +187,7 @@ def normalize_coordinates(var_ranges, size, coordinates):
     return new_results
 
 
-def align_tensors(var_ranges, tensors):
+def align_tensors(var_ranges, tensors, op_it_space_splits={}):
     splits = {var: set() for var in var_ranges.keys()}
     breakdown = []
     stick_dim = []
@@ -205,9 +206,11 @@ def align_tensors(var_ranges, tensors):
     splits = {var: sorted(val) for var, val in splits.items()}
 
     new_var_ranges = {}
+    new_op_it_space_splits = {}
     n = 0
     remap = {}
     for var, split in splits.items():
+        div = op_it_space_splits[var] if var in op_it_space_splits else 1
         if len(split) > 1:
             new_var_ranges[var] = split[1] // split[0]
             remap[var] = [var]
@@ -216,8 +219,14 @@ def align_tensors(var_ranges, tensors):
                 n += 1
                 new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
+            for v in reversed(remap[var]):
+                new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
+                div //= new_op_it_space_splits[v]
         else:
             new_var_ranges[var] = var_ranges[var]
+            new_op_it_space_splits[var] = (
+                op_it_space_splits[var] if var in op_it_space_splits else 1
+            )
 
     new_tensors = []
     for j, intervals in enumerate(breakdown):
@@ -275,7 +284,7 @@ def align_tensors(var_ranges, tensors):
                         t["coordinates"][-1] = stick_dim_var % t["size"][-1]
                         continue
 
-    return new_var_ranges, new_tensors
+    return new_var_ranges, new_tensors, new_op_it_space_splits
 
 
 if __name__ == "__main__":
@@ -370,5 +379,37 @@ if __name__ == "__main__":
                     "coordinates": [x1, x0 // 64, x2, x0 % 64],
                 },
             ],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 128, x1: 256},
+            [
+                {
+                    "size": [16, 2, 16, 64],
+                    "coordinates": [x1 // 16, x0 // 64, x1 % 16, x0 % 64],
+                }
+            ],
+            {x0: 1, x1: 32},
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 128, x1: 256},
+            [
+                {
+                    "size": [4, 2, 16, 4, 64],
+                    "coordinates": [
+                        x1 // 64,
+                        x0 // 64,
+                        x1 % 16,
+                        x1 % 64 // 16,
+                        x0 % 64,
+                    ],
+                }
+            ],
+            {x0: 1, x1: 32},
         )
     )
