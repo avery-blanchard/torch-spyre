@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import dataclasses
-import logging
 import math
 from typing import Any
 
@@ -43,7 +42,7 @@ logger = get_inductor_logger("codegen.superdsc")
 
 @dataclasses.dataclass
 class SDSCArgs:
-    layout: int
+    layout: str
     data_format: DataFormats
     scales: dict[Symbol, Any]
     strides: dict[Symbol, Any]
@@ -51,6 +50,19 @@ class SDSCArgs:
     max_dim_sizes: dict[Symbol, Any]
     allocation: dict[str, Any]
     start_address: int | Symbol
+
+    def __str__(self) -> str:
+        scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
+        strides = ", ".join(f"{k}={v}" for k, v in self.strides.items())
+        offsets = ", ".join(f"{k}={v}" for k, v in self.offsets.items())
+        max_dim_sizes = ", ".join(f"{k}={v}" for k, v in self.max_dim_sizes.items())
+        allocation = ", ".join(f"{k}={v}" for k, v in self.allocation.items())
+        return (
+            f"SDSCArgs(layout={self.layout}, data_format={self.data_format.name},"
+            f" scales=[{scales}], strides=[{strides}], offsets=[{offsets}],"
+            f" max_dim_sizes=[{max_dim_sizes}], allocation=[{allocation}],"
+            f" start_address={self.start_address})"
+        )
 
 
 @dataclasses.dataclass
@@ -65,9 +77,43 @@ class SDSCSpec:
     core_id_to_work_slice: dict[Symbol, Any]
     padding: dict[Symbol, Any]
     layouts: dict[int, Any]
-    args: dict[str, Any]
+    args: list[SDSCArgs]
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
+
+    def __str__(self) -> str:
+        iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
+        slices = ", ".join(f"{k}={v}" for k, v in self.work_slices.items())
+        layouts = ", ".join(
+            f"{label}=[{', '.join(str(d) for d in info['dim_order'])}]"
+            for label, info in self.layouts.items()
+        )
+        args = ", ".join(str(a) for a in self.args)
+        parts = [
+            f"opfunc={self.opfunc}",
+            f"exec_unit={self.execution_unit}",
+            f"data_format={self.data_format.name}",
+            f"num_inputs={self.num_inputs}",
+            f"iteration_space=[{iter_space}]",
+            f"work_slices=[{slices}]",
+            f"layouts=[{layouts}]",
+            f"args=[{args}]",
+        ]
+        if self.padding:
+            parts.append(
+                f"padding=[{', '.join(f'{k}={v}' for k, v in self.padding.items())}]"
+            )
+        if self.coordinate_masking:
+            parts.append(
+                "coordinate_masking=["
+                + ", ".join(f"{k}={v}" for k, v in self.coordinate_masking.items())
+                + "]"
+            )
+        if self.constants:
+            parts.append(
+                f"constants=[{', '.join(f'{k}={v}' for k, v in self.constants.items())}]"
+            )
+        return "SDSCSpec(" + ", ".join(parts) + ")"
 
 
 def _get_mask_value(op: str) -> float:
@@ -184,12 +230,12 @@ def _create_sdsc_tensors(
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
 
-        for rank_idx, dim in enumerate(reversed(dim_order)):
+        for dim_idx, dim in enumerate(reversed(dim_order)):
             if dim in reduced_dims:
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             else:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(rank_idx, arg.device_size)
+            strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
 
@@ -246,7 +292,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
     if is_matmul:
-        pad_args, pad_sdsc_args = op_spec.args, args
+        pad_args, pad_sdsc_args = list(op_spec.args), args
     elif op_spec.is_reduction:
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
@@ -265,7 +311,9 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
         execution_unit="pt" if is_matmul else "sfp",
-        data_format=op_spec.args[0].device_dtype,
+        data_format=op_spec.args[
+            0
+        ].device_dtype,  # TODO: op_spec needs operation data format
         num_inputs=num_inputs,
         iteration_space=sdsc_iteration_space,
         num_cores=1,
@@ -281,8 +329,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
 def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> tuple[Any, list[int]]:
     sdsc_spec = parse_op_spec(op_spec)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("SDSCSpec: %s", sdsc_spec)
+    logger.debug("%s", sdsc_spec)
 
     arg_map = [ts.arg_index for ts in op_spec.args]
     dt_sdsc = generate_sdsc(sdsc_spec)
