@@ -68,11 +68,10 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
         if stride_val in layout.stride:
             idx = layout.stride.index(stride_val)
             result[idx] = sym
-
-    for d in range(len(layout.size)):
-        if d not in result:
-            # assert layout.size[d] == 1, "non-trivial dim missing from index expression"
-            result[d] = wildcard_symbol(d)
+    # for d in range(len(layout.size)):
+    #     if d not in result:
+    #         # assert layout.size[d] == 1, "non-trivial dim missing from index expression"
+    #         result[d] = wildcard_symbol(d)
 
     return result
 
