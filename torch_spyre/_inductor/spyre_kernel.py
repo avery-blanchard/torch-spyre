@@ -345,34 +345,6 @@ def analyze_tensor_access(
     return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
 
 
-def create_op_spec(
-    op: str,
-    is_reduction: bool,
-    dims: list[DimensionInfo],
-    args: Sequence[TensorArg],
-    op_info: dict[str, Any],
-) -> OpSpec:
-    for arg in args:
-        if (
-            arg.device_layout.device_dtype == DataFormats.IEEE_FP32
-            and op not in SPYRE_FP32_OPS
-        ):
-            raise Unsupported(f"{op} on {arg.dtype} dtype")
-        elif arg.device_layout.device_dtype not in [
-            DataFormats.IEEE_FP32,
-            DataFormats.SEN169_FP16,
-        ]:
-            raise Unsupported(f"operations on {arg.dtype} dtype")
-    return OpSpec(
-        op,
-        is_reduction,
-        [d.numel for d in dims],
-        {d.var: d.numel for d in dims},
-        args,
-        op_info,
-    )
-
-
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -411,6 +383,46 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
+
+    def create_op_spec(
+        self,
+        op: str,
+        is_reduction: bool,
+        dims: list[DimensionInfo],
+        args: Sequence[TensorArg],
+        op_info: dict[str, Any],
+    ) -> OpSpec:
+        for arg in args:
+            if (
+                arg.device_layout.device_dtype == DataFormats.IEEE_FP32
+                and op not in SPYRE_FP32_OPS
+            ):
+                raise Unsupported(f"{op} on {arg.dtype} dtype")
+            elif arg.device_layout.device_dtype not in [
+                DataFormats.IEEE_FP32,
+                DataFormats.SEN169_FP16,
+            ]:
+                raise Unsupported(f"operations on {arg.dtype} dtype")
+
+        if hasattr(self.current_node, "op_dim_splits"):
+            op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
+        if hasattr(self.current_node, "n_cores_used"):
+            op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
+
+        core_division: dict[sympy.Symbol, int] = {}
+        if hasattr(self.current_node, "op_it_space_splits"):
+            core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]
+
+        it_space = {d.var: (d.numel, core_division.get(d.var, 1)) for d in dims}
+
+        return OpSpec(
+            op,
+            is_reduction,
+            [d.numel for d in dims],
+            it_space,
+            args,
+            op_info,
+        )
 
     def remove_kernel_local_buffers(self) -> None:
         """Do not remove kernel local buffers becasue we need the allocate in hbm/lx"""
@@ -451,12 +463,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
-        op_info = {}
-        if hasattr(self.current_node, "op_dim_splits"):
-            op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
-        if hasattr(self.current_node, "n_cores_used"):
-            op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
-
+        op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
             logger.debug(
@@ -477,7 +484,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst, di))
             op_info.update(value.op_info)
-            self.op_specs.append(create_op_spec(value.op, False, di, args, op_info))
+            self.op_specs.append(
+                self.create_op_spec(value.op, False, di, args, op_info)
+            )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
             in_di = self.derive_dim_info(value)
@@ -520,9 +529,17 @@ class SpyreKernel(Kernel[CSEVariable]):
             else:
                 op = CLONE_OP
 
+<<<<<<< HEAD
             op_spec = create_op_spec(op, False, out_di, args, op_info)
             if len(transposed_dims) > 0:
                 op_spec.op_info["transposed_dims"] = transposed_dims
+=======
+            op_spec = self.create_op_spec(op, False, out_di, args, op_info)
+            if op == TRANSPOSE_OP:
+                op_spec.op_info["transposed_dims"] = [
+                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
+                ]
+>>>>>>> c8210b3 (Implement view-aware core divsion for pointwise ops (#1192))
                 # Reorder it_dim_map of the input to implement transpositions
                 (
                     op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
@@ -558,10 +575,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_info = {}
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
-        if hasattr(self.current_node, "op_dim_splits"):
-            op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
-        if hasattr(self.current_node, "n_cores_used"):
-            op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -599,7 +612,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(True, y.name, y, di),
                 self.create_tensor_arg(False, real_dst_name, dst, di),
             ]
-            self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
+            self.op_specs.append(self.create_op_spec(value.op, True, di, args, op_info))
         elif value.op == BATCH_MATMUL_OP:
             if (
                 len(value.arguments) != 2
@@ -673,7 +686,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(True, y.name, y, di),
                 self.create_tensor_arg(False, real_dst_name, dst, di),
             ]
-            self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
+            self.op_specs.append(self.create_op_spec(value.op, True, di, args, op_info))
         else:
             # All other reductions have exactly one input which is a tensor
             if (not len(value.arguments) == 1) or (
@@ -686,7 +699,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(True, x.name, x, di),
                 self.create_tensor_arg(False, real_dst_name, dst, di),
             ]
-            self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
+            self.op_specs.append(self.create_op_spec(value.op, True, di, args, op_info))
 
     def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
         """
@@ -736,7 +749,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                         buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
                         buf.writeline(
                             "iteration_space_dict={"
-                            + f"{', '.join([sympy.srepr(k) + ': ' + sympy.srepr(v) for k, v in op_spec.iteration_space_dict.items()])}"
+                            + f"{', '.join([sympy.srepr(k) + ': (' + sympy.srepr(v[0]) + ', ' + str(v[1]) + ')' for k, v in op_spec.iteration_space_dict.items()])}"
                             + "},"
                         )
                         buf.writeline(f"op_info={op_spec.op_info!r},")

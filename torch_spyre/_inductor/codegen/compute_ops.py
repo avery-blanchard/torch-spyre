@@ -14,17 +14,6 @@
 
 
 from torch_spyre._C import encode_constant, DataFormats
-<<<<<<< HEAD
-from torch_spyre._inductor.constants import (
-    LAYOUT_INPUT_LABELS,
-    LAYOUT_OUTPUT_LABELS,
-    INPUT_DIM_LABELS,
-    OUTPUT_DIM_LABELS,
-    RESTICKIFY_OP,
-    IDENTITY_OP,
-)
-=======
->>>>>>> 5ad07e6 (Outline sdscspec)
 
 
 def swap_last_two_elements(x: list):
