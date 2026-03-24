@@ -272,6 +272,10 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space_dict)
     }
+    logger.debug(
+        "symbol mapping: %s",
+        ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
+    )
 
     sdsc_iteration_space = {
         symbol_mapping[sym]: (v.p if isinstance(v, Integer) else v)
