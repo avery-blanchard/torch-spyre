@@ -19,38 +19,6 @@ from torch_spyre.ops.fallbacks import warn_fallback
 from .errors import Unsupported
 
 
-# TODO: implement as dl-dsc
-# see issue: https://github.com/torch-spyre/torch-spyre/issues/1173
-@torch.library.custom_op("spyre::compact", mutates_args=())
-def compact(input: torch.Tensor) -> torch.Tensor:
-    raise Unsupported("compact not implemented")
-
-
-@compact.register_fake
-def _(input):
-    raise Unsupported("compact not implemented")
-
-
-@torch.library.custom_op("spyre::swap", mutates_args=(), device_types="spyre")
-def swap(input: torch.Tensor) -> torch.Tensor:
-    raise Unsupported("swap not implemented")
-
-
-@swap.register_fake
-def _(input):
-    raise Unsupported("swap not implemented")
-
-
-@torch.library.custom_op("spyre::slice", mutates_args=(), device_types="spyre")
-def slice(input: torch.Tensor) -> torch.Tensor:
-    raise Unsupported("slice not implemented")
-
-
-@slice.register_fake
-def _(input):
-    raise Unsupported("slice not implemented")
-
-
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0

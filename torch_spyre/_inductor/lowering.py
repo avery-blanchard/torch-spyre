@@ -336,44 +336,6 @@ def lower_bmm(x, y):
     return result
 
 
-@register_spyre_lowering(torch.ops.spyre.swap)
-def lower_swap(x):
-    fn = lowering.ops_wrapper(torch.ops.spyre.swap.__name__)
-
-    def inner_fn(index):
-        return fn(x.make_loader()(index))
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.slice)
-def lower_slice(x):
-    fn = lowering.ops_wrapper(torch.ops.spyre.slice.__name__)
-
-    def inner_fn(index):
-        return fn(x.make_loader()(index))
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
 @register_spyre_lowering(torch.ops.spyre.exx2)
 def lower_exx2(x, exx2Scale, useZeroMean):
     kwargs = lowering._make_reduction_inner(

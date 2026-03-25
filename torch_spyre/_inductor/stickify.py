@@ -112,26 +112,6 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x = args[0]
         x_stl = x.layout.device_layout
         match op:
-            case spyreop.slice.default:
-                if not is_sparse(x_stl):
-                    raise Unsupported("slice on non-sparse tensor")
-                if len(x.layout.size) != 1:
-                    raise Unsupported("slice on non 1-D tensor")
-                stl = SpyreTensorLayout(output.size, output.dtype)
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
-
-            case spyreop.swap.default:
-                if not is_sparse(x_stl):
-                    raise Unsupported("swap on non-sparse tensor")
-                if len(x.layout.size) != 1:
-                    raise Unsupported("swap on non 1-D tensor")
-                stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
-
             case aten.clone.default:
                 if is_sparse(x_stl):
                     # TODO: Determine whether we already support cloning a sparse tensor

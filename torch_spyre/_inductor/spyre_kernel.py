@@ -206,14 +206,6 @@ class SpyreOpFuncs:
         return PointwiseOp("rsqrt", [x])
 
     @staticmethod
-    def slice(x):
-        return PointwiseOp("slice", [x])
-
-    @staticmethod
-    def swap(x):
-        return PointwiseOp("swap", [x])
-
-    @staticmethod
     def sigmoid(x):
         return PointwiseOp("sigmoid", [x])
 
