@@ -501,15 +501,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             out_stick_vars = args[1].device_coordinates[-1].free_symbols
 
             # Determine data op based on tensor args
-            if in_stick_vars != out_stick_vars:
-                op = RESTICKIFY_OP
-            elif all(is_wildcard(d.var) for d in in_di) and not all(
+            if all(is_wildcard(d.var) for d in in_di) and not all(
                 is_wildcard(d.var) for d in out_di
             ):
                 # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
                 op = IDENTITY_OP
                 in_di = out_di
                 args[0] = self.create_tensor_arg(True, value.name, value, in_di)
+            elif in_stick_vars != out_stick_vars:
+                op = RESTICKIFY_OP
             elif in_coords != out_coords:
                 op = IDENTITY_OP
             elif in_coords == out_coords:
