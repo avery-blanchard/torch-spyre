@@ -270,7 +270,7 @@ def align_tensors(iteration_space, tensors):
     rank = 0
     for i, t in enumerate(new_tensors):
         if stick_dim[i] is None:
-            rank = max(rank, len(t["size"]))
+            rank = max(2, rank, len(t["size"]))
             continue
         found = 1
         for c, s in zip(t["coordinates"][:-1], t["size"][:-1]):
