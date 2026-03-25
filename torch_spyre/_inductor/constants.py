@@ -54,3 +54,4 @@ LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j"]
 OUTPUT_DIM_LABELS = ["out"]
+MATMUL_DIM_LABELS = ["x", "y", "mb", "in", "out"]

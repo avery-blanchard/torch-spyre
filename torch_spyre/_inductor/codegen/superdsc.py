@@ -25,6 +25,7 @@ from torch_spyre._inductor.constants import (
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
     OUTPUT_DIM_LABELS,
+    MATMUL_DIM_LABELS,
     SEGMENT_OFFSETS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -233,6 +234,12 @@ def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul")
 
 
+def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
+    if is_matmul:
+        return MATMUL_DIM_LABELS[5 - ndim :]
+    return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -300,7 +307,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space_dict)
-    dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+    dim_labels = _get_op_dim_labels(ndim, is_matmul)
 
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space_dict)
