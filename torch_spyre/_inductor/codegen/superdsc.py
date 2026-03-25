@@ -267,10 +267,13 @@ def _create_sdsc_tensors(
         elif use_op_dims and dim_order != dims:
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
-
+        if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
+            reduced_dims = [stick_dim]
         for dim_idx, dim in enumerate(reversed(dim_order)):
-            if dim in reduced_dims:
+            if dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
+            elif dim in reduced_dims and op_spec.op == "layernormscale":
+                scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
             strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
