@@ -187,8 +187,12 @@ def normalize_coordinates(var_ranges, size, coordinates):
     return new_results
 
 
-def align_tensors(var_ranges, tensors, op_it_space_splits={}):
+def align_tensors(iteration_space, tensors):
+    print(iteration_space)
+    var_ranges = {var: val[0] for var, val in iteration_space.items()}
+    op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
     splits = {var: set() for var in var_ranges.keys()}
+
     breakdown = []
     stick_dim = []
     stick_size = []
@@ -232,7 +236,7 @@ def align_tensors(var_ranges, tensors, op_it_space_splits={}):
     for j, intervals in enumerate(breakdown):
         size = []
         coordinates = []
-        for num, den, var, mod, dim_size in intervals:
+        for num, den, var, mod, dim_size in intervals[:-1]:
             if var is None:
                 size.append(dim_size)
                 coordinates.append(sympy.S.Zero)
@@ -259,6 +263,8 @@ def align_tensors(var_ranges, tensors, op_it_space_splits={}):
                 size.append(num)
                 coordinates.append(sympy.S.Zero)
         num, den, var, mod, dim_size = intervals[-1]
+        size.append(dim_size)
+        coordinates.append(var % dim_size if var is not None else sympy.S.Zero)
         new_tensors.append({"size": size, "coordinates": coordinates})
 
     rank = 0
@@ -422,5 +428,12 @@ if __name__ == "__main__":
                 }
             ],
             {x0: 1, x1: 32},
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 10},
+            [{"size": [1, 64], "coordinates": [sympy.S.Zero, x0]}],
         )
     )

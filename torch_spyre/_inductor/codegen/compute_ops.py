@@ -14,68 +14,19 @@
 
 
 from torch_spyre._C import encode_constant, DataFormats
+from sympy import Symbol
 
 
-def swap_last_two_elements(x: list):
-    assert len(x) >= 2
-    return x[:-2] + x[-1:] + x[-2:-1]
-
-
-def calculate_core_to_slice_mapping(
-    iteration_space, dim_splits: list[int]
-) -> dict[str, dict[str, int]]:
-    """
-    Calculate mapping from core ID to slice indices for each dimension.
-
-    Iterates dimensions right-to-left (innermost varies fastest), similar to
-    row-major ordering in multi-dimensional arrays.
-
-    Args:
-        dim_labels: List of dimension labels (e.g., ["mb", "out", "x"])
-        dim_splits: Number of splits per dimension (e.g., [2, 4, 1])
-
-    Returns:
-        Dictionary mapping core ID (as string) to dimension slice indices
-    """
-    total_cores = 1
-    for splits in dim_splits:
-        total_cores *= splits
-
-    core_to_slice = {}
-
-    for core_id in range(total_cores):
-        # Calculate multi-dimensional index from flat core_id
-        # Iterate right-to-left (innermost dimension varies fastest)
-        indices = {}
-        remaining = core_id
-
-        for i, (dim, _) in enumerate(iteration_space.items()):
-            indices[str(dim)] = remaining % dim_splits[i]
-            remaining //= dim_splits[i]
-
-        core_to_slice[str(core_id)] = indices
-
-    return core_to_slice
-
-
-# def core_idx_to_slice_offset(
-#     dim_info_list: list[DimInfo],
-#     wk_slice: dict[str, int],
-#     device_size: list[int],
-# ) -> int:
-#     # compute tensor specific strides from its device layout
-#     strides = {}
-#     for i, di in enumerate(dim_info_list):
-#         strides[di.label] = math.prod(device_size[-i - 2 :])
-
-#     # Calculate offset by accumulating contribution from each dimension
-#     offset = 0
-#     for di in dim_info_list:
-#         label = di.label
-#         slice_idx = wk_slice[label]
-#         offset += slice_idx * strides[label] // di.nsplits
-
-#     return offset
+def core_idx_to_slice_offset(
+    arg,
+    wk_slice: dict,
+    work_slices: dict,
+) -> int:
+    offset = 0
+    for dim, stride in arg.strides.items():
+        if dim in wk_slice:
+            offset += wk_slice[dim] * stride // work_slices[dim]
+    return offset
 
 
 def num_bytes(df: DataFormats) -> int:
@@ -255,13 +206,14 @@ def gen_coord_info_value(
 
 
 def generate_sdsc(sdsc_spec):
-    ndim = len(sdsc_spec.iteration_space)
-    cores = 1
-    dim_splits = [1] * ndim
     out_idx = len(sdsc_spec.args) - 1
-    core_id_to_wk_slice = calculate_core_to_slice_mapping(
-        sdsc_spec.iteration_space, dim_splits
-    )
+    core_id_to_wk_slice = {
+        str(c): {
+            str(dim): int(expr.subs({Symbol("core_id"): c}))
+            for dim, expr in sdsc_spec.core_id_to_work_slice.items()
+        }
+        for c in range(sdsc_spec.num_cores)
+    }
     return {
         sdsc_spec.opfunc: {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -270,22 +222,24 @@ def generate_sdsc(sdsc_spec):
                 "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
                 "data_": {"[0]": "0"},
             },
-            "coreFoldProp_": {"factor_": cores, "label_": "core"},
+            "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
             "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-            "numCoresUsed_": cores,
-            "coreIdToDsc_": {str(c): 0 for c in range(cores)},
+            "numCoresUsed_": sdsc_spec.num_cores,
+            "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
             "numWkSlicesPerDim_": {
                 str(dim): num_wk_slices
                 for dim, num_wk_slices in sdsc_spec.work_slices.items()
             },
             "coreIdToWkSlice_": core_id_to_wk_slice,
-            "coreIdToDscSchedule": {str(c): [[-1, 0, 0, 0]] for c in range(cores)},
+            "coreIdToDscSchedule": {
+                str(c): [[-1, 0, 0, 0]] for c in range(sdsc_spec.num_cores)
+            },
             "dscs_": [
                 {
                     sdsc_spec.opfunc: {
-                        "numCoresUsed_": cores,
+                        "numCoresUsed_": sdsc_spec.num_cores,
                         "numCoreletsUsed_": 1,
-                        "coreIdsUsed_": [c for c in range(cores)],
+                        "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
                         "N_": {
                             "name_": "n",
                             **{
@@ -352,13 +306,24 @@ def generate_sdsc(sdsc_spec):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
+                                        {
+                                            "factor_": sdsc_spec.num_cores,
+                                            "label_": "core",
+                                        },
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        f"[{c}, 0, 0]": str(tensor.start_address)
-                                        for c in range(cores)
+                                        f"[{c}, 0, 0]": str(
+                                            tensor.start_address
+                                            + core_idx_to_slice_offset(
+                                                tensor,
+                                                core_id_to_wk_slice[str(c)],
+                                                sdsc_spec.work_slices,
+                                            )
+                                            * num_bytes(tensor.data_format)
+                                        )
+                                        for c in range(sdsc_spec.num_cores)
                                     },
                                 },
                                 "coordinates_": {
@@ -404,7 +369,7 @@ def generate_sdsc(sdsc_spec):
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
                                 },
-                                # if tensor["lx_addr"] is None
+                                # if tensor.allocation is None
                                 # else {"lx": {"isPresent": 1}},
                             }
                             for i, tensor in enumerate(sdsc_spec.args)

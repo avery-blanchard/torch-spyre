@@ -16,7 +16,7 @@ import dataclasses
 import math
 from typing import Any
 
-from sympy import Integer, Symbol
+from sympy import Integer, Symbol, Expr, Mod
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
@@ -96,6 +96,9 @@ class SDSCSpec:
             f" stick_size={info['stick_size']}"
             for label, info in self.layouts.items()
         )
+        core_slice_map = ", ".join(
+            f"{k}={v}" for k, v in self.core_id_to_work_slice.items()
+        )
         args = "\n".join("  " + line for a in self.args for line in str(a).splitlines())
         parts = [
             f"  opfunc={self.opfunc}",
@@ -104,6 +107,7 @@ class SDSCSpec:
             f"  num_inputs={self.num_inputs}",
             f"  iteration_space=[{iter_space}]",
             f"  work_slices=[{slices}]",
+            f"  core_id_to_work_slice=[{core_slice_map}]",
             f"  layouts=[\n{layouts}\n  ]",
             f"  args=[\n{args}\n  ]",
         ]
@@ -122,6 +126,28 @@ class SDSCSpec:
                 f"  constants=[{', '.join(f'{k}={v}' for k, v in self.constants.items())}]"
             )
         return "SDSCSpec(\n" + "\n".join(parts) + "\n)"
+
+
+def _get_core_to_slice_mapping(
+    iteration_space, dim_splits: list[int], num_cores: int
+) -> dict[Symbol, Expr]:
+    core_id_sym = Symbol("core_id")
+
+    dim_to_expr: dict[str, object] = {}
+    inner_product = Integer(1)
+
+    for i, dim in enumerate(iteration_space):
+        n = dim_splits[i]
+        if n == 1:
+            expr = Integer(0)
+        elif inner_product == Integer(1):
+            expr = Mod(core_id_sym, Integer(n))
+        else:
+            expr = Mod(floor(core_id_sym / inner_product), Integer(n))
+        dim_to_expr[str(dim)] = expr
+        inner_product = inner_product * Integer(n)
+
+    return dim_to_expr
 
 
 def _get_mask_value(op: str) -> float:
@@ -186,10 +212,11 @@ def _get_padded_iteration_space(
     sdsc_iteration_space: dict,
     layouts: dict,
 ) -> dict:
-    """Compute padding per dim when device size exceeds iteration space.
+    """
+    Compute padding per dim when device size exceeds iteration space.
 
-    Change sdsc_iteration_space in-place when padding is needed.
-    Returns a dict mapping dim -> padding amount (absent dims have no padding).
+    Update sdsc_iteration_space when padding is needed.
+    Returns a mapping of dim -> padding amount
     """
     padding: dict = {}
     for sdsc_arg, op_spec_arg in zip(sdsc_args, op_spec_args):
@@ -253,14 +280,14 @@ def _create_sdsc_tensors(
         )
         sdsc_args.append(
             SDSCArgs(
-                label,
-                arg.device_dtype,
-                scales,
-                strides,
-                offsets,
-                max_dim_sizes,
-                arg.allocation,
-                addr,
+                layout=label,
+                data_format=arg.device_dtype,
+                scales=scales,
+                strides=strides,
+                offsets=offsets,
+                max_dim_sizes=max_dim_sizes,
+                allocation=arg.allocation,
+                start_address=addr,
             )
         )
     return sdsc_args, layouts
@@ -286,10 +313,16 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
     sdsc_iteration_space = {
-        symbol_mapping[sym]: (v.p if isinstance(v, Integer) else v)
-        for sym, v in op_spec.iteration_space_dict.items()
+        symbol_mapping[sym]: (size.p if isinstance(size, Integer) else size)
+        for sym, (size, _) in op_spec.iteration_space_dict.items()
     }
-    work_slices = {sym: 1 for sym in sdsc_iteration_space}
+
+    dim_splits = [n_cores for _, n_cores in op_spec.iteration_space_dict.values()]
+    num_cores = math.prod(dim_splits)
+    work_slices = {
+        symbol_mapping[sym]: wk_slice
+        for sym, (_, wk_slice) in op_spec.iteration_space_dict.items()
+    }
 
     ref_arg = op_spec.args[0] if op_spec.is_reduction else op_spec.args[-1]
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
@@ -298,6 +331,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
+        dim_splits.append(1)
 
     args, layouts = _create_sdsc_tensors(
         op_spec, symbol_mapping, sdsc_iteration_space, op_dim_order, op_stick_dim
@@ -328,9 +362,11 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         ].device_dtype,  # TODO: op_spec needs operation data format
         num_inputs=num_inputs,
         iteration_space=sdsc_iteration_space,
-        num_cores=1,
+        num_cores=num_cores,
         work_slices=work_slices,
-        core_id_to_work_slice={},
+        core_id_to_work_slice=_get_core_to_slice_mapping(
+            sdsc_iteration_space, dim_splits, num_cores
+        ),
         padding=padding,
         layouts=layouts,
         args=args,

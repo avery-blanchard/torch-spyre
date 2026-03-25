@@ -800,7 +800,9 @@ def simplify_op_spec(op_spec):
             for arg in op_spec.args
         ],
     )
-    op_spec.iteration_space_dict = new_var_ranges
+    op_spec.iteration_space_dict = {
+        k1: (v1, op_space_splits[k1]) for k1, v1 in new_var_ranges.items()
+    }
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
