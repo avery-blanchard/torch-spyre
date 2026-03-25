@@ -526,7 +526,20 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Unsupported data operation on TensorArg
                 raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
-            self.op_specs.append(self.create_op_spec(op, False, out_di, args, op_info))
+            op_spec = self.create_op_spec(op, False, out_di, args, op_info)
+            if len(transposed_dims) > 0:
+                op_spec.op_info["transposed_dims"] = [
+                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
+                ]
+                # Reorder it_dim_map of the input to implement transpositions
+                (
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                ) = (
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                )
+            self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
 

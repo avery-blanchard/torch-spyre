@@ -26,7 +26,6 @@ from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 
-
 logger = get_inductor_logger("codegen.superdsc")
 
 _argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
@@ -109,12 +108,13 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             inputs[0]["device_layout"].device_dtype
             == outputs[0]["device_layout"].device_dtype
         ):
-            return generate_dldsc(
+            return generate_sfp_op(
                 pointers,
                 op=IDENTITY_OP,
                 dimensions=dimensions,
                 inputs=inputs,
                 outputs=outputs,
+                reduction=reduction,
                 **kwargs,
             )
         else:
