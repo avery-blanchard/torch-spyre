@@ -159,7 +159,13 @@ def normalize_coordinates(var_ranges, size, coordinates):
                 result.append([sympy.S.One, sympy.S.One, var, term.args[1], dim_size])
             elif term.func == sympy.Mul and term.args[0].is_rational:
                 expr0, expr1 = term.args
-                mod = expr1.args[1] if expr1.func == sympy.Mod else var_ranges[var]
+                mod = (
+                    expr1.args[1]
+                    if expr1.func == sympy.Mod
+                    else (var_ranges[var] + expr0.denominator - 1)
+                    // expr0.denominator
+                    * expr0.denominator
+                )
                 result.append([expr0.numerator, expr0.denominator, var, mod, dim_size])
             else:
                 raise IndexError
@@ -308,7 +314,6 @@ if __name__ == "__main__":
     from sympy import floor, Mod
 
     x0, x1, x2, x3, x4, x5, x6 = sympy.symbols("x0 x1 x2 x3 x4 x5 x6")
-
     print(
         align_tensors(
             {x0: 16384, x1: 256, x2: 30},
@@ -456,6 +461,18 @@ if __name__ == "__main__":
                         x0,
                         x2,
                     ],
+                }
+            ],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 256, x1: 100},
+            [
+                {
+                    "size": [2, 256, 64],
+                    "coordinates": [floor(x1 / 64), x0, Mod(x1, 64)],
                 }
             ],
         )
