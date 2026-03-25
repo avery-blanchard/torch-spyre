@@ -37,7 +37,7 @@ def num_bytes(df: DataFormats) -> int:
     return 128 // num_elems
 
 
-def generate_constant_info(data_format, constants):
+def generate_constant_info(data_format, constants, num_cores):
     if len(constants.keys()) == 0:
         return "{}"
     constant_info = {}
@@ -48,7 +48,7 @@ def generate_constant_info(data_format, constants):
             "data_": {
                 "dim_prop_func": [{"Const": {}}, {"Const": {}}, {"Map": {}}],
                 "dim_prop_attr": [
-                    {"factor_": 1, "label_": "core"},
+                    {"factor_": num_cores, "label_": "core"},
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
@@ -245,7 +245,7 @@ def generate_sdsc(sdsc_spec):
                             **{
                                 str(dim) + "_": size
                                 for dim, size in sdsc_spec.iteration_space.items()
-                            },  # dim sizes before split
+                            },
                         },
                         "coordinateMasking_": {
                             str(dim): mask_range
@@ -283,10 +283,10 @@ def generate_sdsc(sdsc_spec):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'hbm'}",  # TODO(avery)
+                                "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
                                 "prev_": "",
                                 "ldsIdx_": i,
-                                "component_": "hbm",  # TODO(avery)
+                                "component_": "hbm" if not tensor.allocation else "lx",
                                 "layoutDimOrder_": [
                                     str(dim)
                                     for dim in sdsc_spec.layouts[tensor.layout][
@@ -368,14 +368,16 @@ def generate_sdsc(sdsc_spec):
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
-                                },
-                                # if tensor.allocation is None
-                                # else {"lx": {"isPresent": 1}},
+                                }
+                                if not tensor.allocation
+                                else {"lx": {"isPresent": 1}},
                             }
                             for i, tensor in enumerate(sdsc_spec.args)
                         ],
                         "constantInfo_": generate_constant_info(
-                            sdsc_spec.data_format, sdsc_spec.constants
+                            sdsc_spec.data_format,
+                            sdsc_spec.constants,
+                            sdsc_spec.num_cores,
                         ),
                         "computeOp_": [
                             {
