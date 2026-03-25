@@ -527,28 +527,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Clone: check that device layout is the same.
                 op = IDENTITY_OP
             else:
-                op = CLONE_OP
+                op = IDENTITY_OP
 
-<<<<<<< HEAD
-            op_spec = create_op_spec(op, False, out_di, args, op_info)
-            if len(transposed_dims) > 0:
-                op_spec.op_info["transposed_dims"] = transposed_dims
-=======
-            op_spec = self.create_op_spec(op, False, out_di, args, op_info)
-            if op == TRANSPOSE_OP:
-                op_spec.op_info["transposed_dims"] = [
-                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
-                ]
->>>>>>> c8210b3 (Implement view-aware core divsion for pointwise ops (#1192))
-                # Reorder it_dim_map of the input to implement transpositions
-                (
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                ) = (
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                )
-            self.op_specs.append(op_spec)
+            self.op_specs.append(self.create_op_spec(op, False, out_di, args, op_info))
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
 

@@ -16,13 +16,12 @@ import dataclasses
 import math
 from typing import Any
 
-from sympy import Integer, Symbol, Expr, Mod
+from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
-    MATMUL_REDUCTION_OP,
-    BATCH_MATMUL_OP,
     IDENTITY_OP,
+    RESTICKIFY_OP,
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
     OUTPUT_DIM_LABELS,
@@ -30,12 +29,9 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
-from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
-from .data_ops import generate_dldsc
-from torch_spyre._inductor.op_spec import OpSpec, TensorArg
-
 from .compute_ops import generate_sdsc
+from torch_spyre._inductor.op_spec import TensorArg
+
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -246,7 +242,7 @@ def _create_sdsc_tensors(
 ) -> tuple[list[SDSCArgs], dict]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
-    use_op_dims = not _is_matmul(op_spec.op)
+    use_op_dims = not _is_matmul(op_spec.op) and op_spec.op != RESTICKIFY_OP
 
     sdsc_args = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
@@ -294,6 +290,8 @@ def _create_sdsc_tensors(
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+    if op == "to_dtype":
+        return IDENTITY_OP
     if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
         return op + "nonstick"
     return op
