@@ -157,7 +157,7 @@ def _get_coordinate_mask(
     iteration_space: dict, arg: SDSCArgs, dim_padding: dict
 ) -> dict:
     return {
-        dim: [[iteration_space[dim] - padding, iteration_space[dim]]]
+        dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
         if padding > 0 and dim in arg.scales and arg.scales[dim] == -2
     }
