@@ -494,23 +494,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             in_stl = args[0].device_layout  # type: ignore[union-attr]
             out_stl = args[1].device_layout  # type: ignore[union-attr]
+            in_stick_vars = args[0].device_coordinates[-1].free_symbols
+            out_stick_vars = args[1].device_coordinates[-1].free_symbols
             transposed_dims = []
             # Determine data op based on tensor args
             if (
                 Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
                 and in_stl.device_size != out_stl.device_size
             ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
-                # Transpose:
-                #   - check that the input / output DimensionInfo are the same, but in different order.
-                #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
-                transposed_dims = [
-                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
-                ]
-                op = (
-                    RESTICKIFY_OP
-                    if in_stl.host_stick_dim() in transposed_dims
-                    else IDENTITY_OP
-                )
+                op = RESTICKIFY_OP if in_stick_vars != out_stick_vars else IDENTITY_OP
 
             elif all(is_wildcard(d.var) for d in in_di) and not all(
                 is_wildcard(d.var) for d in out_di
@@ -527,18 +519,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
             op_spec = self.create_op_spec(op, False, out_di, args, op_info)
-            if len(transposed_dims) > 0:
-                op_spec.op_info["transposed_dims"] = [
-                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
-                ]
-                # Reorder it_dim_map of the input to implement transpositions
-                (
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                ) = (
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                )
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
