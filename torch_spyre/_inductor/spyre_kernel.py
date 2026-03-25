@@ -15,7 +15,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
-from collections import Counter
 
 import torch
 import sympy
@@ -496,18 +495,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(True, value.name, value, in_di),
                 self.create_tensor_arg(False, real_dst_name, dst, out_di),
             ]
-            in_stl = args[0].device_layout  # type: ignore[union-attr]
-            out_stl = args[1].device_layout  # type: ignore[union-attr]
+            in_coords = [coord for coord in args[0].device_coordinates if coord != 0]
+            out_coords = [coord for coord in args[1].device_coordinates if coord != 0]
             in_stick_vars = args[0].device_coordinates[-1].free_symbols
             out_stick_vars = args[1].device_coordinates[-1].free_symbols
-            transposed_dims = []
-            # Determine data op based on tensor args
-            if (
-                Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
-                and in_stl.device_size != out_stl.device_size
-            ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
-                op = RESTICKIFY_OP if in_stick_vars != out_stick_vars else IDENTITY_OP
 
+            # Determine data op based on tensor args
+            if in_stick_vars != out_stick_vars:
+                op = RESTICKIFY_OP
             elif all(is_wildcard(d.var) for d in in_di) and not all(
                 is_wildcard(d.var) for d in out_di
             ):
@@ -515,7 +510,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = IDENTITY_OP
                 in_di = out_di
                 args[0] = self.create_tensor_arg(True, value.name, value, in_di)
-            elif in_stl.device_size == out_stl.device_size:
+            elif in_coords != out_coords:
+                op = IDENTITY_OP
+            elif in_coords == out_coords:
                 # Clone: check that device layout is the same.
                 op = IDENTITY_OP
             else:
