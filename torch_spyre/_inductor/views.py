@@ -53,7 +53,7 @@ def compute_coordinates(
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i]:
+            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
                 next_stride[i] = stride[j]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
@@ -435,5 +435,28 @@ if __name__ == "__main__":
         align_tensors(
             {x0: 10},
             [{"size": [1, 64], "coordinates": [sympy.S.Zero, x0]}],
+        )
+    )
+
+    print(
+        compute_coordinates(
+            [7, 1, 3, 64], [9, 64, 63, 1], {x0: 3, x1: 7, x2: 9}, 63 * x0 + 9 * x1 + x2
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 3, x1: 7, x2: 9},
+            [
+                {
+                    "size": [7, 1, 3, 64],
+                    "coordinates": [
+                        x1,
+                        sympy.S.Zero,
+                        x0,
+                        x2,
+                    ],
+                }
+            ],
         )
     )
