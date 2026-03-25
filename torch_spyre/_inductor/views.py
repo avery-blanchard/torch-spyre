@@ -195,9 +195,10 @@ def normalize_coordinates(var_ranges, size, coordinates):
 
 
 def align_tensors(iteration_space, tensors):
-    print(iteration_space)
     var_ranges = {var: val[0] for var, val in iteration_space.items()}
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
+
+
     splits = {var: set() for var in var_ranges.keys()}
 
     breakdown = []
@@ -313,7 +314,11 @@ def align_tensors(iteration_space, tensors):
                         t["coordinates"][-1] = stick_dim_var % t["size"][-1]
                         break
 
-    return new_var_ranges, new_tensors, new_op_it_space_splits
+    new_iteration_space = {
+        k: (v, new_op_it_space_splits[k]) for k, v in new_var_ranges.items()
+    }
+
+    return new_iteration_space, new_tensors
 
 
 if __name__ == "__main__":
@@ -323,7 +328,7 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x0: 16384, x1: 256, x2: 30},
+            {x0: (16384, 1), x1: (256, 1), x2: (30, 1)},
             [
                 {
                     "size": [2, 128, 256, 64],
@@ -348,14 +353,14 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x0: 128},
+            {x0: (128, 1)},
             [{"size": [2, 64], "coordinates": [x0 // 64, x0 % 64]}],
         )
     )
 
     print(
         align_tensors(
-            {x0: 64},
+            {x0: (64, 1)},
             [{"size": [1, 64], "coordinates": [sympy.S.Zero, x0]}],
         )
     )
@@ -369,7 +374,7 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x0: 128, x2: 32, x1: 128},
+            {x0: (128, 1), x2: (32, 1), x1: (128, 1)},
             [
                 {
                     "size": [128, 32, 2, 1, 1, 1, 64],
@@ -393,7 +398,7 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x2: 2, x1: 256, x3: 4096, x0: 4096},
+            {x2: (2, 1), x1: (256, 1), x3: (4096, 1), x0: (4096, 1)},
             [
                 {
                     "size": [256, 32, 2, 2, 64],
@@ -413,20 +418,19 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x0: 128, x1: 256},
+            {x0: (128, 1), x1: (256, 32)},
             [
                 {
                     "size": [16, 2, 16, 64],
                     "coordinates": [x1 // 16, x0 // 64, x1 % 16, x0 % 64],
                 }
             ],
-            {x0: 1, x1: 32},
         )
     )
 
     print(
         align_tensors(
-            {x0: 128, x1: 256},
+            {x0: (128, 1), x1: (256, 32)},
             [
                 {
                     "size": [4, 2, 16, 4, 64],
@@ -439,26 +443,19 @@ if __name__ == "__main__":
                     ],
                 }
             ],
-            {x0: 1, x1: 32},
         )
     )
 
     print(
         align_tensors(
-            {x0: 10},
+            {x0: (10, 1)},
             [{"size": [1, 64], "coordinates": [sympy.S.Zero, x0]}],
         )
     )
 
     print(
-        compute_coordinates(
-            [7, 1, 3, 64], [9, 64, 63, 1], {x0: 3, x1: 7, x2: 9}, 63 * x0 + 9 * x1 + x2
-        )
-    )
-
-    print(
         align_tensors(
-            {x0: 3, x1: 7, x2: 9},
+            {x0: (3, 1), x1: (7, 1), x2: (9, 1)},
             [
                 {
                     "size": [7, 1, 3, 64],
@@ -475,7 +472,7 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x0: 256, x1: 100},
+            {x0: (256, 1), x1: (100, 1)},
             [
                 {
                     "size": [2, 256, 64],
@@ -487,7 +484,7 @@ if __name__ == "__main__":
 
     print(
         align_tensors(
-            {x0: 2, x1: 32, x2: 256, x3: 128},
+            {x0: (2, 1), x1: (32, 1), x2: (256, 1), x3: (128, 1)},
             [
                 {
                     "size": [32, 256, 2, 2, 64],
@@ -499,20 +496,6 @@ if __name__ == "__main__":
                         Mod(x3, 64),
                     ],
                 }
-            ],
-        )
-    )
-
-    print(
-        normalize_coordinates(
-            {x0: 2, x1: 32, x2: 256, x3: 128},
-            [32, 256, 2, 2, 64],
-            [
-                floor(x2 / 8),
-                x1 + 32 * (Mod(x2, 8)),
-                floor(x3 / 64),
-                x0,
-                Mod(x3, 64),
             ],
         )
     )
