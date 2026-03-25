@@ -174,6 +174,7 @@ def normalize_coordinates(var_ranges, size, coordinates):
         for r in result:
             r[-1] = dim_size // r[0]
             dim_size = r[0]
+            r[0] = 1
             results.append(r)
 
     new_results = []
@@ -314,6 +315,7 @@ if __name__ == "__main__":
     from sympy import floor, Mod
 
     x0, x1, x2, x3, x4, x5, x6 = sympy.symbols("x0 x1 x2 x3 x4 x5 x6")
+
     print(
         align_tensors(
             {x0: 16384, x1: 256, x2: 30},
@@ -474,6 +476,38 @@ if __name__ == "__main__":
                     "size": [2, 256, 64],
                     "coordinates": [floor(x1 / 64), x0, Mod(x1, 64)],
                 }
+            ],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: 2, x1: 32, x2: 256, x3: 128},
+            [
+                {
+                    "size": [32, 256, 2, 2, 64],
+                    "coordinates": [
+                        floor(x2 / 8),
+                        x1 + 32 * (Mod(x2, 8)),
+                        floor(x3 / 64),
+                        x0,
+                        Mod(x3, 64),
+                    ],
+                }
+            ],
+        )
+    )
+
+    print(
+        normalize_coordinates(
+            {x0: 2, x1: 32, x2: 256, x3: 128},
+            [32, 256, 2, 2, 64],
+            [
+                floor(x2 / 8),
+                x1 + 32 * (Mod(x2, 8)),
+                floor(x3 / 64),
+                x0,
+                Mod(x3, 64),
             ],
         )
     )
