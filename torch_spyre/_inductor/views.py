@@ -147,7 +147,8 @@ def normalize_coordinates(var_ranges, size, coordinates):
         expr = coordinate.replace(sympy.floor, lambda x: x)
         vars = expr.free_symbols
         if len(vars) == 0:
-            results.append([1, None, None, None, dim_size])
+            results.append([None, None, None, None, dim_size])
+            continue
         result = []
         for var in vars:
             term = expr.subs({v: 0 for v in vars - {var}})
@@ -159,23 +160,28 @@ def normalize_coordinates(var_ranges, size, coordinates):
                 result.append([sympy.S.One, sympy.S.One, var, term.args[1], dim_size])
             elif term.func == sympy.Mul and term.args[0].is_rational:
                 expr0, expr1 = term.args
-                mod = (
-                    expr1.args[1]
-                    if expr1.func == sympy.Mod
-                    else (var_ranges[var] + expr0.denominator - 1)
-                    // expr0.denominator
-                    * expr0.denominator
-                )
+                mod = expr1.args[1] if expr1.func == sympy.Mod else var_ranges[var]
                 result.append([expr0.numerator, expr0.denominator, var, mod, dim_size])
             else:
                 raise IndexError
+
         result.sort()
-        result.reverse()
-        for r in result:
-            r[-1] = dim_size // r[0]
-            dim_size = r[0]
-            r[0] = 1
-            results.append(r)
+
+        r = []
+        cum_size = result[0][0]
+        for i in range(0, len(result) - 1):
+            result[i][4] = result[i + 1][0]
+            cum_size *= result[i][4]
+            if i > 0:
+                result[i][0] = 1
+            r.append(result[i])
+        if len(result) > 1:
+            result[-1][0] = 1
+        result[-1][4] = dim_size // cum_size
+        r.append(result[-1])
+
+        r.reverse()
+        results += r
 
     new_results = []
     tmp = results[0]
@@ -209,7 +215,7 @@ def align_tensors(iteration_space, tensors):
         stick_dim.append(intervals[-1][2])
         stick_size.append(intervals[-1][-1])
         breakdown.append(intervals)
-        for num, den, var, mod, _ in intervals:
+        for num, den, var, mod, dim_size in intervals:
             if var is not None:
                 if den != stick_size[-1] or var != stick_dim[-1]:
                     splits[var].add(den)
@@ -249,24 +255,22 @@ def align_tensors(iteration_space, tensors):
                 size.append(dim_size)
                 coordinates.append(sympy.S.Zero)
                 continue
-            if num * mod < dim_size:
-                size.append(dim_size // num // mod)
-                coordinates.append(sympy.S.Zero)
-            if var == stick_dim[j] and den == stick_size[j]:
-                for i in reversed(range(1, splits[var].index(mod))):
+            low = (
+                0
+                if var == stick_dim[j]
+                and den == stick_size[j]
+                and den not in splits[var]
+                else splits[var].index(den)
+            )
+            for i in reversed(range(low, splits[var].index(mod))):
+                if i == splits[var].index(mod) - 1:
+                    size.append(dim_size * den // splits[var][i])
+                else:
                     size.append(splits[var][i + 1] // splits[var][i])
-                    coordinates.append(var)
-                size.append(splits[var][1] // den)
-                coordinates.append(var // den)
-            elif var == stick_dim[j] and mod == stick_size[j]:
-                size.append(mod)
-                coordinates.append(var % mod)
-            else:
-                for i in reversed(
-                    range(splits[var].index(den), splits[var].index(mod))
-                ):
-                    size.append(splits[var][i + 1] // splits[var][i])
-                    coordinates.append(remap[var][i])
+                coordinates.append(remap[var][i])
+            if var == stick_dim[j] and den == stick_size[j] and den not in splits[var]:
+                size[-1] //= den
+                coordinates[-1] //= den
             if num > 1:
                 size.append(num)
                 coordinates.append(sympy.S.Zero)
@@ -494,6 +498,25 @@ if __name__ == "__main__":
                         floor(x3 / 64),
                         x0,
                         Mod(x3, 64),
+                    ],
+                }
+            ],
+        )
+    )
+
+    print(
+        align_tensors(
+            {x0: (16384, 1)},
+            [
+                {
+                    "size": [2, 128, 64, 1, 256, 64],
+                    "coordinates": [
+                        floor((Mod(x0, 128)) / 64),
+                        floor(x0 / 128),
+                        Mod(x0, 64),
+                        sympy.S.Zero,
+                        sympy.S.Zero,
+                        sympy.S.Zero,
                     ],
                 }
             ],
