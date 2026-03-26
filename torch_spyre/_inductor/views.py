@@ -480,4 +480,3 @@ if __name__ == "__main__":
             [{"size": [1, 64], "coordinates": [sympy.S.Zero, x0]}],
         )
     )
->>>>>>> 042d024 (core division and specspec updates)

@@ -16,13 +16,12 @@ import dataclasses
 import math
 from typing import Any
 
-from sympy import Integer, Symbol, Expr, Mod
+from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
-    MATMUL_REDUCTION_OP,
-    BATCH_MATMUL_OP,
     IDENTITY_OP,
+    RESTICKIFY_OP,
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
     OUTPUT_DIM_LABELS,
@@ -31,9 +30,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
-from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
-from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import TensorArg
 
 from .compute_ops import generate_sdsc
 
@@ -137,7 +134,6 @@ def _get_core_to_slice_mapping(
     inner_product = Integer(1)
 
     for dim in iteration_space:
-        n = dim_splits[dim]
         if dim_splits[dim] == 1:
             expr = Integer(0)
         elif inner_product == Integer(1):
@@ -236,8 +232,10 @@ def _get_padded_iteration_space(
 def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul")
 
+
 def _is_data_op(op: str) -> bool:
     return op in (IDENTITY_OP, RESTICKIFY_OP)
+
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
@@ -316,7 +314,6 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     ndim = len(op_spec.iteration_space_dict)
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
 
-    
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space_dict)
     }
@@ -331,10 +328,10 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     }
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] if not is_data_op else 1 for dim, value in op_spec.iteration_space_dict.items()
+        symbol_mapping[dim]: value[-1] if not is_data_op else 1
+        for dim, value in op_spec.iteration_space_dict.items()
     }
     num_cores = math.prod(dim_splits.values())
-
 
     work_slices = {
         symbol_mapping[sym]: wk_slice if not is_data_op else 1
