@@ -335,7 +335,9 @@ def generate_sdsc(sdsc_spec):
                                             // sdsc_spec.work_slices[dim]
                                             if (tensor.scales[dim] == 1)
                                             else 1,
-                                            nsplits=sdsc_spec.work_slices[dim],
+                                            nsplits=sdsc_spec.work_slices[dim]
+                                            if (tensor.scales[dim] == 1)
+                                            else 1,
                                             elems_per_stick=tensor.data_format.elems_per_stick(),
                                             is_stick_dim=(
                                                 sdsc_spec.layouts[tensor.layout][

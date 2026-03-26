@@ -690,10 +690,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             simplify_op_spec(op_spec)
 
         def sympy_str(x: sympy.Expr) -> str:
-            if isinstance(x, int) or isinstance(x, sympy.Integer):
-                return str(x)
-            else:
-                return "sympify('" + str(x) + "')"
+            return "sympify('" + str(x) + "')"
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]

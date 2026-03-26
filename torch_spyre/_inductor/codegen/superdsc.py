@@ -126,7 +126,7 @@ class SDSCSpec:
 
 
 def _get_core_to_slice_mapping(
-    iteration_space, dim_splits: list[int], num_cores: int
+    iteration_space, dim_splits: dict[Symbol, int], num_cores: int
 ) -> dict[Symbol, Expr]:
     core_id_sym = Symbol("core_id")
 
@@ -234,7 +234,7 @@ def _is_matmul(op: str) -> bool:
 
 
 def _is_data_op(op: str) -> bool:
-    return op in (IDENTITY_OP, RESTICKIFY_OP)
+    return op in ("to_dtype", IDENTITY_OP, RESTICKIFY_OP)
 
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
@@ -254,7 +254,7 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
-    sdsc_args = []
+    sdsc_args: list[SDSCArgs] = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
@@ -303,6 +303,8 @@ def _create_sdsc_tensors(
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+    if op == "to_dtype":
+        return IDENTITY_OP
     if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
         return op + "nonstick"
     return op
