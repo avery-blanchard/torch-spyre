@@ -136,16 +136,16 @@ def _get_core_to_slice_mapping(
     dim_to_expr: dict[str, object] = {}
     inner_product = Integer(1)
 
-    for i, dim in enumerate(iteration_space):
-        n = dim_splits[i]
-        if n == 1:
+    for dim in iteration_space:
+        n = dim_splits[dim]
+        if dim_splits[dim] == 1:
             expr = Integer(0)
         elif inner_product == Integer(1):
-            expr = Mod(core_id_sym, Integer(n))
+            expr = Mod(core_id_sym, Integer(dim_splits[dim]))
         else:
-            expr = Mod(floor(core_id_sym / inner_product), Integer(n))
+            expr = Mod(floor(core_id_sym / inner_product), Integer(dim_splits[dim]))
         dim_to_expr[str(dim)] = expr
-        inner_product = inner_product * Integer(n)
+        inner_product = inner_product * Integer(dim_splits[dim])
 
     return dim_to_expr
 
@@ -236,6 +236,8 @@ def _get_padded_iteration_space(
 def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul")
 
+def _is_data_op(op: str) -> bool:
+    return op in (IDENTITY_OP, RESTICKIFY_OP)
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
@@ -272,7 +274,7 @@ def _create_sdsc_tensors(
             dim_order = dim_order + reduced_dims
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
-        for dim_idx, dim in enumerate(reversed(dim_order)):
+        for dim_idx, dim in enumerate(dim_order):
             if dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
@@ -310,9 +312,11 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
 
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
+    is_data_op = _is_data_op(op_spec.op)
     ndim = len(op_spec.iteration_space_dict)
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
 
+    
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space_dict)
     }
@@ -326,10 +330,14 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         for sym, (size, _) in op_spec.iteration_space_dict.items()
     }
 
-    dim_splits = [n_cores for _, n_cores in op_spec.iteration_space_dict.values()]
-    num_cores = math.prod(dim_splits)
+    dim_splits = {
+        symbol_mapping[dim]: value[-1] if not is_data_op else 1 for dim, value in op_spec.iteration_space_dict.items()
+    }
+    num_cores = math.prod(dim_splits.values())
+
+
     work_slices = {
-        symbol_mapping[sym]: wk_slice
+        symbol_mapping[sym]: wk_slice if not is_data_op else 1
         for sym, (_, wk_slice) in op_spec.iteration_space_dict.items()
     }
 
@@ -340,7 +348,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
-        dim_splits.append(1)
+        dim_splits[stick_sym] = 1
 
     args, layouts = _create_sdsc_tensors(
         op_spec, symbol_mapping, sdsc_iteration_space, op_dim_order, op_stick_dim
