@@ -24,8 +24,8 @@ def core_idx_to_slice_offset(
 ) -> int:
     offset = 0
     for dim, stride in arg.strides.items():
-        if dim in wk_slice:
-            offset += wk_slice[dim] * stride // work_slices[dim]
+        if str(dim) in wk_slice and arg.scales[dim] > 0:
+            offset += wk_slice[str(dim)] * stride // work_slices[dim]
     return offset
 
 
@@ -257,14 +257,14 @@ def generate_sdsc(sdsc_spec):
                                 "ss_": {
                                     "name_": "core",
                                     **{
-                                        str(dim) + "_": size
+                                        str(dim) + "_": size // sdsc_spec.work_slices[dim]
                                         for dim, size in sdsc_spec.iteration_space.items()
                                     },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
-                                        str(dim) + "_": size
+                                        str(dim) + "_": size // sdsc_spec.work_slices[dim]
                                         for dim, size in sdsc_spec.iteration_space.items()
                                     },
                                 },
@@ -329,10 +329,10 @@ def generate_sdsc(sdsc_spec):
                                 "coordinates_": {
                                     "coordInfo": {
                                         str(dim): gen_coord_info_value(
-                                            size=sdsc_spec.iteration_space[dim]
+                                            size=sdsc_spec.iteration_space[dim] // sdsc_spec.work_slices[dim]
                                             if (tensor.scales[dim] == 1)
                                             else 1,
-                                            nsplits=1,
+                                            nsplits=sdsc_spec.work_slices[dim],
                                             elems_per_stick=tensor.data_format.elems_per_stick(),
                                             is_stick_dim=(
                                                 sdsc_spec.layouts[tensor.layout][
