@@ -182,7 +182,6 @@ def adjust_it_space_for_sticks(
 def must_split_vars(
     tensor_deps: list[TensorDep] | None,
     it_space_adjusted: dict[Symbol, Expr],
-    min_slice: int = 1,
 ) -> dict[Symbol, int]:
     """Return the minimum splits required per iteration variable to keep each
     tensor's memory span within MAX_SPAN_STICKS.
@@ -219,7 +218,7 @@ def must_split_vars(
                 (
                     d
                     for d in range(min_split_raw, adjusted_size + 1)
-                    if adjusted_size % d == 0 and (adjusted_size // d) % min_slice == 0
+                    if adjusted_size % d == 0
                 ),
                 adjusted_size,
             )
@@ -240,7 +239,6 @@ def prioritize_dimensions(
     output: TensorDep,
     it_space: dict[Symbol, Expr],
     inputs: list[TensorDep] | None = None,
-    min_slice: int = 1,
 ) -> tuple[list[Symbol], dict[Symbol, int]]:
     """
     Return iteration variables in priority order for core division, along with
@@ -261,7 +259,7 @@ def prioritize_dimensions(
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     all_deps = (inputs + [output]) if inputs is not None else [output]
-    min_splits = must_split_vars(all_deps, it_space, min_slice)
+    min_splits = must_split_vars(all_deps, it_space)
     priority = list(min_splits.keys())
 
     remaining_output = []
@@ -296,9 +294,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     is_clone = origin_node is not None and origin_node.target == aten.clone.default
 
     elems_per_stick = output_td.layout.device_layout.elems_per_stick()
-    priorities, min_splits = prioritize_dimensions(
-        output_td, it_space, min_slice=elems_per_stick if is_clone else 1
-    )
+    priorities, min_splits = prioritize_dimensions(output_td, it_space)
     splits = multi_dim_iteration_space_split(
         it_space,
         max_cores,
