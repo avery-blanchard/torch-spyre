@@ -23,9 +23,10 @@ from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     RESTICKIFY_OP,
     INPUT_DIM_LABELS,
-    LAYOUT_LABELS,
     OUTPUT_DIM_LABELS,
+    LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
+    MATMUL_LAYOUT_LABELS,
     SEGMENT_OFFSETS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -184,7 +185,11 @@ def _get_device_dim_order(
 
 
 def _get_layout_label(
-    layouts: dict, dim_order: list, stick_dim_order: Symbol | None, stick_size: int
+    layouts: dict,
+    dim_order: list,
+    stick_dim_order: Symbol | None,
+    stick_size: int,
+    layout_labels: list[str],
 ) -> str:
     for label, layout in layouts.items():
         if (
@@ -193,7 +198,7 @@ def _get_layout_label(
             and layout["stick_size"] == stick_size
         ):
             return label
-    label = LAYOUT_LABELS[len(layouts)]
+    label = layout_labels[len(layouts)]
     layouts[label] = {
         "dim_order": dim_order,
         "stick_dim_order": stick_dim_order,
@@ -285,7 +290,11 @@ def _create_sdsc_tensors(
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         label = _get_layout_label(
-            layouts, dim_order, effective_stick, arg.device_dtype.elems_per_stick()
+            layouts,
+            dim_order,
+            effective_stick,
+            arg.device_dtype.elems_per_stick(),
+            MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
         )
         sdsc_args.append(
             SDSCArgs(
