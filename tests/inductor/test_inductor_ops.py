@@ -746,6 +746,75 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_cat",
+            "test_cat_cpu",
+        ): {
+            "param_sets": {
+                "1d_dim0": (
+                    0,
+                    cached_randn((64,), dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float16),
+                ),
+                "1d_dim0_three_tensors": (
+                    0,
+                    cached_randn((64,), dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float16),
+                    cached_randn((192,), dtype=torch.float16),
+                ),
+                "2d_dim0_diff_size": (
+                    0,
+                    cached_randn((64, 128), dtype=torch.float16),
+                    cached_randn((128, 128), dtype=torch.float16),
+                ),
+                "2d_dim0_three_tensors": (
+                    0,
+                    cached_randn((64, 64), dtype=torch.float16),
+                    cached_randn((128, 64), dtype=torch.float16),
+                    cached_randn((192, 64), dtype=torch.float16),
+                ),
+                "2d_dim1_diff_size": (
+                    1,
+                    cached_randn((128, 64), dtype=torch.float16),
+                    cached_randn((128, 128), dtype=torch.float16),
+                ),
+                "3d_dim0": (
+                    0,
+                    cached_randn((2, 32, 64), dtype=torch.float16),
+                    cached_randn((3, 32, 64), dtype=torch.float16),
+                ),
+                "3d_dim1": (
+                    1,
+                    cached_randn((2, 32, 64), dtype=torch.float16),
+                    cached_randn((2, 16, 64), dtype=torch.float16),
+                ),
+                "3d_dim2": (
+                    2,
+                    cached_randn((2, 32, 64), dtype=torch.float16),
+                    cached_randn((2, 32, 128), dtype=torch.float16),
+                ),
+                "4d_dim0": (
+                    0,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((3, 4, 8, 64), dtype=torch.float16),
+                ),
+                "4d_dim1": (
+                    1,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((2, 6, 8, 64), dtype=torch.float16),
+                ),
+                "4d_dim2": (
+                    2,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((2, 4, 12, 64), dtype=torch.float16),
+                ),
+                "4d_dim3": (
+                    3,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((2, 4, 8, 128), dtype=torch.float16),
+                ),
+            },
+        },
+        (
             "test_fallback",
             "test_fallback_cpu",
         ): {
@@ -1718,6 +1787,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_numel_cpu(self, x):
         compare_with_cpu(lambda x: torch.numel(x), x)
+
+    def test_cat_cpu(self, dim, *tensors):
+        def fn(*tensors):
+            return torch.cat(tensors, dim=dim)
+
+        compare_with_cpu(fn, *tensors)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):

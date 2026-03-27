@@ -21,8 +21,8 @@ def core_idx_to_slice_offset(
     arg,
     wk_slice: dict,
     work_slices: dict,
+    offset: int,
 ) -> int:
-    offset = 0
     for dim, stride in arg.strides.items():
         if str(dim) in wk_slice and arg.scales[dim] > 0:
             offset += wk_slice[str(dim)] * stride // work_slices[dim]
@@ -322,12 +322,24 @@ def generate_sdsc(sdsc_spec):
                                                 tensor,
                                                 core_id_to_wk_slice[str(c)],
                                                 sdsc_spec.work_slices,
+                                                offset=tensor.offset,
                                             )
                                             * num_bytes(tensor.data_format)
                                         )
                                         for c in range(sdsc_spec.num_cores)
                                     },
                                 },
+                                **(
+                                    {
+                                        "backGapCore_": {
+                                            tensor.gap_dim_label: {
+                                                "-1": str(tensor.gap)  # HBM is -1
+                                            },
+                                        }
+                                    }
+                                    if tensor.gap_dim_label is not None
+                                    else {}
+                                ),
                                 "coordinates_": {
                                     "coordInfo": {
                                         str(dim): gen_coord_info_value(

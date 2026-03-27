@@ -47,6 +47,9 @@ class SDSCArgs:
     max_dim_sizes: dict[Symbol, Any]
     allocation: dict[str, Any]
     start_address: int | Symbol
+    gap: int
+    gap_dim_label: str
+    offset: int
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -64,6 +67,9 @@ class SDSCArgs:
             f"  max_dim_sizes=[{max_dim_sizes}],\n"
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
+            f"  gap={self.gap}\n"
+            f"  gap_dim_label={self.gap_dim_label}\n"
+            f"  offset={self.offset}\n"
             f")"
         )
 
@@ -243,16 +249,67 @@ def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
+def _device_axes_for_dim(arg, dim):
+    c = Symbol(f"c{dim}")
+    return [i for i, expr in enumerate(arg.device_coordinates) if expr.has(c)]
+
+
+def _get_host_size(arg, dim) -> int:
+    device_size = arg.device_size
+    axes = _device_axes_for_dim(arg, dim)
+    if not axes:
+        return 1
+    size = 1
+    for a in axes:
+        size *= device_size[a]
+    return size
+
+
+def _compute_output_offset(arg, dim, offset, op_stick_dim, symbol_mapping, op_spec):
+    device_size = arg.device_size
+    dim_axes = _device_axes_for_dim(arg, dim)
+    device_dim_idx = min(dim_axes)
+    is_stick_dim = len(dim_axes) > 1
+    stick_axes = set(dim_axes)
+
+    ini_offset = offset
+    for i in range(device_dim_idx + 1, len(device_size)):
+        if not is_stick_dim or i not in stick_axes:
+            offset *= device_size[i]
+
+    return offset
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
+    constants: dict = None,
 ) -> tuple[list[SDSCArgs], dict]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
+
+    output_offset = 0
+    gap = 0
+    gap_dim_label = None
+    if constants is not None:
+        if "dim" in constants and "offset" in constants:
+            dim = constants["dim"]
+            input_arg = op_spec.args[0]
+            output_arg = op_spec.args[-1]
+
+            input_size = _get_host_size(input_arg, dim)
+            output_size = _get_host_size(output_arg, dim)
+            gap = output_size - input_size
+            ndim = len(op_spec.iteration_space)
+            gap_dim_label = _get_op_dim_labels(ndim, False)[dim]
+            offset = constants["offset"]
+            output_offset = _compute_output_offset(
+                input_arg, dim, offset, op_stick_dim, symbol_mapping, op_spec
+            )
 
     sdsc_args: list[SDSCArgs] = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
@@ -301,17 +358,31 @@ def _create_sdsc_tensors(
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
                 start_address=addr,
+                gap=gap if not arg.is_input else 0,
+                gap_dim_label=gap_dim_label if not arg.is_input else None,
+                offset=output_offset if not arg.is_input else 0,
             )
         )
     return sdsc_args, layouts
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if op == "to_dtype":
+    if op == "to_dtype" or op == "overwrite":
         return IDENTITY_OP
     if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
         return op + "nonstick"
     return op
+
+
+def _ref_arg(op_spec):
+    if op_spec.is_reduction:
+        return op_spec.args[0]
+
+    # op specific layout choice
+    if op_spec.op == "overwrite":
+        return op_spec.args[0]
+
+    return op_spec.args[-1]
 
 
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
@@ -342,7 +413,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
-    ref_arg = op_spec.args[0] if op_spec.is_reduction else op_spec.args[-1]
+    ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
     if op_stick_dim is None:
@@ -351,13 +422,20 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
+    constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
+
     args, layouts = _create_sdsc_tensors(
-        op_spec, symbol_mapping, sdsc_iteration_space, op_dim_order, op_stick_dim
+        op_spec,
+        symbol_mapping,
+        sdsc_iteration_space,
+        op_dim_order,
+        op_stick_dim,
+        constants,
     )
 
     if is_matmul:
         pad_args, pad_sdsc_args = list(op_spec.args), args
-    elif op_spec.is_reduction:
+    elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
         pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
@@ -365,7 +443,6 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
     )
 
-    constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
     if coordinate_masking:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
