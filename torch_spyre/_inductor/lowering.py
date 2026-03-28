@@ -510,7 +510,12 @@ def lower_overwrite(input, output, dim, offset):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
 
     def inner_fn(index):
-        return fn(input.make_loader()(index), dim, offset)
+        return fn(
+            input.make_loader()(index),
+            int(output.get_layout().stride[dim]),
+            offset,
+            int(output.get_layout().size[dim] - input.get_layout().size[dim]),
+        )
 
     inp = Pointwise(
         device=input.get_device(),

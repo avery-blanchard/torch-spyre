@@ -295,21 +295,16 @@ def _create_sdsc_tensors(
     output_offset = 0
     gap = 0
     gap_dim_label = None
+    device_stride = None
     if constants is not None:
-        if "dim" in constants and "offset" in constants:
-            dim = constants["dim"]
-            input_arg = op_spec.args[0]
-            output_arg = op_spec.args[-1]
-
-            input_size = _get_host_size(input_arg, dim)
-            output_size = _get_host_size(output_arg, dim)
-            gap = output_size - input_size
-            ndim = len(op_spec.iteration_space)
-            gap_dim_label = _get_op_dim_labels(ndim, False)[dim]
-            offset = constants["offset"]
-            output_offset = _compute_output_offset(
-                input_arg, dim, offset, op_stick_dim, symbol_mapping, op_spec
-            )
+        if (
+            "gap" in constants
+            and "device_offset" in constants
+            and "device_stride" in constants
+        ):
+            device_stride = constants["device_stride"]
+            gap = constants["gap"]
+            output_offset = constants["device_offset"] * device_stride
 
     sdsc_args: list[SDSCArgs] = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
@@ -337,6 +332,8 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
             strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
+            if device_stride == math.prod(arg.device_size[-dim_idx - 1 :]):
+                gap_dim_label = str(dim)
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
 
