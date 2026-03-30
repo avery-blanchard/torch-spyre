@@ -401,12 +401,12 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     }
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] if op_spec.op != "overwrite" else 1 for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice
+        symbol_mapping[sym]: wk_slice  if op_spec.op != "overwrite" else 1
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
