@@ -288,6 +288,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
     priorities, min_splits = prioritize_dimensions(output_td, it_space)
+
     splits = multi_dim_iteration_space_split(
         it_space,
         max_cores,

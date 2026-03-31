@@ -83,12 +83,6 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
-
-            case spyreop.overwrite.default:
-                stl = SpyreTensorLayout(output.size, output.dtype)
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
             case _:
                 x_stl = x.layout.device_layout
                 in_coords = host_coordinates(x.layout, x.dep)
@@ -97,6 +91,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     in_coords == out_coords
                     and x.dep.index == output_dep.index
                     and same_device_size(x.layout.dtype, output.dtype)
+                    and x.layout.size == output.size
                 ):
                     # Input and output tensors are being accessed identically and elem size is the same.
                     # We can simply propagate the device_layout.
