@@ -279,10 +279,11 @@ def _create_sdsc_tensors(
             output_offset = op_info["device_offset"] * device_stride
             for dim_idx, dim in enumerate(reversed(dim_order)):
                 if device_stride == math.prod(output.device_size[dim_idx + 1 :]):
+                    dim_size = iteration_space.get(dim, 1)
                     output_dev_size[dim_idx] = (
-                        iteration_space[dim] // output.device_dtype.elems_per_stick()
+                        dim_size // output.device_dtype.elems_per_stick()
                         if dim == stick_dim
-                        else iteration_space[dim]
+                        else dim_size
                     )
     sdsc_args: list[SDSCArgs] = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
@@ -309,16 +310,14 @@ def _create_sdsc_tensors(
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
-            stride_dev_size = (
-                arg.device_size if not use_input_strides else output_dev_size
+            strides[dim] = _calculate_device_stride(
+                dim_idx, arg.device_size if not use_input_strides else output_dev_size
             )
-            strides[dim] = _calculate_device_stride(dim_idx, stride_dev_size)
             if (
                 device_stride == math.prod(arg.device_size[-dim_idx - 1 :])
                 and not arg.is_input
             ):
                 backGap[dim] = gap
-                offsets[dim] = 0
                 use_input_strides = False
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
