@@ -348,9 +348,10 @@ def _create_sdsc_tensors(
             )
             if not src_arg.is_input:
                 sdsc_arg.backGap[missing_concat_dim] = gap
-            layouts[sdsc_arg.layout]["dim_order"] = layouts[sdsc_arg.layout][
-                "dim_order"
-            ] + [missing_concat_dim]
+            if missing_concat_dim not in layouts[sdsc_arg.layout]["dim_order"]:
+                layouts[sdsc_arg.layout]["dim_order"] = layouts[sdsc_arg.layout][
+                    "dim_order"
+                ] + [missing_concat_dim]
 
     return sdsc_args, layouts, missing_concat_dim
 
