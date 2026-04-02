@@ -93,6 +93,24 @@ def enable_spyre_context(
         "permute_fusion": False,
         "memory_planning": True,
     }
+
+    inductor_config.split_reductions = False
+    inductor_config.benchmark_harness = False
+    inductor_config.post_grad_custom_pre_pass = CustomPrePasses()
+    inductor_config.post_grad_custom_post_pass = CustomPostPasses()
+    inductor_config._pre_fusion_custom_pass = lambda nodes: _maybe_run_scheduler_pass(
+        scheduler_pre_passes, nodes
+    )
+    inductor_config._post_fusion_custom_pass = lambda nodes: _maybe_run_scheduler_pass(
+        scheduler_post_passes, nodes
+    )
+    # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
+    # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
+    inductor_config.unroll_reductions_threshold = 1
+    # Disable fusing of mm + permute/transpose for now.
+    inductor_config.permute_fusion = False
+    inductor_config.memory_planning = True
+>>>>>>> f991f52 (Enable inductor memory planning)
     from torch._inductor.ir import Loops
 
     # Force all operations to be realized when LoopLevel IR is initially constructed
