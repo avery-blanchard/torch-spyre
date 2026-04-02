@@ -91,8 +91,8 @@ def enable_spyre_context(
         "unroll_reductions_threshold": 1,
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
+        "memory_planning": True,
     }
-
     from torch._inductor.ir import Loops
 
     # Force all operations to be realized when LoopLevel IR is initially constructed
