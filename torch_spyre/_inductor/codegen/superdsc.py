@@ -264,7 +264,7 @@ def _create_sdsc_tensors(
     missing_dim = None
     backGap = {}
     op_info = dict(op_spec.op_info.get("overwrite_info", {})) if op_spec.op_info else {}
-    output_dev_size = op_spec.args[-1].device_size.copy()
+    adjusted_output_size = op_spec.args[-1].device_size.copy()
     if op_info and (
         "gap" in op_info and "device_offset" in op_info and "device_stride" in op_info
     ):
@@ -276,7 +276,7 @@ def _create_sdsc_tensors(
         for dim_idx, dim in enumerate(reversed(dim_order)):
             if device_stride == math.prod(output.device_size[dim_idx + 1 :]):
                 dim_size = iteration_space.get(dim, 1)
-                output_dev_size[dim_idx] = (
+                adjusted_output_size[dim_idx] = (
                     dim_size // output.device_dtype.elems_per_stick()
                     if dim == stick_dim
                     else dim_size
@@ -289,7 +289,7 @@ def _create_sdsc_tensors(
         offsets: dict = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
-        use_input_strides = op_spec.op == "overwrite" and not arg.is_input
+        use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims:
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
@@ -307,14 +307,15 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
             strides[dim] = _calculate_device_stride(
-                dim_idx, arg.device_size if not use_input_strides else output_dev_size
+                dim_idx,
+                arg.device_size if not use_adjusted_size else adjusted_output_size,
             )
             if (
                 device_stride == math.prod(arg.device_size[-dim_idx - 1 :])
                 and not arg.is_input
             ):
                 backGap[dim] = gap
-                use_input_strides = False
+                use_adjusted_size = False
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
 
