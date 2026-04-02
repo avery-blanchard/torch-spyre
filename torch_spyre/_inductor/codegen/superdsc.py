@@ -26,7 +26,6 @@ from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
-    SEGMENT_OFFSETS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
@@ -46,7 +45,6 @@ class SDSCArgs:
     offsets: dict[Symbol, Any]
     max_dim_sizes: dict[Symbol, Any]
     allocation: dict[str, Any]
-    start_address: int | Symbol
     backGap: dict[Symbol, int]
     offset: int
 
@@ -65,7 +63,6 @@ class SDSCArgs:
             f"  offsets=[{offsets}],\n"
             f"  max_dim_sizes=[{max_dim_sizes}],\n"
             f"  allocation=[{allocation}],\n"
-            f"  start_address={self.start_address}\n"
             f"  backGap={self.backGap}\n"
             f"  offset={self.offset}\n"
             f")"
@@ -283,7 +280,6 @@ def _create_sdsc_tensors(
                 )
     sdsc_args: list[SDSCArgs] = []
     for arg in op_spec.args:
-        addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
@@ -337,7 +333,6 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address=addr,
                 backGap=backGap if not arg.is_input else {},
                 offset=output_offset if not arg.is_input else 0,
             )

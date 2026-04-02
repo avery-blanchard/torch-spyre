@@ -32,6 +32,7 @@ from torch._inductor.virtualized import V
 
 from .constants import (
     MATMUL_REDUCTION_OP,
+    SEGMENT_OFFSETS,
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     IDENTITY_OP,
@@ -537,6 +538,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
+            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[tensor_arg.arg_index]
 
         buf = IndentedBuffer()
         buf.writeline("[")

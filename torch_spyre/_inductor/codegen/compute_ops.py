@@ -285,10 +285,12 @@ def generate_sdsc(sdsc_spec):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
+                                "name_": f"allocate-Tensor{i}_{'lx' if 'lx' in tensor.allocation else 'hbm'}",
                                 "prev_": "",
                                 "ldsIdx_": i,
-                                "component_": "hbm" if not tensor.allocation else "lx",
+                                "component_": "lx"
+                                if "lx" in tensor.allocation
+                                else "hbm",
                                 "layoutDimOrder_": [
                                     str(dim)
                                     for dim in sdsc_spec.layouts[tensor.layout][
@@ -317,7 +319,7 @@ def generate_sdsc(sdsc_spec):
                                     ],
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
-                                            tensor.start_address
+                                            tensor.allocation["hbm"]
                                             + core_idx_to_slice_offset(
                                                 tensor,
                                                 core_id_to_wk_slice[str(c)],
@@ -326,7 +328,7 @@ def generate_sdsc(sdsc_spec):
                                             )
                                             * num_bytes(tensor.data_format)
                                         )
-                                        if not tensor.allocation
+                                        if "lx" not in tensor.allocation
                                         else tensor.allocation["lx"]
                                         for c in range(sdsc_spec.num_cores)
                                     },
@@ -389,7 +391,7 @@ def generate_sdsc(sdsc_spec):
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
                                 }
-                                if not tensor.allocation
+                                if "lx" not in tensor.allocation
                                 else {"lx": {"isPresent": 1}},
                             }
                             for i, tensor in enumerate(sdsc_spec.args)
