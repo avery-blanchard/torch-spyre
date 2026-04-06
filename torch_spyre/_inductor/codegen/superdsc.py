@@ -281,8 +281,20 @@ def _create_sdsc_tensors(
                     if dim == stick_dim
                     else dim_size
                 )
+
+    # Check if this is a type conversion with different elems_per_stick
+    is_type_conversion = op_spec.op == "to_dtype"
+    has_mixed_stick_sizes = False
+    if is_type_conversion and len(op_spec.args) >= 2:
+        input_eps = op_spec.args[0].device_dtype.elems_per_stick()
+        output_eps = op_spec.args[-1].device_dtype.elems_per_stick()
+        has_mixed_stick_sizes = input_eps != output_eps
+
     sdsc_args: list[SDSCArgs] = []
-    for arg in op_spec.args:
+    # For type conversions with mixed stick sizes, track separate stick dimensions
+    type_conv_stick_dims: dict[int, Symbol] = {}
+
+    for arg_idx, arg in enumerate(op_spec.args):
         addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
@@ -294,10 +306,42 @@ def _create_sdsc_tensors(
         if use_op_dims and dim_order != dims:
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
-        if op_stick_dim is None:
+
+        # Handle type conversion with different stick sizes
+        if has_mixed_stick_sizes and op_stick_dim is not None:
+            # For type conversions, use separate stick dimensions for input and output
+            # to accommodate different elems_per_stick values
+            if arg.is_input:
+                # Input uses its own stick dimension
+                if 0 not in type_conv_stick_dims:
+                    type_conv_stick_dims[0] = op_stick_dim
+                stick_dim = type_conv_stick_dims[0]
+            else:
+                # Output uses a separate stick dimension
+                if 1 not in type_conv_stick_dims:
+                    # Create a new stick dimension symbol for output
+                    output_stick_label = (
+                        INPUT_DIM_LABELS[len(op_dim_order) + 1]
+                        if len(op_dim_order) + 1 < len(INPUT_DIM_LABELS)
+                        else "stick_out"
+                    )
+                    type_conv_stick_dims[1] = Symbol(output_stick_label)
+                    # Add output stick dimension to iteration space
+                    iteration_space[type_conv_stick_dims[1]] = (
+                        arg.device_dtype.elems_per_stick()
+                    )
+                stick_dim = type_conv_stick_dims[1]
+
+            # Update dim_order to use the appropriate stick dimension
+            if op_stick_dim in dim_order:
+                dim_order = [stick_dim if d == op_stick_dim else d for d in dim_order]
+            elif stick_dim not in dim_order:
+                dim_order = dim_order + [stick_dim]
+        elif op_stick_dim is None:
             # No stick dim found in op - add one
             stick_dim = next(d for d in dims if d not in op_dim_order)
             dim_order = dim_order + [stick_dim]
+
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
         for dim_idx, dim in enumerate(dim_order):

@@ -141,12 +141,20 @@ def multi_dim_iteration_space_split(
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
+    allow_mixed_dtype: bool = False,
 ) -> None:
     """Adjust iteration space sizes to count sticks rather than elements.
 
     For each tensor, find the variable that indexes its stick dimension and
     convert its size in it_space from elements to sticks. This ensures core
     division treats sticks as atomic units. Adjusts each variable at most once.
+
+    Args:
+        it_space: Iteration space to adjust
+        tensor_deps: List of tensor dependencies
+        allow_mixed_dtype: If True, allows mixed-dtype tensors sharing a stick variable
+                          (e.g., for type conversion operations). Uses the maximum
+                          elems_per_stick value when conflicts occur.
     """
     adjusted: dict[Symbol, int] = {}  # stick_var -> elems_per_stick used
     for td in tensor_deps:
@@ -158,12 +166,23 @@ def adjust_it_space_for_sticks(
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var in adjusted:
-            assert adjusted[stick_var] == elems_per_stick, (
-                f"Conflicting elems_per_stick for iteration variable {stick_var}: "
-                f"previously seen {adjusted[stick_var]}, now {elems_per_stick}. "
-                f"Mixed-dtype tensors sharing a stick variable are not supported."
-            )
-            continue
+            if allow_mixed_dtype:
+                # For type conversions, use the maximum elems_per_stick to ensure
+                # the iteration space can accommodate both input and output dtypes
+                if elems_per_stick > adjusted[stick_var]:
+                    # Re-adjust with the larger elems_per_stick
+                    it_space[stick_var] = (
+                        it_space[stick_var] * adjusted[stick_var] + elems_per_stick - 1
+                    ) // elems_per_stick
+                    adjusted[stick_var] = elems_per_stick
+                continue
+            else:
+                assert adjusted[stick_var] == elems_per_stick, (
+                    f"Conflicting elems_per_stick for iteration variable {stick_var}: "
+                    f"previously seen {adjusted[stick_var]}, now {elems_per_stick}. "
+                    f"Mixed-dtype tensors sharing a stick variable are not supported."
+                )
+                continue
         # FIXME: here we assume padding to a full stick. It may not always be the
         #        case and we shouldn use a more robust way of computing the number
         #        of sticks
@@ -288,7 +307,18 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
-    adjust_it_space_for_sticks(it_space, input_tds + [output_td])
+    # Check if this is a type conversion operation by comparing input/output dtypes
+    # Type conversions may have different elems_per_stick for input and output
+    is_type_conversion = False
+    if input_tds and output_td:
+        input_dtypes = {td.layout.device_layout.dtype for td in input_tds}
+        output_dtype = output_td.layout.device_layout.dtype
+        # If input and output have different dtypes, this might be a type conversion
+        is_type_conversion = output_dtype not in input_dtypes and len(input_dtypes) == 1
+
+    adjust_it_space_for_sticks(
+        it_space, input_tds + [output_td], allow_mixed_dtype=is_type_conversion
+    )
 
     priorities, min_splits = prioritize_dimensions(output_td, it_space)
     splits = multi_dim_iteration_space_split(
