@@ -311,8 +311,8 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     # Type conversions may have different elems_per_stick for input and output
     is_type_conversion = False
     if input_tds and output_td:
-        input_dtypes = {td.layout.device_layout.dtype for td in input_tds}
-        output_dtype = output_td.layout.device_layout.dtype
+        input_dtypes = {td.layout.device_layout.device_dtype for td in input_tds}
+        output_dtype = output_td.layout.device_layout.device_dtype
         # If input and output have different dtypes, this might be a type conversion
         is_type_conversion = output_dtype not in input_dtypes and len(input_dtypes) == 1
 

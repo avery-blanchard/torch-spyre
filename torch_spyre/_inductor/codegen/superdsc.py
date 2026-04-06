@@ -253,7 +253,7 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
-) -> tuple[list[SDSCArgs], dict, Symbol | None]:
+) -> tuple[list[SDSCArgs], dict, Symbol | None, list[Symbol]]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
@@ -293,6 +293,7 @@ def _create_sdsc_tensors(
     sdsc_args: list[SDSCArgs] = []
     # For type conversions with mixed stick sizes, track separate stick dimensions
     type_conv_stick_dims: dict[int, Symbol] = {}
+    new_stick_dims: list[Symbol] = []  # Track newly added stick dimensions
 
     for arg_idx, arg in enumerate(op_spec.args):
         addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
@@ -330,6 +331,8 @@ def _create_sdsc_tensors(
                     iteration_space[type_conv_stick_dims[1]] = (
                         arg.device_dtype.elems_per_stick()
                     )
+                    # Track this new dimension
+                    new_stick_dims.append(type_conv_stick_dims[1])
                 stick_dim = type_conv_stick_dims[1]
 
             # Update dim_order to use the appropriate stick dimension
@@ -407,7 +410,7 @@ def _create_sdsc_tensors(
                     "dim_order"
                 ] + [missing_dim]
 
-    return sdsc_args, layouts, missing_dim
+    return sdsc_args, layouts, missing_dim, new_stick_dims
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
@@ -462,7 +465,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
-    args, layouts, missing_dim = _create_sdsc_tensors(
+    args, layouts, missing_dim, new_stick_dims = _create_sdsc_tensors(
         op_spec,
         symbol_mapping,
         sdsc_iteration_space,
@@ -473,6 +476,12 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         # A dimension was added to the iteration space, update splits and work slices
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
+
+    # Add any new stick dimensions created for type conversions
+    for new_dim in new_stick_dims:
+        if new_dim not in dim_splits:
+            dim_splits[new_dim] = 1
+            work_slices[new_dim] = 1
 
     if is_matmul:
         pad_args, pad_sdsc_args = list(op_spec.args), args
