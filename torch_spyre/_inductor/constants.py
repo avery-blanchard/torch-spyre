@@ -17,6 +17,12 @@ IDENTITY_OP = "identity"
 MATMUL_REDUCTION_OP = "matmul"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
+# Type casting operators from deeptools/dsc
+DL16TOFP32_OP = "dl16tofp32"  # fp16 -> fp32
+FP32TODL16_OP = "fp32todl16"  # fp32 -> fp16
+DL16TOBF16_OP = "dl16tobf16"  # fp16 -> bf16
+FP8TODL16_OP = "fp8todl16"  # fp8 -> fp16
+
 DEVICE_NAME = "spyre"
 
 

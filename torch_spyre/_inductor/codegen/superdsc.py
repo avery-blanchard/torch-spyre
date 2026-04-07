@@ -21,6 +21,10 @@ from sympy import Integer, Symbol, Expr, Mod, floor
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
+    DL16TOFP32_OP,
+    FP32TODL16_OP,
+    DL16TOBF16_OP,
+    FP8TODL16_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
     LAYOUT_LABELS,
@@ -193,19 +197,24 @@ def _get_layout_label(
     stick_dim_order: Symbol | None,
     stick_size: int,
     layout_labels: list[str],
+    is_output: bool = False,
 ) -> str:
-    for label, layout in layouts.items():
-        if (
-            layout["stick_dim_order"] == stick_dim_order
-            and layout["dim_order"] == dim_order
-            and layout["stick_size"] == stick_size
-        ):
-            return label
+    # For outputs, always use a separate label even if layout matches inputs
+    if not is_output:
+        for label, layout in layouts.items():
+            if (
+                layout["stick_dim_order"] == stick_dim_order
+                and layout["dim_order"] == dim_order
+                and layout["stick_size"] == stick_size
+                and not layout.get("is_output", False)
+            ):
+                return label
     label = layout_labels[len(layouts)]
     layouts[label] = {
         "dim_order": dim_order,
         "stick_dim_order": stick_dim_order,
         "stick_size": stick_size,
+        "is_output": is_output,
     }
     return label
 
@@ -285,14 +294,18 @@ def _create_sdsc_tensors(
     # Check if this is a type conversion with different elems_per_stick
     is_type_conversion = op_spec.op == "to_dtype"
     has_mixed_stick_sizes = False
+    unified_stick_size = None
     if is_type_conversion and len(op_spec.args) >= 2:
         input_eps = op_spec.args[0].device_dtype.elems_per_stick()
         output_eps = op_spec.args[-1].device_dtype.elems_per_stick()
         has_mixed_stick_sizes = input_eps != output_eps
+        if has_mixed_stick_sizes:
+            # Use the maximum stick size for unified layout
+            unified_stick_size = max(input_eps, output_eps)
 
     sdsc_args: list[SDSCArgs] = []
     # For type conversions with mixed stick sizes, track separate stick dimensions
-    type_conv_stick_dims: dict[int, Symbol] = {}
+    # type_conv_stick_dims: dict[int, Symbol] = {}
     new_stick_dims: list[Symbol] = []  # Track newly added stick dimensions
 
     for arg_idx, arg in enumerate(op_spec.args):
@@ -310,35 +323,10 @@ def _create_sdsc_tensors(
 
         # Handle type conversion with different stick sizes
         if has_mixed_stick_sizes and op_stick_dim is not None:
-            # For type conversions, use separate stick dimensions for input and output
-            # to accommodate different elems_per_stick values
-            if arg.is_input:
-                # Input uses its own stick dimension
-                if 0 not in type_conv_stick_dims:
-                    type_conv_stick_dims[0] = op_stick_dim
-                stick_dim = type_conv_stick_dims[0]
-            else:
-                # Output uses a separate stick dimension
-                if 1 not in type_conv_stick_dims:
-                    # Create a new stick dimension symbol for output
-                    output_stick_label = (
-                        INPUT_DIM_LABELS[len(op_dim_order) + 1]
-                        if len(op_dim_order) + 1 < len(INPUT_DIM_LABELS)
-                        else "stick_out"
-                    )
-                    type_conv_stick_dims[1] = Symbol(output_stick_label)
-                    # Add output stick dimension to iteration space
-                    iteration_space[type_conv_stick_dims[1]] = (
-                        arg.device_dtype.elems_per_stick()
-                    )
-                    # Track this new dimension
-                    new_stick_dims.append(type_conv_stick_dims[1])
-                stick_dim = type_conv_stick_dims[1]
-
-            # Update dim_order to use the appropriate stick dimension
-            if op_stick_dim in dim_order:
-                dim_order = [stick_dim if d == op_stick_dim else d for d in dim_order]
-            elif stick_dim not in dim_order:
+            # For type conversions with different stick sizes, use the same stick dimension
+            # but the hardware will handle the different elems_per_stick values
+            stick_dim = op_stick_dim
+            if stick_dim not in dim_order:
                 dim_order = dim_order + [stick_dim]
         elif op_stick_dim is None:
             # No stick dim found in op - add one
@@ -368,12 +356,19 @@ def _create_sdsc_tensors(
             max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        # For type conversions with mixed stick sizes, use unified stick size
+        stick_size_for_layout = (
+            unified_stick_size
+            if unified_stick_size is not None
+            else arg.device_dtype.elems_per_stick()
+        )
         label = _get_layout_label(
             layouts,
             dim_order,
             effective_stick,
-            arg.device_dtype.elems_per_stick(),
+            stick_size_for_layout,
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+            is_output=not arg.is_input,
         )
         sdsc_args.append(
             SDSCArgs(
@@ -413,8 +408,45 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim, new_stick_dims
 
 
-def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if op == "to_dtype" or op == "overwrite":
+def _get_op_func(op: str, is_reduction: bool, output_scales: dict, op_spec=None) -> str:
+    if op == "to_dtype":
+        # Map dtype conversions to Spyre native operators
+        if op_spec and len(op_spec.args) >= 2:
+            from torch_spyre._C import DataFormats
+
+            src_dtype = op_spec.args[0].device_dtype
+            dst_dtype = op_spec.args[-1].device_dtype
+
+            # Map DataFormats to Spyre type casting operators
+            # IEEE_FP32 -> SEN169_FP16 (fp32 -> fp16)
+            if (
+                src_dtype == DataFormats.IEEE_FP32
+                and dst_dtype == DataFormats.SEN169_FP16
+            ):
+                return FP32TODL16_OP
+            # SEN169_FP16 -> IEEE_FP32 (fp16 -> fp32)
+            elif (
+                src_dtype == DataFormats.SEN169_FP16
+                and dst_dtype == DataFormats.IEEE_FP32
+            ):
+                return DL16TOFP32_OP
+            # SEN169_FP16 -> BFLOAT16 (fp16 -> bf16)
+            elif (
+                src_dtype == DataFormats.SEN169_FP16
+                and dst_dtype == DataFormats.BFLOAT16
+            ):
+                return DL16TOBF16_OP
+            # SEN143_FP8 or SEN152_FP8 -> SEN169_FP16 (fp8 -> fp16)
+            elif (
+                src_dtype in (DataFormats.SEN143_FP8, DataFormats.SEN152_FP8)
+                and dst_dtype == DataFormats.SEN169_FP16
+            ):
+                return FP8TODL16_OP
+
+        # Fallback to identity for unsupported conversions
+        return IDENTITY_OP
+
+    if op == "overwrite":
         return IDENTITY_OP
     if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
         return op + "nonstick"
@@ -461,7 +493,14 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
-        sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
+        # For type conversions, use the maximum elems_per_stick across all args
+        if op_spec.op == "to_dtype":
+            max_eps = max(arg.device_dtype.elems_per_stick() for arg in op_spec.args)
+            sdsc_iteration_space[stick_sym] = max_eps
+        else:
+            sdsc_iteration_space[stick_sym] = op_spec.args[
+                0
+            ].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
@@ -500,7 +539,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
 
     return SDSCSpec(
-        opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
+        opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales, op_spec),
         execution_unit="pt" if is_matmul else "sfp",
         data_format=op_spec.args[
             0
