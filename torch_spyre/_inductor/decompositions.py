@@ -617,7 +617,7 @@ def decompose_cat(
         offset = 0
         for input in tensors:
             output = torch.ops.spyre.overwrite(
-                input=input, output=output, dim=dim, offset=offset
+                input=input, output=output, dims=[dim], offsets=[offset]
             )
             offset += input.size(dim)
         return output
@@ -641,26 +641,28 @@ def pad_decomp(
             f"constant_pad_nd: left-padding is not supported on Spyre (pad={pad})"
         )
 
-    # Apply padding one dimension at a time, from outermost to innermost.
-    # Each step fills an intermediate tensor with the pad value and overwrites
-    # it with the current tensor.  Processing outermost-first ensures that each
-    # overwrite call sees matching sizes on all non-overwrite dimensions.
+    # Build the padded output shape and collect which dimensions need padding.
     scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
-    current = input
+    output_size = list(input.size())
+    dims: list[int] = []
+    offsets: list[int] = []
     for i in range(n_dims_padded - 1, -1, -1):
         left = pad[2 * i]
         right = pad[2 * i + 1]
         if left + right == 0:
             continue
         dim = input.dim() - 1 - i
-        intermediate_size = list(current.size())
-        intermediate_size[dim] += left + right
-        intermediate = scalar.expand(intermediate_size).clone()
-        current = torch.ops.spyre.overwrite(
-            input=current, output=intermediate, dim=dim, offset=left
-        )
+        output_size[dim] += left + right
+        dims.append(dim)
+        offsets.append(left)
 
-    return current
+    if not dims:
+        return input
+
+    output = scalar.expand(output_size).clone()
+    return torch.ops.spyre.overwrite(
+        input=input, output=output, dims=dims, offsets=offsets
+    )
 
 
 ###############################################################################################

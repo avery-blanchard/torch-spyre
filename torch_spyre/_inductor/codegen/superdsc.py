@@ -48,7 +48,6 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
-    offset: int
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -67,7 +66,6 @@ class SDSCArgs:
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
             f"  backGap={self.backGap}\n"
-            f"  offset={self.offset}\n"
             f")"
         )
 
@@ -258,19 +256,11 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
-    output_offset = 0
-    gap = 0
-    device_stride = None
     missing_dim = None
-    backGap = {}
-    op_info = dict(op_spec.op_info.get("overwrite_info", {})) if op_spec.op_info else {}
-    if op_info and (
-        "gap" in op_info and "device_offset" in op_info and "device_stride" in op_info
-    ):
-        device_stride = op_info["device_stride"]
-        gap = op_info["gap"]
-        output_offset = op_info["device_offset"] * device_stride
-
+    backGap: dict[Symbol, int] = {}
+    overwrite_infos: dict = (
+        dict(op_spec.op_info.get("overwrite_infos", {})) if op_spec.op_info else {}
+    )
     sdsc_args: list[SDSCArgs] = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
@@ -297,12 +287,15 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
             strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
-            if (
-                device_stride == math.prod(arg.device_size[-dim_idx - 1 :])
-                and not arg.is_input
-            ):
-                backGap[dim] = gap
             offsets[dim] = 0
+            dim_device_stride = math.prod(arg.device_size[-dim_idx - 1 :])
+            for key in list(overwrite_infos.keys()):
+                info = overwrite_infos[key]
+                if info["device_stride"] == dim_device_stride and not arg.is_input:
+                    backGap[dim] = info["gap"]
+                    offsets[dim] = info["device_offset"] * info["device_stride"]
+                    overwrite_infos.pop(key)
+                    break
             max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
@@ -324,25 +317,26 @@ def _create_sdsc_tensors(
                 allocation=arg.allocation,
                 start_address=addr,
                 backGap=backGap if not arg.is_input else {},
-                offset=output_offset if not arg.is_input else 0,
             )
         )
 
-    if not backGap and "gap" in op_info:
-        # Size of the dim with gap is 1 and was absent from the iteration space - add it
+    # For each overwrite entry with a device dimension of size 1 (absent from
+    # the iteration space), inject a synthetic dimension.
+    for info in overwrite_infos.values():
         missing_dim = Symbol(INPUT_DIM_LABELS[len(op_dim_order)])
         iteration_space[missing_dim] = 1
-        backGap[missing_dim] = gap
         for sdsc_arg, src_arg in zip(sdsc_args, op_spec.args):
             dim_idx = len(sdsc_arg.scales)
             sdsc_arg.scales[missing_dim] = 1
-            sdsc_arg.offsets[missing_dim] = 0
             sdsc_arg.max_dim_sizes[missing_dim] = -1
             sdsc_arg.strides[missing_dim] = _calculate_device_stride(
                 dim_idx, src_arg.device_size
             )
             if not src_arg.is_input:
-                sdsc_arg.backGap[missing_dim] = gap
+                sdsc_arg.backGap[missing_dim] = info["gap"]
+                sdsc_arg.offsets[missing_dim] = (
+                    info["device_offset"] * info["device_stride"]
+                )
             if missing_dim not in layouts[sdsc_arg.layout]["dim_order"]:
                 layouts[sdsc_arg.layout]["dim_order"] = layouts[sdsc_arg.layout][
                     "dim_order"
