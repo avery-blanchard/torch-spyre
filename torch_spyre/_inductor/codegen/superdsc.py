@@ -267,7 +267,9 @@ def _create_sdsc_tensors(
         dim_order, stick_dim = _get_device_dim_order(output, symbol_mapping)
         for dim_idx, dim in enumerate(reversed(dim_order)):
             for info in overwrite_infos.values():
-                if info["device_stride"] == math.prod(output.device_size[dim_idx + 1 :]):
+                if info["device_stride"] == math.prod(
+                    output.device_size[dim_idx + 1 :]
+                ):
                     dim_size = iteration_space.get(dim, 1)
                     adjusted_output_size[dim_idx] = (
                         dim_size // output.device_dtype.elems_per_stick()
