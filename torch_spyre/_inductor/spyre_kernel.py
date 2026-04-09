@@ -339,7 +339,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_coords,
             tensor.layout.allocation,
         )
-        if not tensor.layout.allocation:
+        if "lx" not in tensor.layout.allocation:
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
@@ -383,7 +383,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if buf is None:
                 continue
             layout = buf.get_layout()
-            if isinstance(layout, FixedTiledLayout) and layout.allocation:
+            if isinstance(layout, FixedTiledLayout) and "lx" in layout.allocation:
                 self.remove_buffer(name)
 
     def load(self, name: str, index: sympy.Expr):
@@ -393,7 +393,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        if not layout.allocation:
+        if "lx" not in layout.allocation:
             _ = self.args.input(name)
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -536,9 +536,13 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
+        hbm_idx = 0
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
-            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[tensor_arg.arg_index]
+            if "lx" not in tensor_arg.allocation and "hbm" not in tensor_arg.allocation:
+                print("ASSIGNING HBM ADDRESS", SEGMENT_OFFSETS[hbm_idx])
+                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[hbm_idx]
+                hbm_idx += 1
 
         buf = IndentedBuffer()
         buf.writeline("[")
@@ -606,9 +610,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         """Codegen a call to this kernel"""
         wrapper = V.graph.wrapper_code
         call_args = []
-        call_args.extend(self.args.python_argdefs()[1])
-        call_args_str = ", ".join(call_args)
-        wrapper.writeline(f"{name}.run({call_args_str})")
+        # Filter pool-allocated intermediates
+        all_args = self.args.python_argdefs()[1]
+        wrapper.deferred_kernel_calls.append((name, all_args))
 
 
 def simplify_op_spec(op_spec):

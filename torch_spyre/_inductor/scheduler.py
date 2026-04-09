@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Union
+from typing import Sequence, Union, Optional
 
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import (
@@ -29,9 +29,47 @@ from torch._inductor.scheduler import (
 from torch._inductor.virtualized import V
 from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
-
+from torch._inductor.codegen.wrapper import WrapperLine
 from .spyre_kernel import SpyreKernel
 from .pass_utils import iteration_space
+
+
+class DeferredKernelLine(WrapperLine):
+    """Defers codegen_kernel() until after memory planning has resolved pool
+    assignments, so HBM addresses in layout.allocation are populated before
+    the OpSpec list is serialised into the SDSC source string."""
+
+    def __init__(
+        self,
+        wrapper,
+        kernel: SpyreKernel,
+        kernel_name: str,
+        node_schedule,
+        metadata_comment: Optional[str] = None,
+    ):
+        self.wrapper = wrapper
+        self.kernel = kernel
+        self.kernel_name = kernel_name
+        self.node_schedule = node_schedule
+        self.metadata_comment = metadata_comment
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        with V.set_kernel_handler(self.kernel):
+            print("calling codegen kerenl")
+            src_code = self.kernel.codegen_kernel()
+        self.kernel.code_hash = code_hash(src_code)
+
+        buf = IndentedBuffer()
+        buf.writeline(f"async_compile.sdsc('{self.kernel_name}',")
+        with buf.indent():
+            buf.splice(f"{src_code}")
+        buf.writeline(")")
+        self.wrapper._define_kernel_helper(
+            self.kernel_name,
+            buf.getvalue(),
+            metadata=self.metadata_comment,
+            gpu=False,
+        )
 
 
 class SuperDSCScheduling(BaseScheduling):
@@ -115,9 +153,9 @@ class SuperDSCScheduling(BaseScheduling):
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel_name = self.define_kernel(src_code, kernel, node_schedule)
         kernel.kernel_name = kernel_name
-        kernel.code_hash = code_hash(src_code)
+        # kernel.code_hash = code_hash(src_code)
 
         with V.set_kernel_handler(kernel):
             for node in node_schedule:
@@ -131,24 +169,32 @@ class SuperDSCScheduling(BaseScheduling):
 
         self.free_buffers_in_scheduler()
 
-    def define_kernel(self, src_code, node_schedule, kernel):
+    def define_kernel(self, src_code, kernel, node_schedule):
         """
         Codegen kernel definition to go in output wrapper code
         """
         wrapper = V.graph.wrapper_code
-        if src_code in wrapper.src_to_kernel:
-            kernel_name = wrapper.src_to_kernel[src_code]
-        else:
-            fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
-            wrapper.src_to_kernel[src_code] = kernel_name
-            buf = IndentedBuffer()
-            buf.writeline(f"async_compile.sdsc('{kernel_name}',")
-            with buf.indent():
-                buf.splice(f"{src_code}")
-            buf.writeline(")")
-            origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
-            metadata_comment = f"{origins}\n{detailed_origins}"
-            wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
-
+        # if src_code in wrapper.src_to_kernel:
+        #     kernel_name = wrapper.src_to_kernel[src_code]
+        # else:
+        #     fused_name = get_fused_kernel_name(node_schedule, "original_aten")
+        #     kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
+        #     wrapper.src_to_kernel[src_code] = kernel_name
+        #     buf = IndentedBuffer()
+        #     buf.writeline(f"async_compile.sdsc('{kernel_name}',")
+        #     with buf.indent():
+        #         buf.splice(f"{src_code}")
+        #     buf.writeline(")")
+        #     origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
+        #     metadata_comment = f"{origins}\n{detailed_origins}"
+        #     wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
+        fused_name = get_fused_kernel_name(node_schedule, "original_aten")
+        kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
+        origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
+        metadata_comment = f"{origins}\n{detailed_origins}"
+        wrapper.writeline(
+            DeferredKernelLine(
+                wrapper, kernel, kernel_name, node_schedule, metadata_comment
+            )
+        )
         return kernel_name

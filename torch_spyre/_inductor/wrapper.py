@@ -33,6 +33,9 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         V.graph.sizevars._simplify_loops_impl = noop_simplify_loops_impl.__get__(
             V.graph.sizevars, SizeVarAllocator
         )
+        # Track intermediate buffers that are pool-allocated and optimized away (no code generation)
+        self.intermediate_buffers: set[str] = set()
+        self.deferred_kernel_calls: list[tuple[str, list[str]]] = []
 
     @staticmethod
     def create(
@@ -103,6 +106,32 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         new_stl = new.get_layout().device_layout
         reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
+
+    def execute_deferred_kernel_calls(self):
+        from torch._inductor.codegen.wrapper import FreeLine, FreeIfNotReusedLine
+
+        for kernel_name, all_args in self.deferred_kernel_calls:
+            call_args = [
+                arg for arg in all_args if arg not in self.intermediate_buffers
+            ]
+            call_args_str = ", ".join(call_args)
+            run_line = f"{kernel_name}.run({call_args_str})"
+
+            # Find the earliest position where any call arg would be freed,
+            # and insert the .run() call just before it.
+            insert_pos = len(self.lines)
+            for i, line in enumerate(self.lines):
+                if isinstance(line, (FreeLine, FreeIfNotReusedLine)):
+                    if line.node.get_name() in call_args:
+                        insert_pos = i
+                        break
+            self.lines.insert(insert_pos, run_line)
+
+    def memory_plan(self):
+        from torch_spyre._inductor.codegen.memory_planning import SpyreMemoryPlanner
+
+        self.lines = SpyreMemoryPlanner(self).plan(self.lines)
+        self.execute_deferred_kernel_calls()
 
 
 def noop_simplify_loops_impl(
