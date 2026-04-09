@@ -291,18 +291,6 @@ def _create_sdsc_tensors(
                     else dim_size
                 )
 
-    # Check if this is a type conversion with different elems_per_stick
-    is_type_conversion = op_spec.op == "to_dtype"
-    has_mixed_stick_sizes = False
-    unified_stick_size = None
-    if is_type_conversion and len(op_spec.args) >= 2:
-        input_eps = op_spec.args[0].device_dtype.elems_per_stick()
-        output_eps = op_spec.args[-1].device_dtype.elems_per_stick()
-        has_mixed_stick_sizes = input_eps != output_eps
-        if has_mixed_stick_sizes:
-            # Use the maximum stick size for unified layout
-            unified_stick_size = max(input_eps, output_eps)
-
     sdsc_args: list[SDSCArgs] = []
     # For type conversions with mixed stick sizes, track separate stick dimensions
     # type_conv_stick_dims: dict[int, Symbol] = {}
@@ -322,7 +310,7 @@ def _create_sdsc_tensors(
             dim_order = dim_order + reduced_dims
 
         # Handle type conversion with different stick sizes
-        if has_mixed_stick_sizes and op_stick_dim is not None:
+        if op_stick_dim is not None:
             # For type conversions with different stick sizes, use the same stick dimension
             # but the hardware will handle the different elems_per_stick values
             stick_dim = op_stick_dim
@@ -356,17 +344,11 @@ def _create_sdsc_tensors(
             max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
-        # For type conversions with mixed stick sizes, use unified stick size
-        stick_size_for_layout = (
-            unified_stick_size
-            if unified_stick_size is not None
-            else arg.device_dtype.elems_per_stick()
-        )
         label = _get_layout_label(
             layouts,
             dim_order,
             effective_stick,
-            stick_size_for_layout,
+            arg.device_dtype.elems_per_stick(),
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
             is_output=not arg.is_input,
         )
