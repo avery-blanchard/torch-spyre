@@ -32,7 +32,6 @@ from torch._inductor.virtualized import V
 
 from .constants import (
     MATMUL_REDUCTION_OP,
-    SEGMENT_OFFSETS,
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     IDENTITY_OP,
@@ -534,16 +533,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         def sympy_str(x: sympy.Expr) -> str:
             return "sympify('" + str(x) + "')"
 
-        # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
-        actuals = self.args.python_argdefs()[1]
-        hbm_idx = 0
-        for name, tensor_arg in self.spyre_kernel_args:
-            tensor_arg.arg_index = actuals.index(name)
-            if "lx" not in tensor_arg.allocation and "hbm" not in tensor_arg.allocation:
-                print("ASSIGNING HBM ADDRESS", SEGMENT_OFFSETS[hbm_idx])
-                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[hbm_idx]
-                hbm_idx += 1
-
         buf = IndentedBuffer()
         buf.writeline("[")
         with buf.indent():
@@ -609,7 +598,6 @@ class SpyreKernel(Kernel[CSEVariable]):
     def call_kernel(self, name: str, node=None):
         """Codegen a call to this kernel"""
         wrapper = V.graph.wrapper_code
-        call_args = []
         # Filter pool-allocated intermediates
         all_args = self.args.python_argdefs()[1]
         wrapper.deferred_kernel_calls.append((name, all_args))

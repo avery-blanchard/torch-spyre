@@ -29,7 +29,7 @@ SEGMENT_OFFSETS = [
     0x1400000000,
     0x1800000000,
 ]
-
+SEGMENT_SIZE = 0x400000000
 SPYRE_FP32_OPS = [
     "add",
     "sub",

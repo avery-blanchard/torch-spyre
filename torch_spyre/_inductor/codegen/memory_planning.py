@@ -2,11 +2,15 @@ from torch._inductor.codegen.memory_planning import (
     Allocation,
     AllocationPool,
     AllocationPools,
+    AllocationTreeNode,
     BufferGroup,
     MemoryPlanner,
+    Empty,
+    SpatialSplit,
     TemporalSplit,
     AllocFromPoolLine,
     DeallocFromPoolLine,
+    align,
 )
 from torch._inductor.codegen.wrapper import (
     AllocateLine,
@@ -18,12 +22,7 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-
-
-def get_pool_id(pool_name: str) -> int:
-    """Extract the pool ID number from a pool name (e.g., 'pool0' -> 0)."""
-    return int(pool_name.removeprefix("pool"))
+from torch_spyre._inductor.constants import SEGMENT_OFFSETS, SEGMENT_SIZE
 
 
 class SpyreAllocation(Allocation):
@@ -34,24 +33,80 @@ class SpyreAllocation(Allocation):
         self.is_output = False
 
     def finalize(self, pool, offset):
-        """Assign HBM address based on pool ID and number of graph inputs."""
         assert self.pool is None and self.offset is None
         self.pool = pool
         self.offset = offset
-
-        # Map pool ID to HBM segment: inputs get segments 0..n-1, then pools start at segment n.
-        n = SpyreAllocationPools._num_graph_inputs
-        pool_id = get_pool_id(self.pool.name)
-        segment_id = n + pool_id
+        print("Offset in SpyreAllocation.finalize", int(offset))
+        segment_id = -1
         self.node.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[segment_id] + int(
             self.offset
         )
-        print("finalized allocation", self.node.get_layout().allocation["hbm"])
         return self
 
     def codegen_alloc_from_pool(self, wrapper):
-        """Generate allocation code from pool, with special handling for outputs."""
         return "", []
+
+
+class SpyreTemporalSplit(TemporalSplit):
+    def _allocate(self, block: SpyreAllocation, is_last: bool):
+        slot_size = self.get_size_hint()
+        block_size = block.get_size_hint()
+        if not is_last and block_size > slot_size:
+            return False  # doesn't fit
+
+        block_live = block.get_live_ranges()
+        overlapping = [
+            s for s in self.allocations if s.get_live_ranges().overlaps(block_live)
+        ]
+        if len(overlapping) > 1:
+            return False
+        elif len(overlapping) == 1:
+            return overlapping[0].allocate(block, is_last)
+        else:
+            block.mark_allocated()
+
+            if len(self.allocations) == 1 and isinstance(self.allocations[-1], Empty):
+                self.allocations.pop()
+
+            if slot_size == block_size:
+                self.allocations.append(block)
+            elif slot_size > block_size:
+                self.allocations.append(
+                    SpyreSpatialSplit.create(block, slot_size - block_size)
+                )
+            else:  # grow this allocation
+                assert is_last
+                self.allocations = [
+                    *(
+                        SpyreSpatialSplit.create(a, block_size - slot_size)
+                        for a in self.allocations
+                    ),
+                    block,
+                ]
+            return True
+
+
+class SpyreSpatialSplit(SpatialSplit):
+    left: SpyreTemporalSplit
+    right: SpyreTemporalSplit
+
+    @staticmethod
+    def create(left, extra_space):
+        assert isinstance(left, AllocationTreeNode)
+        assert isinstance(extra_space, int) and extra_space >= 1
+        return SpyreSpatialSplit(
+            SpyreTemporalSplit([left]), SpyreTemporalSplit([Empty(extra_space)])
+        )
+
+    def finalize(self, pool, offset):
+        self.left = self.left.finalize(pool, offset)
+        self.right = self.right.finalize(
+            pool, offset + align(self.left.get_symbolic_size())
+        )
+        self.clear_cache()
+        if self.right.is_empty():
+            return self.left
+        return self
 
 
 class SpyreAllocFromPoolLine(AllocFromPoolLine):
@@ -92,25 +147,45 @@ class SpyreAllocationPools(AllocationPools):
 
     _graph_inputs = list(V.graph.graph_inputs.values())
     _num_graph_inputs = len(list(V.graph.graph_inputs.values()))
+    _graph_outputs = V.graph.graph_outputs
 
-    def allocate_output(self, block: Allocation):
-        """Each output gets its own pool so its HBM address starts at offset 0."""
-        print("IN ALLOCATE OUTPUT")
+    def allocate(self, block: Allocation):
+        """Allocate into the single intermediate pool, enforcing MAX_POOLS and SEGMENT_SIZE."""
         pools = self.get_pools(block)
-        block.mark_allocated()
-        block.is_output = True
-        pools.append(
-            AllocationPool(
-                block.device,
-                TemporalSplit([block]),
-                can_expand=False,
+
+        if pools:
+            pool = pools[0]
+            # Reject if adding this block would exceed one segment's worth of memory.
+            current = pool.root.get_symbolic_size()
+            incoming = block.symbolic_size
+            if current + incoming <= SEGMENT_SIZE:
+                if pool.allocate(block, is_last=True):
+                    return
+            else:
+                raise RuntimeError(
+                    f"Intermediate pool would exceed the {SEGMENT_SIZE:#x}-byte "
+                    "segment size limit. Only one pool is supported."
+                )
+        else:
+            # First allocation: create the single pool.
+            pools.append(
+                AllocationPool(
+                    block.device,
+                    SpyreTemporalSplit([block]),
+                    can_expand=True,
+                )
             )
-        )
+            block.mark_allocated()
+            return
 
     def finalize(self):
-        """Assign inputs to segments 0..n-1, then finalize pools."""
+        """Assign inputs/outputs to segments 0..n-1, then finalize pools."""
         for i, inp in enumerate(self._graph_inputs):
             inp.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[i]
+        for i, inp in enumerate(self._graph_outputs):
+            inp.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[
+                i + self._num_graph_inputs
+            ]
         super().finalize()
 
 
@@ -119,6 +194,15 @@ class SpyreAllocationPool(AllocationPool):
         for block in self.root.allocations:
             if isinstance(block, SpyreAllocation):
                 self.update_restrict_live_range(block)
+
+    def allocate_at_end(self, block: Allocation) -> bool:
+        """Override to use SpyreSpatialSplit instead of SpatialSplit."""
+        block.mark_allocated()
+        self.root = SpyreTemporalSplit(
+            [SpyreSpatialSplit(self.root, SpyreTemporalSplit([block]))]
+        )
+        self.update_restrict_live_range(block)
+        return True
 
     def allocate(self, block: SpyreAllocation, is_last: bool):
         if (
@@ -141,36 +225,6 @@ class SpyreAllocationPool(AllocationPool):
             return self.allocate_at_end(block)
 
         return False
-
-    def codegen_create(self, wrapper, code: IndentedBuffer):
-        assert self.name
-        nbytes = self.root.get_symbolic_size()
-        for block in self.root.allocations:
-            if (
-                isinstance(block, SpyreAllocation)
-                and nbytes == block.get_symbolic_size()
-            ):
-                node = block.node
-                code.writeline(
-                    wrapper.make_allocation(
-                        self.name,
-                        device=self.device,
-                        dtype=node.get_dtype(),
-                        shape=tuple(node.get_size()),
-                        stride=tuple(node.get_stride()),
-                    )
-                )
-                return
-        else:
-            code.writeline(
-                wrapper.make_allocation(
-                    self.name,
-                    device=self.device,
-                    dtype=torch.uint8,
-                    shape=(nbytes,),
-                    stride=(1,),
-                )
-            )
 
 
 class SpyreBufferGroup(BufferGroup):

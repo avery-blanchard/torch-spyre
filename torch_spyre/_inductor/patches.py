@@ -92,7 +92,7 @@ def enable_spyre_context(
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
         "memory_planning": True,
-        "memory_pool": "intermediates",
+        "memory_pool": "combined",
     }
     from torch._inductor.ir import Loops
 
