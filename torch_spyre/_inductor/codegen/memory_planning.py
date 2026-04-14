@@ -1,3 +1,4 @@
+import math
 from torch._inductor.codegen.memory_planning import (
     Allocation,
     AllocationPool,
@@ -35,10 +36,13 @@ class SpyreAllocation(Allocation):
     def finalize(self, pool, offset):
         assert self.pool is None and self.offset is None
         self.pool = pool
-        self.offset = offset
-        print("Offset in SpyreAllocation.finalize", int(offset))
-        segment_id = -1
-        self.node.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[segment_id] + int(
+        layout = self.node.get_layout()
+        device_size = layout.device_layout.device_size
+        # Compute the byte size of this tensor on device: the product of all
+        # non-stick dimensions times 128 bytes per stick.
+        device_nbytes = math.prod(device_size[:-1]) * 128
+        self.offset = (offset // self.symbolic_size) * device_nbytes
+        self.node.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[-1] + int(
             self.offset
         )
         return self
@@ -48,6 +52,19 @@ class SpyreAllocation(Allocation):
 
 
 class SpyreTemporalSplit(TemporalSplit):
+    def finalize(self, pool, offset):
+        current_offset = offset
+        finalized_allocations = []
+        for block in self.allocations:
+            finalized_block = block.finalize(pool, current_offset)
+            finalized_allocations.append(finalized_block)
+            current_offset += align(finalized_block.get_symbolic_size())
+        self.allocations = finalized_allocations
+        self.clear_cache()
+        if len(self.allocations) == 1:
+            return self.allocations[0]
+        return self
+
     def _allocate(self, block: SpyreAllocation, is_last: bool):
         slot_size = self.get_size_hint()
         block_size = block.get_size_hint()
@@ -71,6 +88,7 @@ class SpyreTemporalSplit(TemporalSplit):
             if slot_size == block_size:
                 self.allocations.append(block)
             elif slot_size > block_size:
+                print("Creating SpyreSpatialSplit with offset:", slot_size - block_size)
                 self.allocations.append(
                     SpyreSpatialSplit.create(block, slot_size - block_size)
                 )
@@ -83,6 +101,7 @@ class SpyreTemporalSplit(TemporalSplit):
                     ),
                     block,
                 ]
+                print("Growing allocation", self.allocations)
             return True
 
 
@@ -92,17 +111,25 @@ class SpyreSpatialSplit(SpatialSplit):
 
     @staticmethod
     def create(left, extra_space):
+        print("In SpyreSpatialSplit.create")
         assert isinstance(left, AllocationTreeNode)
         assert isinstance(extra_space, int) and extra_space >= 1
         return SpyreSpatialSplit(
             SpyreTemporalSplit([left]), SpyreTemporalSplit([Empty(extra_space)])
         )
 
+    def _allocate(self, block: SpyreAllocation, is_last: bool):
+        print("In SpyreSpatialSplit.allocate")
+        return self.left.allocate(block, False) or self.right.allocate(block, is_last)
+
     def finalize(self, pool, offset):
-        self.left = self.left.finalize(pool, offset)
-        self.right = self.right.finalize(
-            pool, offset + align(self.left.get_symbolic_size())
+        print("In SpyreSpatialSplit.finalize left", offset)
+        print(
+            "In SpyreSpatialSplit.finalize right", align(self.left.get_symbolic_size())
         )
+        left_size = self.left.get_symbolic_size()
+        self.left = self.left.finalize(pool, offset)
+        self.right = self.right.finalize(pool, offset + align(left_size))
         self.clear_cache()
         if self.right.is_empty():
             return self.left
@@ -143,14 +170,15 @@ class SpyreAllocFromPoolLine(AllocFromPoolLine):
 
 
 class SpyreAllocationPools(AllocationPools):
-    """Spyre-specific allocation pools that assign inputs to distinct segments."""
+    """Spyre-specific allocation pools that assign inputs/outputs to distinct segments."""
 
     _graph_inputs = list(V.graph.graph_inputs.values())
     _num_graph_inputs = len(list(V.graph.graph_inputs.values()))
     _graph_outputs = V.graph.graph_outputs
+    _graph_input_names = list(V.graph.graph_input_names)
+    _graph_output_names = list(V.graph.get_output_names())
 
-    def allocate(self, block: Allocation):
-        """Allocate into the single intermediate pool, enforcing MAX_POOLS and SEGMENT_SIZE."""
+    def allocate(self, block: SpyreAllocation):
         pools = self.get_pools(block)
 
         if pools:
@@ -167,9 +195,9 @@ class SpyreAllocationPools(AllocationPools):
                     "segment size limit. Only one pool is supported."
                 )
         else:
-            # First allocation: create the single pool.
+            # First allocation: create the pool
             pools.append(
-                AllocationPool(
+                SpyreAllocationPool(
                     block.device,
                     SpyreTemporalSplit([block]),
                     can_expand=True,
@@ -179,13 +207,16 @@ class SpyreAllocationPools(AllocationPools):
             return
 
     def finalize(self):
-        """Assign inputs/outputs to segments 0..n-1, then finalize pools."""
-        for i, inp in enumerate(self._graph_inputs):
-            inp.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[i]
-        for i, inp in enumerate(self._graph_outputs):
-            inp.get_layout().allocation["hbm"] = SEGMENT_OFFSETS[
-                i + self._num_graph_inputs
-            ]
+        mutation_real_name = V.graph.scheduler.mutation_real_name
+        num_inputs = len(self._graph_input_names)
+        for i, name in enumerate(self._graph_input_names):
+            V.graph.get_buffer(name).get_layout().allocation["hbm"] = SEGMENT_OFFSETS[i]
+        for i, name in enumerate(self._graph_output_names):
+            real_name = mutation_real_name.get(name, name)
+            V.graph.get_buffer(real_name).get_layout().allocation["hbm"] = (
+                SEGMENT_OFFSETS[i + num_inputs]
+            )
+
         super().finalize()
 
 
@@ -195,13 +226,13 @@ class SpyreAllocationPool(AllocationPool):
             if isinstance(block, SpyreAllocation):
                 self.update_restrict_live_range(block)
 
-    def allocate_at_end(self, block: Allocation) -> bool:
+    def allocate_at_end(self, block: SpyreAllocation) -> bool:
         """Override to use SpyreSpatialSplit instead of SpatialSplit."""
+        print("allocate at end")
         block.mark_allocated()
         self.root = SpyreTemporalSplit(
             [SpyreSpatialSplit(self.root, SpyreTemporalSplit([block]))]
         )
-        self.update_restrict_live_range(block)
         return True
 
     def allocate(self, block: SpyreAllocation, is_last: bool):
@@ -211,14 +242,14 @@ class SpyreAllocationPool(AllocationPool):
         ):
             return False
 
-        block_earliest_available = block.get_earliest_available()
-        pool_begin = self.root.get_live_ranges().begin
-        if block_earliest_available and block_earliest_available > pool_begin:
-            return False
+        # block_earliest_available = block.get_earliest_available()
+        # pool_begin = self.root.get_live_ranges().begin
+        # if block_earliest_available and block_earliest_available > pool_begin:
+        #     return False
 
         is_last = self.can_expand and is_last
         if self.root.allocate(block, is_last):
-            self.update_restrict_live_range(block)
+            # self.update_restrict_live_range(block)
             return True
 
         if is_last:
@@ -247,20 +278,15 @@ class SpyreMemoryPlanner(MemoryPlanner):
         super().__init__(wrapper, pools=SpyreAllocationPools())
 
     def plan(self, lines):
-        """Call all the memory planning passes in sequence, then clean up optimized buffers."""
+        """Call all the memory planning passes, then clean up intermediate buffers."""
         lines = super().plan(lines)
-        # Determine and populate optimized-away buffers
-        self.determine_optimized_buffers(lines)
-        # Remove lines referencing optimized-away buffers
-        self.remove_optimized_buffers(lines)
+        # Determine and populate intermediate buffers
+        self.determine_intermediate_buffers(lines)
+        # Remove lines referencing intermediate buffers
+        self.remove_intermediate_buffers(lines)
         return lines
 
-    def determine_optimized_buffers(self, lines):
-        """Determine which pool-allocated buffers will be optimized away (no code generation).
-
-        A buffer is optimized away if it's converted to SpyreAllocFromPoolLine but
-        its allocation.codegen_alloc_from_pool() returns empty string.
-        """
+    def determine_intermediate_buffers(self, lines):
         for line in lines:
             if isinstance(line, SpyreAllocFromPoolLine):
                 allocation = line.group.allocation
@@ -268,16 +294,15 @@ class SpyreMemoryPlanner(MemoryPlanner):
                     for buf_name in line.group.names:
                         self.wrapper.intermediate_buffers.add(buf_name)
 
-    def remove_optimized_buffers(self, lines):
-        """Remove or neutralize lines that reference optimized-away buffers."""
-        optimized_away = self.wrapper.intermediate_buffers
-        if not optimized_away:
+    def remove_intermediate_buffers(self, lines):
+        intermediates = self.wrapper.intermediate_buffers
+        if not intermediates:
             return
 
         filtered_lines = []
         for line in lines:
-            # Skip lines that only operate on optimized-away buffers
-            if hasattr(line, "node") and line.node.get_name() in optimized_away:
+            # Skip lines that only operate on intermediate buffers
+            if hasattr(line, "node") and line.node.get_name() in intermediates:
                 # Replace with NullLine to remove it from output
                 filtered_lines.append(NullLine(self.wrapper))
             else:

@@ -421,6 +421,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
+            # Use the real destination's layout so the TensorArg holds the same
+            # allocation dict that memory planning writes HBM addresses into.
+            real_buf = V.graph.get_buffer(real_dst_name)
+            real_layout = real_buf.get_layout()
+            if isinstance(real_layout, FixedTiledLayout):
+                layout = real_layout
+            dst = TensorAccess(name, index, layout)
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
