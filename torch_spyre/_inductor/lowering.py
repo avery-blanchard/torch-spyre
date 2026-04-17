@@ -25,7 +25,7 @@ from typing import Any, Callable, Union
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
-from .ir import SpyreReduction
+from .ir import Scatter, SpyreReduction
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 import threading
@@ -507,22 +507,21 @@ def clone(x, *, memory_format=None):
 def lower_overwrite(input, output, dims, offsets):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
 
-    strides = [int(output.get_layout().stride[d]) for d in dims]
-    gaps = [int(output.get_layout().size[d] - input.get_layout().size[d]) for d in dims]
-
     def inner_fn(index):
-        return fn(
-            input.make_loader()(index),
-            strides,
-            offsets,
-            gaps,
-        )
+        return fn(input.make_loader()(index))
 
-    inp = Pointwise(
+    def output_indexer(index):
+        out_index = [*index]
+        for dim, offset in zip(dims, offsets):
+            out_index[dim] += offset
+        return out_index
+
+    inp = Scatter(
         device=input.get_device(),
         dtype=input.get_dtype(),
         inner_fn=inner_fn,
         ranges=input.get_size(),
+        output_indexer=output_indexer,
     )
 
     output.realize()
