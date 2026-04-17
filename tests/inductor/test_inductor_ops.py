@@ -1620,6 +1620,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # ),
             }
         },
+<<<<<<< HEAD
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
                 "split3": lambda dim, index, x: (
@@ -1645,6 +1646,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s0": (2, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
                 "3d2s1": (2, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
                 "3d2s2": (2, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+            },
+        ("test_rope", "test_rope_cpu"): {
+            "param_sets": {
+                "fp16": (
+                    cached_randn((2, 256, 4096), dtype=torch.float16),
+                    cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
             },
         },
     }
@@ -2217,11 +2225,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
 
+<<<<<<< HEAD
     def test_split_cpu(self, op, dim, index, x):
         def fn(x):
             return op(dim, index, x)
 
         compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
+=======
+    def test_rope_cpu(self, q, freqs):
+        def fn(q, freqs):
+            q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
+            mul_out = freqs[:, :, None, :, :, :] * q_.unsqueeze(-3)
+            sum_out = mul_out.sum(4, keepdim=True)
+            q_out = sum_out.flatten(3)
+            return q_out
+
+        compare_with_cpu(fn, q, freqs, cpu_compile=False)
+>>>>>>> 2c9974c (Add special case dim order for broadcast dim)
 
 
 if __name__ == "__main__":
