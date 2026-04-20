@@ -48,6 +48,7 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
+    dim_order: list[Symbol]
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -57,7 +58,8 @@ class SDSCArgs:
         allocation = ", ".join(f"{k}={v}" for k, v in self.allocation.items())
         return (
             f"SDSCArgs(\n"
-            f"  layout={self.layout},\n"
+            f"  layout{self.layout},\n"
+            f"  dim_order={self.dim_order}, "
             f"  data_format={self.data_format.name},\n"
             f"  scales=[{scales}],\n"
             f"  strides=[{strides}],\n"
@@ -195,7 +197,7 @@ def _get_layout_label(
     for label, layout in layouts.items():
         if (
             layout["stick_dim_order"] == stick_dim_order
-            and layout["dim_order"] == dim_order
+            and set(layout["dim_order"]) == set(dim_order)
             and layout["stick_size"] == stick_size
         ):
             return label
@@ -339,6 +341,7 @@ def _create_sdsc_tensors(
                 allocation=arg.allocation,
                 start_address=addr,
                 backGap=backGap if not arg.is_input else {},
+                dim_order=dim_order,
             )
         )
 
