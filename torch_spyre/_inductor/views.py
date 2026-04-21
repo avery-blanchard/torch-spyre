@@ -174,9 +174,7 @@ def normalize_coordinates(
         vars = expr.free_symbols
         offset = expr.xreplace({var: sympy.S.Zero for var in vars})
         if len(vars) == 0:
-            # TODO: Support size-1 dimensions with non-zero offset
-            assert offset == 0
-            terms.append(Term(None, None, None, None, dim_size))
+            terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         dim_terms = []  # terms for current dimension
         for var in vars:
@@ -341,7 +339,7 @@ def align_tensors(
             if var is None:
                 # dimension is not iterated over, keep as is
                 size.append(dim_size)
-                coordinates.append(sympy.S.Zero)
+                coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
             low = (

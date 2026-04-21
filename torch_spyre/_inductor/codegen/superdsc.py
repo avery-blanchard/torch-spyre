@@ -321,26 +321,16 @@ def _create_sdsc_tensors(
             )
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
-            for key in list(overwrite_infos.keys()):
-                info = overwrite_infos[key]
-                if info["device_stride"] == dim_device_stride and not arg.is_input:
-                    backGap[dim] = info["gap"]
-                    offsets[dim] = info["device_offset"] * info["device_stride"]
-                    overwrite_infos.pop(key)
-                    use_adjusted_size = False
-                    break
 
-            dev_dim_size = arg.device_size[-dim_idx - 2]
+            dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
             if dim == stick_dim:
                 stick_size = arg.device_dtype.elems_per_stick()
                 dev_dim_size *= stick_size
                 it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
-            if dev_dim_size > it_dim_size and "overwrite_infos" not in op_spec.op_info:
-                # TODO: overwrite and view offsets cannot be used together until the
-                # overwrite operator is refactored to use coordinate expression offsets
-                dim_coord = arg.device_coordinates[-dim_idx - 2]
+            if dev_dim_size > it_dim_size:
+                dim_coord = arg.device_coordinates[-stride_idx - 2]
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
