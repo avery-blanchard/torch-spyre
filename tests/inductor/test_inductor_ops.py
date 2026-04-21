@@ -2225,13 +2225,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
 
-<<<<<<< HEAD
     def test_split_cpu(self, op, dim, index, x):
         def fn(x):
             return op(dim, index, x)
 
-        compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
-=======
+        compare_with_cpu(fn, x, run_eager=False)
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
             q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
@@ -2241,8 +2239,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return q_out
 
         compare_with_cpu(fn, q, freqs, cpu_compile=False)
->>>>>>> 2c9974c (Add special case dim order for broadcast dim)
-
 
 if __name__ == "__main__":
     unittest.main()
