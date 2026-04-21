@@ -294,9 +294,10 @@ def _create_sdsc_tensors(
                 and op_dim_order
                 and op_dim_order[0] in reduced_dims
             ):
-                dim_order = [reduced_dims[0]] + dim_order + reduced_dims[1:]
+                dim_order =  op_dim_order
             else:
-                dim_order = dim_order + reduced_dims
+                dim_order =  dim_order + reduced_dims
+
 
         if op_stick_dim is None:
             # No stick dim found in op - add one
