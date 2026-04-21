@@ -209,14 +209,19 @@ def _ones_scalar_fake(
 
 # Copy input into output starting at offsets along dimensions dims and
 # return the updated output.
-@torch.library.custom_op("spyre::overwrite", mutates_args=(), device_types="spyre")
+@torch.library.custom_op("spyre::overwrite", mutates_args=())
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
     dims: Sequence[int],
     offsets: Sequence[int],
 ) -> torch.Tensor:
-    pass
+    out = output.clone()                                                                                                                                                                         
+    slices = [slice(None)] * input.dim()                                                                                                                                                         
+    for dim, offset in zip(dims, offsets):                                                                                                                                                       
+        slices[dim] = slice(offset, offset + input.size(dim))                                                                                                                                    
+    out[tuple(slices)] = input                                                                                                                                                                   
+    return out 
 
 
 @overwrite.register_fake
@@ -227,7 +232,6 @@ def _(
     offsets: Sequence[int],
 ) -> torch.Tensor:
     return output
-
 
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
 def restickify(  # type: ignore[empty-body]
