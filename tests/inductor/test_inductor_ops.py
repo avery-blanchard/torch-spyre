@@ -1656,8 +1656,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d1s0": (1, 0, cached_randn((5, 3, 192), dtype=torch.float16)),
                 "3d1s1": (1, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
                 "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
-	    },
-	},
+            },
+        },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
                 "fp16": (
