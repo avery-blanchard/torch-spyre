@@ -289,14 +289,7 @@ def _create_sdsc_tensors(
         use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims:
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
-            if (
-                not op_spec.is_reduction
-                and op_dim_order
-                and op_dim_order[0] in reduced_dims
-            ):
-                dim_order = [reduced_dims[0]] + dim_order + reduced_dims[1:]
-            else:
-                dim_order = dim_order + reduced_dims
+            dim_order = dim_order + reduced_dims
 
         if op_stick_dim is None:
             # No stick dim found in op - add one
