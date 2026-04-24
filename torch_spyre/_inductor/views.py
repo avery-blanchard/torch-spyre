@@ -273,7 +273,8 @@ def normalize_coordinates(
                 assert False, f"Unsupported coordinate expression {expr}"
 
         # sort dim_terms in increasing num order
-        dim_terms.sort()
+        # term.num may be a sympy.Expr; plain sort() raises — use _concretize_for_cmp
+        dim_terms.sort(key=lambda t: _concretize_for_cmp(t.num))
 
         for dim_term in dim_terms[::-1]:
             dim_term.offset = offset // dim_term.num
@@ -361,33 +362,30 @@ def align_tensors(
 
     n = 0  # next symbol number
 
-    # TODO: Current support of size-1 dimensions are limited. We will generalize this
-    # in follow-up PRs. See #1548
-    is_pointwise_op = len(set([len(tensor["size"]) for tensor in tensors])) == 1
-    if is_pointwise_op:
-        rank = len(tensors[0]["size"])
-        vars = var_ranges.keys()
-        for i in range(rank):
-            coords = [tensor["coordinates"][i] for tensor in tensors]
-            if all(c == 0 for c in coords):
-                continue
-            if not any(c == 0 for c in coords):
-                continue
-            if not any(c.is_number and c > 0 for c in coords):
-                continue
+    min_rank = min(len(tensor["size"]) for tensor in tensors) if tensors else 0
+    for i in range(min_rank):
+        coords = [tensor["coordinates"][i] for tensor in tensors]
 
-            new_var = sympy.symbols(f"z{n}")
-            n += 1
-            var_ranges[new_var] = 1
-            splits[new_var] = set()
+        all_vars: set[sympy.Symbol] = set()
+        for c in coords:
+            all_vars.update(c.free_symbols)
+        zero_map = {v: sympy.S.Zero for v in all_vars}
+        offsets = [c.xreplace(zero_map) for c in coords]
+        has_offset_variance = not all(offset == offsets[0] for offset in offsets)
+        if not has_offset_variance:
+            continue
 
-            for tensor in tensors:
-                coord = tensor["coordinates"][i]
-                if coord == 0:
-                    tensor["coordinates"][i] = new_var
-                else:
-                    tensor["coordinates"][i] = new_var + coord
+        new_var = sympy.symbols(f"z{n}")
+        n += 1
+        var_ranges[new_var] = sympy.S.One
+        splits[new_var] = set()
 
+        for tensor in tensors:
+            coord = tensor["coordinates"][i]
+            if coord == 0:
+                tensor["coordinates"][i] = new_var
+            else:
+                tensor["coordinates"][i] = new_var + coord
     for tensor in tensors:
         terms = normalize_coordinates(var_ranges, tensor["size"], tensor["coordinates"])
         stick_dim.append(terms[-1].var)
@@ -445,7 +443,7 @@ def align_tensors(
             if var is None:
                 # dimension is not iterated over, keep as is
                 size.append(dim_size)
-                coordinates.append(sympy.S.Zero)
+                coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
             low = (
