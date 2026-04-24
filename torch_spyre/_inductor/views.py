@@ -271,10 +271,15 @@ def normalize_coordinates(
                 )
             else:
                 assert False, f"Unsupported coordinate expression {expr}"
-
-        # sort dim_terms in increasing num order
-        # term.num may be a sympy.Expr; plain sort() raises — use _concretize_for_cmp
-        dim_terms.sort(key=lambda t: _concretize_for_cmp(t.num))
+        # sort dim_terms in increasing (num, mod) order so that z + offset
+        # vars (num=1, mod=1) always sort before real iteration vars (num=1, mod=N)
+        # when num is equal
+        dim_terms.sort(
+            key=lambda t: (
+                _concretize_for_cmp(t.num),
+                _concretize_for_cmp(t.mod),
+            )
+        )
 
         for dim_term in dim_terms[::-1]:
             dim_term.offset = offset // dim_term.num
