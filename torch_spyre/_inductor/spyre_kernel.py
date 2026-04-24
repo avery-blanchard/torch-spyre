@@ -667,6 +667,7 @@ def simplify_op_spec(op_spec):
             }
             for arg in op_spec.args
         ],
+        op=op_spec.op,
     )
     op_spec.iteration_space = new_op_space_splits
     for arg, t in zip(op_spec.args, new_tensors):

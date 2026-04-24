@@ -273,7 +273,19 @@ def normalize_coordinates(
                 assert False, f"Unsupported coordinate expression {expr}"
 
         # sort dim_terms in increasing num order
-        dim_terms.sort()
+        # Use a key function that safely extracts numeric values, handling symbolic expressions
+        def term_sort_key(term):
+            num_val = term.num
+            # Convert to float for comparison; use a large value for symbolic expressions
+            # to push them to the end of the sort order
+            if num_val is None:
+                return (float('inf'),)
+            try:
+                return (float(num_val),)
+            except (TypeError, ValueError):
+                # Symbolic expression - convert to string for stable ordering
+                return (float('inf'), str(num_val))
+        dim_terms.sort(key=term_sort_key)
 
         for dim_term in dim_terms[::-1]:
             dim_term.offset = offset // dim_term.num
@@ -330,6 +342,7 @@ def normalize_coordinates(
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
+    op: str = None,
 ) -> tuple[
     (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
 ]:
@@ -361,33 +374,34 @@ def align_tensors(
 
     n = 0  # next symbol number
 
-    # TODO: Current support of size-1 dimensions are limited. We will generalize this
-    # in follow-up PRs. See #1548
-    is_pointwise_op = len(set([len(tensor["size"]) for tensor in tensors])) == 1
-    if is_pointwise_op:
-        rank = len(tensors[0]["size"])
-        vars = var_ranges.keys()
-        for i in range(rank):
-            coords = [tensor["coordinates"][i] for tensor in tensors]
-            if all(c == 0 for c in coords):
-                continue
-            if not any(c == 0 for c in coords):
-                continue
-            if not any(c.is_number and c > 0 for c in coords):
-                continue
+    min_rank = min(len(tensor["size"]) for tensor in tensors) if tensors else 0
+    for i in range(min_rank):
+        coords = [tensor["coordinates"][i] for tensor in tensors]
 
-            new_var = sympy.symbols(f"z{n}")
-            n += 1
-            var_ranges[new_var] = 1
-            splits[new_var] = set()
+        all_constant = all(not c.free_symbols for c in coords)
+        has_constant_variance = all_constant and not all(c == coords[0] for c in coords)
+                                                                                                                   
+        all_vars = set()                                                                                                                                                           
+        for c in coords:                                                                                                                                                           
+            all_vars.update(c.free_symbols)                                                                                                                                        
+            offsets = [                                                                                                                                                                
+                c.xreplace({v: sympy.S.Zero for v in all_vars}) for c in coords                                                                                                        
+            ]                                                                                                                                                                          
+        has_offset_variance = not all(offset == offsets[0] for offset in offsets) 
+        if not has_offset_variance:
+            continue
 
-            for tensor in tensors:
-                coord = tensor["coordinates"][i]
-                if coord == 0:
-                    tensor["coordinates"][i] = new_var
-                else:
-                    tensor["coordinates"][i] = new_var + coord
+        new_var = sympy.symbols(f"z{n}")
+        n += 1
+        var_ranges[new_var] = sympy.S.One
+        splits[new_var] = set()
 
+        for tensor in tensors:
+            coord = tensor["coordinates"][i]
+            if coord == 0:
+                tensor["coordinates"][i] = new_var
+            else:
+                tensor["coordinates"][i] = new_var + coord
     for tensor in tensors:
         terms = normalize_coordinates(var_ranges, tensor["size"], tensor["coordinates"])
         stick_dim.append(terms[-1].var)
@@ -445,7 +459,7 @@ def align_tensors(
             if var is None:
                 # dimension is not iterated over, keep as is
                 size.append(dim_size)
-                coordinates.append(sympy.S.Zero)
+                coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
             low = (
