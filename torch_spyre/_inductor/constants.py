@@ -26,12 +26,9 @@ SEGMENT_OFFSETS = [
     0xC00000000,
     0x1000000000,
     0x1400000000,
-    0x1800000000,
 ]
 
-# Segment reserved for pooled intermediate (HBM) tensor allocations.
-# Intermediates whose live ranges do not overlap share this region.
-HBM_INTERMEDIATES_POOL_BASE = SEGMENT_OFFSETS[1]
+INTERMEDIATES_SEGMENT = 0x1800000000
 
 # Each HBM segment is 16 GB (0x400000000 bytes).
 HBM_SEGMENT_SIZE = 0x400000000

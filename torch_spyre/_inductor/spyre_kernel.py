@@ -34,6 +34,7 @@ from .constants import (
     BATCH_MATMUL_OP,
     IDENTITY_OP,
     RESTICKIFY_OP,
+    SEGMENT_OFFSETS,
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
@@ -588,6 +589,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
+            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[tensor_arg.arg_index]
 
         buf = IndentedBuffer()
         buf.writeline("[")

@@ -17,7 +17,7 @@ import math
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.virtualized import V
 
-from .constants import HBM_INTERMEDIATES_POOL_BASE, HBM_SEGMENT_SIZE
+from .constants import HBM_SEGMENT_SIZE
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 
@@ -45,7 +45,7 @@ class SpyreHBMAllocator:
         self._peak_usage: int = 0  # peak concurrent usage
 
     def allocate(self, size: int) -> int:
-        """Return a byte offset from HBM_INTERMEDIATES_POOL_BASE for a block of
+        """Return a byte offset from INTERMEDIATES_SEGMENT for a block of
         `size` bytes. Reuses an existing free block when possible."""
         for i, (blk_offset, blk_size) in enumerate(self._free):
             if blk_size >= size:
@@ -186,19 +186,22 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
 
         size = _compute_size_bytes(name)
         offset = allocator.allocate(size)
-        address = HBM_INTERMEDIATES_POOL_BASE + offset
 
-        layout = V.graph.get_buffer(name).get_layout()
-        layout.allocation["hbm"] = address
+        # Assign HBM address directly to layout.allocation.
+        buf = V.graph.get_buffer(name)
+        layout = buf.get_layout()
+        assert isinstance(layout, FixedTiledLayout)
+        layout.allocation["hbm"] = offset
+
         pending_frees.append((end, offset, size))
 
         logger.debug(
-            "hbm_planning: %s  live=[%d,%d]  size=%d  addr=0x%x",
+            "hbm_planning: %s  live=[%d,%d]  size=%d  offset=%d",
             name,
             start,
             end,
             size,
-            address,
+            offset,
         )
 
     peak = allocator.get_peak_usage()

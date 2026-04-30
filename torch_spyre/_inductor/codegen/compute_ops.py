@@ -285,10 +285,12 @@ def generate_sdsc(idx, sdsc_spec):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
+                                "name_": f"allocate-Tensor{i}_{'lx' if 'lx' in tensor.allocation else 'hbm'}",
                                 "prev_": "",
                                 "ldsIdx_": i,
-                                "component_": "hbm" if not tensor.allocation else "lx",
+                                "component_": "lx"
+                                if "lx" in tensor.allocation
+                                else "hbm",
                                 "layoutDimOrder_": [
                                     str(dim)
                                     for dim in sdsc_spec.layouts[tensor.layout][
