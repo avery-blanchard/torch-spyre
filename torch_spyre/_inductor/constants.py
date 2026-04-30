@@ -33,6 +33,9 @@ SEGMENT_OFFSETS = [
 # Intermediates whose live ranges do not overlap share this region.
 HBM_INTERMEDIATES_POOL_BASE = SEGMENT_OFFSETS[1]
 
+# Each HBM segment is 16 GB (0x400000000 bytes).
+HBM_SEGMENT_SIZE = 0x400000000
+
 SPYRE_FP32_OPS = [
     "add",
     "sub",

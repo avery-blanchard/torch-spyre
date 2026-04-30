@@ -17,6 +17,7 @@ from torch._inductor.scheduler import (
     FusedSchedulerNode,
     SchedulerNode,
 )
+from torch._inductor.virtualized import V
 
 from torch_spyre._inductor.logging_utils import _get_env_bool
 
@@ -35,13 +36,22 @@ def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
     return None
 
 
+def _count_non_intermediate_tensors(tensor_names: set[str]) -> int:
+    """Count how many tensors are NOT intermediates (i.e., are graph I/O)."""
+    graph_inputs = set(V.graph.graph_inputs.keys())
+    graph_outputs = set(V.graph.get_output_names())
+    graph_io = graph_inputs | graph_outputs
+    return len(tensor_names & graph_io)
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
     Each kernel will be compiled into a single SuperDSC Bundle.
     Fusion is limited by the following constraints.
      1. We only want to fuse SchedulerNodes (ie, nodes that generate OpSpecs).
-     2. A SDSC Bundle can refer to at most 6 unique tensors (until we complete https://github.com/torch-spyre/torch-spyre/issues/827).
+     2. A SDSC Bundle can refer to at most 6 unique non-intermediate tensors
+        (graph inputs/outputs). Intermediates don't count toward this limit.
     """
     if not _FUSION_ENABLED or len(nodes) == 0:
         return nodes
@@ -54,12 +64,13 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if isinstance(n, SchedulerNode):
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
             candidate = cur_tensors | n_tensors
-            if len(candidate) <= _MAX_BUNDLE_TENSORS:
+            non_intermediate_count = _count_non_intermediate_tensors(candidate)
+            if non_intermediate_count <= _MAX_BUNDLE_TENSORS:
                 # Ok to put in the current bundle
                 cur_nodes.append(n)
                 cur_tensors = candidate
             else:
-                # Would be too many tensors in the Bundle; start a new one.
+                # Would be too many non-intermediate tensors; start a new bundle.
                 if fused := _make_fused(cur_nodes):
                     fused_nodes.append(fused)
                 cur_nodes = [n]

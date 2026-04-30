@@ -17,7 +17,7 @@ import math
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.virtualized import V
 
-from .constants import HBM_INTERMEDIATES_POOL_BASE
+from .constants import HBM_INTERMEDIATES_POOL_BASE, HBM_SEGMENT_SIZE
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 
@@ -33,11 +33,16 @@ class SpyreHBMAllocator:
     Tracks a set of free blocks within a single contiguous HBM region. Buffers
     whose live ranges do not overlap share the same region. Each block is a
     (offset, size) pair measured in bytes from HBM_INTERMEDIATES_POOL_BASE.
+
+    Ensures peak concurrent memory usage does not exceed the segment size limit.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, segment_size: int) -> None:
         self._free: list[tuple[int, int]] = []  # (offset, size) free blocks
         self._pool_end: int = 0  # current end of the pool
+        self._segment_size: int = segment_size
+        self._currently_allocated: int = 0  # bytes in-use right now
+        self._peak_usage: int = 0  # peak concurrent usage
 
     def allocate(self, size: int) -> int:
         """Return a byte offset from HBM_INTERMEDIATES_POOL_BASE for a block of
@@ -49,15 +54,34 @@ class SpyreHBMAllocator:
                 remainder = blk_size - size
                 if remainder > 0:
                     self._free.append((blk_offset + size, remainder))
-                return blk_offset
-        # No suitable free block — extend the pool.
-        offset = self._pool_end
-        self._pool_end += size
+                offset = blk_offset
+                break
+        else:
+            # No suitable free block — extend the pool.
+            offset = self._pool_end
+            self._pool_end += size
+
+        self._currently_allocated += size
+        if self._currently_allocated > self._peak_usage:
+            self._peak_usage = self._currently_allocated
+
+        if self._peak_usage > self._segment_size:
+            raise RuntimeError(
+                f"HBM intermediate pool peak usage ({self._peak_usage} bytes, "
+                f"{self._peak_usage / (1024**3):.2f} GB) exceeds segment size "
+                f"({self._segment_size} bytes, {self._segment_size / (1024**3):.2f} GB)"
+            )
+
         return offset
 
     def free(self, offset: int, size: int) -> None:
         """Return a previously allocated block to the free list."""
         self._free.append((offset, size))
+        self._currently_allocated -= size
+
+    def get_peak_usage(self) -> int:
+        """Return the peak concurrent memory usage in bytes."""
+        return self._peak_usage
 
 
 def _align_up(n: int, alignment: int) -> int:
@@ -83,28 +107,28 @@ def _compute_live_ranges(
     nodes: list[BaseSchedulerNode],
     intermediates: set[str],
 ) -> dict[str, tuple[int, int]]:
-    """Return {buf_name: (birth_step, death_step)} for each intermediate.
+    """Return {buf_name: (start_step, end_step)} for each intermediate.
 
-    birth_step: timestep of the node that writes the buffer.
-    death_step: last timestep at which any node reads the buffer.
+    start_step: timestep of the node that writes the buffer.
+    end_step: last timestep at which any node reads the buffer.
     Both are indices into `nodes`.
     """
-    birth: dict[str, int] = {}
-    death: dict[str, int] = {}
+    start: dict[str, int] = {}
+    end: dict[str, int] = {}
 
     for idx, node in enumerate(nodes):
         rw = node.read_writes
         for dep in rw.writes:
             if dep.name in intermediates:
-                birth[dep.name] = idx
+                start[dep.name] = idx
         for dep in rw.reads:
             if dep.name in intermediates:
-                death[dep.name] = idx
+                end[dep.name] = idx
 
     live_ranges: dict[str, tuple[int, int]] = {}
     for name in intermediates:
-        if name in birth:
-            live_ranges[name] = (birth[name], death.get(name, birth[name]))
+        if name in start:
+            live_ranges[name] = (start[name], end.get(name, start[name]))
     return live_ranges
 
 
@@ -142,19 +166,19 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
 
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
-    # Sort by birth step so the allocator processes tensors in execution order.
+    # Sort by start step so the allocator processes tensors in execution order.
     sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
 
-    allocator = SpyreHBMAllocator()
-    # Track (death_step, offset, size) so we can free blocks promptly.
+    allocator = SpyreHBMAllocator(HBM_SEGMENT_SIZE)
+    # Track (end_step, offset, size) so we can free blocks promptly.
     pending_frees: list[tuple[int, int, int]] = []
 
-    for name, (birth, death) in sorted_bufs:
-        # Free any blocks whose live range ended before this birth step.
+    for name, (start, end) in sorted_bufs:
+        # Free any blocks whose live range ended before this start step.
         still_live = []
         for entry in pending_frees:
-            d, off, sz = entry
-            if d < birth:
+            e, off, sz = entry
+            if e < start:
                 allocator.free(off, sz)
             else:
                 still_live.append(entry)
@@ -166,15 +190,23 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
 
         layout = V.graph.get_buffer(name).get_layout()
         layout.allocation["hbm"] = address
-        pending_frees.append((death, offset, size))
+        pending_frees.append((end, offset, size))
 
         logger.debug(
             "hbm_planning: %s  live=[%d,%d]  size=%d  addr=0x%x",
             name,
-            birth,
-            death,
+            start,
+            end,
             size,
             address,
         )
+
+    peak = allocator.get_peak_usage()
+    logger.info(
+        "hbm_planning: assigned %d intermediates, peak memory usage %.2f GB / %.2f GB",
+        len(sorted_bufs),
+        peak / (1024**3),
+        HBM_SEGMENT_SIZE / (1024**3),
+    )
 
     return nodes
