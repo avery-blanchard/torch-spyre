@@ -29,6 +29,10 @@ SEGMENT_OFFSETS = [
     0x1800000000,
 ]
 
+# Segment reserved for pooled intermediate (HBM) tensor allocations.
+# Intermediates whose live ranges do not overlap share this region.
+HBM_INTERMEDIATES_POOL_BASE = SEGMENT_OFFSETS[1]
+
 SPYRE_FP32_OPS = [
     "add",
     "sub",
