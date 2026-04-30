@@ -237,13 +237,13 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
     // Dimensions that do not appear in the tile map are ignored.
     if (tile_map[i].size() == 0) continue;
 
-    const int64_t host_stride = strides[i];
+    const int64_t host_stride = spyre_dma_strides[i];
     int64_t host_size = sizes[i];
 
     // Fold leading host dimensions that do not appear in the tile map.
     for (int j = i - 1; j > -1 && tile_map[j].size() == 0; j--) {
       // Expanded dimensions are ignored.
-      if (strides[j] == 0) continue;
+      if (spyre_dma_strides[j] == 0) continue;
 
       host_size *= sizes[j];
     }
@@ -320,7 +320,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
   DataConversionStrideInfo stride_info;
   stride_info.size_ = dcsi_sizes;
   stride_info.stride_src_ = host2device ? cpu_layout_strides : device_strides;
-  stride_info.stride_dst_ = host2device ? device_strides : host_strides;
+  stride_info.stride_dst_ = host2device ? device_strides : cpu_layout_strides;
   stride_info.offset_src_ = host2device ? storage_offset : 0;
   stride_info.offset_dst_ = host2device ? 0 : storage_offset;
 
