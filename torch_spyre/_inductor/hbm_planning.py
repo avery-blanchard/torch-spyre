@@ -14,14 +14,15 @@
 
 import math
 
-from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.scheduler import BaseSchedulerNode, ExternKernelSchedulerNode
+from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
-
-from .constants import HBM_SEGMENT_SIZE
+from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout
+
 from .logging_utils import get_inductor_logger
 
-logger = get_inductor_logger("HBM_PLANNING")
+logger = get_inductor_logger("MEMORY_PLANNING")
 
 # HBM sticks are 128 bytes; all allocations are stick-aligned.
 _STICK_BYTES = 128
@@ -93,7 +94,7 @@ def _compute_size_bytes(name: str) -> int:
     buf = V.graph.get_buffer(name)
     layout = buf.get_layout()
     assert isinstance(layout, FixedTiledLayout), (
-        f"hbm_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
+        f"memory_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
     dev_layout = layout.device_layout
     # device_size[-1] is the stick dimension (always 1 in the size array);
@@ -142,22 +143,56 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
     """
     graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
     graph_outputs: set[str] = set(V.graph.get_output_names())
+    kernel_arg_names: set[str] = set()
+    written: set[str] = set()
+    read: set[str] = set()
 
     # Collect intermediate buffer names from all node write sets.
+    for node in nodes:
+        for dep in node.read_writes.writes:
+            buf = V.graph.get_buffer(dep.name)
+            if buf is not None and dep.name in graph_outputs:
+                kernel_arg_names.add(dep.name)
+                continue
+            if isinstance(node, FallbackKernel) or isinstance(
+                node, ExternKernelSchedulerNode
+            ):
+                kernel_arg_names.add(dep.name)
+                continue
+            written.add(dep.name)
+        for dep in node.read_writes.reads:
+            buf = V.graph.get_buffer(dep.name)
+            if buf is not None and dep.name in graph_inputs:
+                kernel_arg_names.add(dep.name)
+                continue
+            if isinstance(node, FallbackKernel) or isinstance(
+                node, ExternKernelSchedulerNode
+            ):
+                kernel_arg_names.add(dep.name)
+                continue
+            read.add(dep.name)
+
+    intermediates_written = written & read
     intermediates: set[str] = set()
     for node in nodes:
         for dep in node.read_writes.writes:
             name = dep.name
-            if name in graph_inputs or name in graph_outputs:
+            if (
+                name in graph_inputs
+                or name in graph_outputs
+                or name in kernel_arg_names
+            ):
+                continue
+            if name not in intermediates_written:
                 continue
             buf = V.graph.get_buffer(name)
-            if buf is None:
+            if buf is None or isinstance(buf, FallbackKernel):
                 continue
             layout = buf.get_layout()
             if not isinstance(layout, FixedTiledLayout):
                 continue
             if layout.allocation:
-                # Already assigned (e.g. LX scratchpad) — skip.
+                # Allocation assigned already (e.g. lx) — skip.
                 continue
             intermediates.add(name)
 
@@ -169,7 +204,7 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
     # Sort by start step so the allocator processes tensors in execution order.
     sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
 
-    allocator = SpyreHBMAllocator(HBM_SEGMENT_SIZE)
+    allocator = SpyreHBMAllocator(SEGMENT_SIZE)
     # Track (end_step, offset, size) so we can free blocks promptly.
     pending_frees: list[tuple[int, int, int]] = []
 
@@ -191,12 +226,12 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         assert isinstance(layout, FixedTiledLayout)
-        layout.allocation["hbm"] = offset
+        layout.allocation["hbm"] = INTERMEDIATES_SEGMENT + offset
 
         pending_frees.append((end, offset, size))
 
         logger.debug(
-            "hbm_planning: %s  live=[%d,%d]  size=%d  offset=%d",
+            "memory_planning: %s  live=[%d,%d]  size=%d  offset=%d",
             name,
             start,
             end,
@@ -206,10 +241,10 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
 
     peak = allocator.get_peak_usage()
     logger.info(
-        "hbm_planning: assigned %d intermediates, peak memory usage %.2f GB / %.2f GB",
+        "memory_planning: assigned %d intermediates, peak memory usage %.2f GB / %.2f GB",
         len(sorted_bufs),
         peak / (1024**3),
-        HBM_SEGMENT_SIZE / (1024**3),
+        SEGMENT_SIZE / (1024**3),
     )
 
     return nodes

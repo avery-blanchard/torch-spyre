@@ -589,7 +589,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
-            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[tensor_arg.arg_index]
+            if "hbm" not in tensor_arg.allocation:
+                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[tensor_arg.arg_index]
 
         buf = IndentedBuffer()
         buf.writeline("[")

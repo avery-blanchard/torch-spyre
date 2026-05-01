@@ -389,7 +389,7 @@ def generate_sdsc(idx, sdsc_spec):
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
                                 }
-                                if not tensor.allocation
+                                if "lx" not in tensor.allocation
                                 else {"lx": {"isPresent": 1}},
                             }
                             for i, tensor in enumerate(sdsc_spec.args)
