@@ -87,6 +87,9 @@ class Allocator:
         """Return the peak concurrent memory usage in bytes."""
         return self._peak_usage
 
+    def get_pool_end(self) -> int:
+        return self._pool_end
+
 
 def _align_up(n: int, alignment: int) -> int:
     return ((n + alignment - 1) // alignment) * alignment
@@ -247,14 +250,16 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         )
 
     peak = allocator.get_peak_usage()
+    pool_extent = allocator.get_pool_end()
     logger.info(
-        "memory_planning: assigned %d intermediates, peak memory usage %.2f GB / %.2f GB",
+        "memory_planning: assigned %d intermediates, peak concurrent usage %.2f GB, pool extent %.2f GB / %.2f GB",
         len(sorted_bufs),
         peak / (1024**3),
+        pool_extent / (1024**3),
         SEGMENT_SIZE / (1024**3),
     )
 
     # Store peak usage for wrapper code generation
-    V.graph.pool_size = peak
+    V.graph.pool_size = pool_extent
 
     return nodes
