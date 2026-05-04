@@ -19,7 +19,7 @@ from torch._inductor.scheduler import (
     ExternKernelSchedulerNode,
     StarDep,
 )
-from torch._inductor.ir import FallbackKernel, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout
@@ -32,12 +32,11 @@ logger = get_inductor_logger("MEMORY_PLANNING")
 _STICK_BYTES = 128
 
 
-class SpyreHBMAllocator:
-    """Greedy temporal-reuse allocator for the HBM intermediate tensor pool.
-
-    Tracks a set of free blocks within a single contiguous HBM region. Buffers
+class Allocator:
+    """
+    Tracks a set of free blocks within an hbm segment. Buffers
     whose live ranges do not overlap share the same region. Each block is a
-    (offset, size) pair measured in bytes from HBM_INTERMEDIATES_POOL_BASE.
+    (offset, size) pair measured in bytes.
 
     Ensures peak concurrent memory usage does not exceed the segment size limit.
     """
@@ -101,8 +100,6 @@ def _compute_size_bytes(name: str) -> int:
         f"memory_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
     dev_layout = layout.device_layout
-    # device_size[-1] is the stick dimension (always 1 in the size array);
-    # the product of all other dims is the number of sticks.
     num_sticks = math.prod(dev_layout.device_size[:-1])
     size_bytes = num_sticks * _STICK_BYTES
     return _align_up(size_bytes, _STICK_BYTES)
@@ -137,13 +134,11 @@ def _compute_live_ranges(
     return live_ranges
 
 
-def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-    """Assign pooled HBM addresses to intermediate tensors.
-
-    Runs on the pre-fusion list[BaseSchedulerNode]. Identifies intermediate
-    buffers (not graph inputs/outputs, not already LX-allocated), performs
-    live range analysis, and assigns layout.allocation["hbm"] = address so
-    that non-overlapping intermediates share HBM memory.
+def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    """Assign intermediate tensors addresses in the same segment.
+    Identifies intermediate buffers (not graph inputs/outputs, not already LX-allocated), performs
+    live range analysis, and assigns layout.allocation["pool"] = address so
+    that non-overlapping intermediates share a hbm segement.
     """
     graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
     graph_outputs: set[str] = set(V.graph.get_output_names())
@@ -151,22 +146,11 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
     written: set[str] = set()
     read: set[str] = set()
 
-    logger.debug(
-        f"hbm_planning: graph_inputs={graph_inputs}, graph_outputs={graph_outputs}"
-    )
-
     # Collect intermediate buffer names from all node write sets.
     for node in nodes:
         for dep in node.read_writes.writes:
             buf = V.graph.get_buffer(dep.name)
-
-            # Skip mutation buffers - they're marked for removal
-            if buf is not None and isinstance(
-                buf.get_layout(), MutationLayoutSHOULDREMOVE
-            ):
-                continue
-
-            if dep.name in graph_inputs or dep.name in graph_outputs:
+            if buf is not None and dep.name in graph_outputs:
                 kernel_arg_names.add(dep.name)
                 continue
             if isinstance(node, FallbackKernel) or isinstance(
@@ -174,42 +158,21 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
             ):
                 kernel_arg_names.add(dep.name)
                 continue
+            if isinstance(dep, StarDep):
+                kernel_arg_names.add(dep.name)
+                continue
             written.add(dep.name)
         for dep in node.read_writes.reads:
-            # Skip StarDep - these are outputs/final uses, not intermediate reads
-            # StarDep indicates a dependency on the entire buffer being returned as output
-            if isinstance(dep, StarDep):
-                # Check if StarDep is reading a graph output (directly or via mutation)
-                buf = V.graph.get_buffer(dep.name)
-                is_output = dep.name in graph_outputs
-
-                # If it's a mutation buffer, check if it's mutating a graph output
-                if buf is not None and isinstance(
-                    buf.get_layout(), MutationLayoutSHOULDREMOVE
-                ):
-                    backing_buf = buf.get_layout().get_buffer()
-                    backing_name = backing_buf.get_name()
-                    if backing_name in graph_outputs:
-                        is_output = True
-
-                if is_output:
-                    kernel_arg_names.add(dep.name)
-                continue
-
             buf = V.graph.get_buffer(dep.name)
-
-            # Skip mutation buffers - they're marked for removal
-            if buf is not None and isinstance(
-                buf.get_layout(), MutationLayoutSHOULDREMOVE
-            ):
-                continue
-
             if buf is not None and dep.name in graph_inputs:
                 kernel_arg_names.add(dep.name)
                 continue
             if isinstance(node, FallbackKernel) or isinstance(
                 node, ExternKernelSchedulerNode
             ):
+                kernel_arg_names.add(dep.name)
+                continue
+            if isinstance(dep, StarDep):
                 kernel_arg_names.add(dep.name)
                 continue
             read.add(dep.name)
@@ -231,37 +194,24 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
             if buf is None or isinstance(buf, FallbackKernel):
                 continue
             layout = buf.get_layout()
-
-            # Check if this is a mutation buffer mutating a graph input/output
-            if isinstance(layout, MutationLayoutSHOULDREMOVE):
-                backing_buf = layout.get_buffer()
-                backing_name = backing_buf.get_name()
-                # If the mutation target is a graph input or output, skip this mutation buffer
-                if backing_name in graph_inputs or backing_name in graph_outputs:
-                    continue
-                # Otherwise, mutation buffers aren't FixedTiledLayout, so they'll be skipped anyway
-                continue
-
             if not isinstance(layout, FixedTiledLayout):
-                # Skips other non-FixedTiledLayout types
                 continue
             if layout.allocation:
                 # Allocation assigned already (e.g. lx) — skip.
                 continue
             intermediates.add(name)
 
-    logger.debug(f"hbm_planning: intermediates set={intermediates}")
     if not intermediates:
-        # No HBM pool needed if no intermediates
-        V.graph.hbm_pool_size = 0
+        V.graph.pool_size = 0
         return nodes
-
+    logger.debug(f"hbm_planning: intermediates set={intermediates}")
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
     # Sort by start step so the allocator processes tensors in execution order.
     sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
 
-    allocator = SpyreHBMAllocator(SEGMENT_SIZE)
+    allocator = Allocator(SEGMENT_SIZE)
+
     # Track (end_step, offset, size) so we can free blocks promptly.
     pending_frees: list[tuple[int, int, int]] = []
 
@@ -283,16 +233,7 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         assert isinstance(layout, FixedTiledLayout)
-
-        # Safety check: ensure this is not a graph input or output
-        assert name not in graph_inputs, (
-            f"Attempted to allocate HBM for graph input {name}"
-        )
-        assert name not in graph_outputs, (
-            f"Attempted to allocate HBM for graph output {name}"
-        )
-
-        layout.allocation["hbm"] = INTERMEDIATES_SEGMENT + offset
+        layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
 
         pending_frees.append((end, offset, size))
 
@@ -314,6 +255,6 @@ def hbm_memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNod
     )
 
     # Store peak usage for wrapper code generation
-    V.graph.hbm_pool_size = peak
+    V.graph.pool_size = peak
 
     return nodes

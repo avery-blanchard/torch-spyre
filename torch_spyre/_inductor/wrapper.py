@@ -25,6 +25,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
 from .ir import FixedTiledLayout
+from .constants import SEGMENT_SIZE
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
@@ -70,6 +71,41 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.header.writeline("del async_compile")
         self.header.writeline("async_compile = SpyreAsyncCompile()")
 
+    def generate(self, is_inference):
+        """Override to add pool allocation into generated code."""
+        # Call parent's generate to set up most of the code
+        result_tuple = super().generate(is_inference)
+
+        # result_tuple is (wrapper_code, kernel_declarations)
+        wrapper_value_with_linemap, kernel_decls = result_tuple
+
+        # Now inject pool allocation after imports but before other code
+        pool_size = getattr(V.graph, "pool_size", 0)
+        if pool_size > 0:
+            pool_alloc_code = self.allocate_pool()
+            # Extract the actual string from ValueWithLineMap
+            wrapper_str = str(wrapper_value_with_linemap.value)
+
+            # Find where to insert the pool allocation - after args are unpacked
+            # Look for "args.clear()" and insert after it
+            import regex as re
+
+            # Match the args.clear() or args = [] line and insert after
+            pattern = r"(\s+)(args\.clear\(\)|args\s*=\s*\[\])"
+            replacement = r"\1\2\n\1" + pool_alloc_code
+            wrapper_str = re.sub(pattern, replacement, wrapper_str, count=1)
+
+            # Create a new ValueWithLineMap with the modified code
+            # Since we can't easily create a ValueWithLineMap, we'll just return it as-is
+            # The line mapping will be slightly off but the code will work
+            from torch._inductor.utils import ValueWithLineMap
+
+            wrapper_value_with_linemap = ValueWithLineMap(
+                value=wrapper_str, line_map=wrapper_value_with_linemap.line_map
+            )
+
+        return (wrapper_value_with_linemap, kernel_decls)
+
     def make_buffer_allocation(self, buffer: BufferLike):
         layout = buffer.get_layout()
         if not isinstance(layout, FixedTiledLayout):
@@ -111,6 +147,17 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         new_stl = new.get_layout().device_layout
         reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
+
+    def allocate_pool(self):
+        """Allocate the intermediate pool."""
+        pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
+        pool_size_sticks = (pool_size_bytes + 127) // 128
+        return (
+            f"_pool = spyre_empty_with_layout("
+            f"({pool_size_sticks},), (1,), "
+            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_sticks}, 1, 1], "
+            f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
+        )
 
 
 def noop_simplify_loops_impl(

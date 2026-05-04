@@ -18,8 +18,9 @@ from torch._inductor.scheduler import (
     SchedulerNode,
 )
 from torch._inductor.virtualized import V
-
+from torch._inductor.ir import FallbackKernel
 from torch_spyre._inductor.logging_utils import _get_env_bool
+from .ir import FixedTiledLayout
 
 # TODO: Temporary hook to easily disable
 _FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION", True)
@@ -37,11 +38,19 @@ def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
 
 
 def _count_non_intermediate_tensors(tensor_names: set[str]) -> int:
-    """Count how many tensors are NOT intermediates (i.e., are graph I/O)."""
-    graph_inputs = set(V.graph.graph_inputs.keys())
-    graph_outputs = set(V.graph.get_output_names())
-    graph_io = graph_inputs | graph_outputs
-    return len(tensor_names & graph_io)
+    """Count how many tensors are NOT intermediates or lx."""
+    count = 0
+    for name in tensor_names:
+        buf = V.graph.get_buffer(name)
+        if buf is None or isinstance(buf, FallbackKernel):
+            continue
+        layout = buf.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        if layout.allocation:
+            continue
+        count += 1
+    return count
 
 
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
