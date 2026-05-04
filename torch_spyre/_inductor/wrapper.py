@@ -94,6 +94,14 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             pattern = r"(\s+)(args\.clear\(\)|args\s*=\s*\[\])"
             replacement = r"\1\2\n\1" + pool_alloc_code
             wrapper_str = re.sub(pattern, replacement, wrapper_str, count=1)
+            lines = wrapper_str.split("\n")
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i].strip()
+                if line.startswith("return ("):
+                    indent = len(lines[i]) - len(lines[i].lstrip())
+                    lines.insert(i, " " * indent + "del _pool")
+                    break
+            wrapper_str = "\n".join(lines)
 
             # Create a new ValueWithLineMap with the modified code
             # Since we can't easily create a ValueWithLineMap, we'll just return it as-is
