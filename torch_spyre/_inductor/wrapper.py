@@ -73,27 +73,34 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.header.writeline("async_compile = SpyreAsyncCompile()")
 
     def generate(self, is_inference):
-        """Override to add pool allocation into generated code."""
+        """Override to add pool allocation/deallocation around kernel calls."""
         result_tuple = super().generate(is_inference)
         wrapper_value_with_linemap, kernel_decls = result_tuple
 
         pool_size = getattr(V.graph, "pool_size", 0)
         if pool_size > 0:
-            pool_alloc_code = self.allocate_pool()
             wrapper_str = str(wrapper_value_with_linemap.value)
 
-            # Inject _pool at module level, right after the SpyreAsyncCompile()
-            # line, so it is allocated once and reused across all calls.  The
-            # baked-in absolute HBM addresses in bundle.mlir are only correct
-            # when the pool tensor lives at a fixed address for the module's
-            # lifetime.
-            target = "async_compile = SpyreAsyncCompile()"
-            wrapper_str = wrapper_str.replace(
-                target,
-                target + "\n" + pool_alloc_code,
-                1,
-            )
+            # Inject pool allocation before kernel calls and cleanup before return.
+            lines = wrapper_str.split("\n")
 
+            # Add `del _pool` before `return (` statement.
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i].strip()
+                if line.startswith("return ("):
+                    indent = len(lines[i]) - len(lines[i].lstrip())
+                    lines.insert(i, " " * indent + "del _pool")
+                    break
+
+            # Add pool allocation before first kernel call (`.run(`).
+            pool_alloc_code = self.allocate_pool()
+            for i, line in enumerate(lines):
+                if ".run(" in line:
+                    indent = len(line) - len(line.lstrip())
+                    lines.insert(i, " " * indent + pool_alloc_code)
+                    break
+
+            wrapper_str = "\n".join(lines)
             wrapper_value_with_linemap = ValueWithLineMap(
                 value=wrapper_str, line_map=wrapper_value_with_linemap.line_map
             )
