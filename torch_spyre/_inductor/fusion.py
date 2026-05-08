@@ -21,12 +21,16 @@ from torch._inductor.virtualized import V
 from torch._inductor.ir import FallbackKernel
 from torch_spyre._inductor.logging_utils import _get_env_bool
 from .ir import FixedTiledLayout
+from .constants import SEGMENT_OFFSETS
 
 # TODO: Temporary hook to easily disable
 _FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION", True)
 
-# Until https://github.com/torch-spyre/torch-spyre/issues/827 is completed.
-_MAX_BUNDLE_TENSORS = 6
+
+def _max_bundle_tensors() -> int:
+    # Until https://github.com/torch-spyre/torch-spyre/issues/827 is completed.
+    has_pool = getattr(V.graph, "pool_size", 0) > 0
+    return len(SEGMENT_OFFSETS) - (2 if has_pool else 1)
 
 
 def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
@@ -59,7 +63,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     Each kernel will be compiled into a single SuperDSC Bundle.
     Fusion is limited by the following constraints.
      1. We only want to fuse SchedulerNodes (ie, nodes that generate OpSpecs).
-     2. A SDSC Bundle can refer to at most 6 unique non-intermediate tensors
+     2. A SDSC Bundle can refer to at most 5 unique non-intermediate tensors
         (graph inputs/outputs). Intermediates don't count toward this limit.
     """
     if not _FUSION_ENABLED or len(nodes) == 0:
@@ -74,7 +78,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
             candidate = cur_tensors | n_tensors
             non_intermediate_count = _count_non_intermediate_tensors(candidate)
-            if non_intermediate_count <= _MAX_BUNDLE_TENSORS:
+            if non_intermediate_count <= _max_bundle_tensors():
                 # Ok to put in the current bundle
                 cur_nodes.append(n)
                 cur_tensors = candidate

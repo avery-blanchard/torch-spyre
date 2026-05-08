@@ -17,19 +17,17 @@ import math
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     ExternKernelSchedulerNode,
-    StarDep,
+    NopKernelSchedulerNode,
 )
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout
-
-from .logging_utils import get_inductor_logger
+from .logging_utils import get_inductor_logger, _get_env_bool
 
 logger = get_inductor_logger("MEMORY_PLANNING")
-
-# HBM sticks are 128 bytes; all allocations are stick-aligned.
 _STICK_BYTES = 128
+_MEMORY_PLAN_ENABLED = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 
 
 class Allocator:
@@ -116,7 +114,6 @@ def _compute_live_ranges(
 
     start_step: timestep of the node that writes the buffer.
     end_step: last timestep at which any node reads the buffer.
-    Both are indices into `nodes`.
     """
     start: dict[str, int] = {}
     end: dict[str, int] = {}
@@ -133,7 +130,7 @@ def _compute_live_ranges(
     live_ranges: dict[str, tuple[int, int]] = {}
     for name in intermediates:
         if name in start:
-            live_ranges[name] = (start[name], end.get(name, start[name]))
+            live_ranges[name] = (start[name], end.get(name, len(nodes) + 1))
     return live_ranges
 
 
@@ -143,48 +140,77 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     live range analysis, and assigns layout.allocation["pool"] = address so
     that non-overlapping intermediates share a hbm segement.
     """
+
+    if not _MEMORY_PLAN_ENABLED:
+        V.graph.pool_size = 0
+        return nodes
+
     graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
     graph_outputs: set[str] = set(V.graph.get_output_names())
     kernel_arg_names: set[str] = set()
     written: set[str] = set()
     read: set[str] = set()
-
     # Collect intermediate buffer names from all node write sets.
     for node in nodes:
         for dep in node.read_writes.writes:
-            buf = V.graph.get_buffer(dep.name)
-            if buf is not None and dep.name in graph_outputs:
+            if dep.name in graph_outputs:
                 kernel_arg_names.add(dep.name)
                 continue
-            if isinstance(node, FallbackKernel) or isinstance(
-                node, ExternKernelSchedulerNode
+            buf = V.graph.get_buffer(dep.name)
+            if (
+                isinstance(node, FallbackKernel)
+                or isinstance(node, ExternKernelSchedulerNode)
+                or isinstance(node, NopKernelSchedulerNode)
             ):
                 kernel_arg_names.add(dep.name)
                 continue
-            if isinstance(dep, StarDep):
-                kernel_arg_names.add(dep.name)
-                continue
+            # if isinstance(dep, StarDep):
+            #     kernel_arg_names.add(dep.name)
+            #     logger.debug(f"memory_planning: {dep.name} is StarDep in writes, added to kernel_arg_names")
+            #     continue
             written.add(dep.name)
         for dep in node.read_writes.reads:
-            buf = V.graph.get_buffer(dep.name)
-            if buf is not None and dep.name in graph_inputs:
+            if dep.name in graph_inputs:
                 kernel_arg_names.add(dep.name)
                 continue
-            if isinstance(node, FallbackKernel) or isinstance(
-                node, ExternKernelSchedulerNode
+            if (
+                isinstance(node, FallbackKernel)
+                or isinstance(node, ExternKernelSchedulerNode)
+                or isinstance(node, NopKernelSchedulerNode)
             ):
                 kernel_arg_names.add(dep.name)
                 continue
-            if isinstance(dep, StarDep):
-                kernel_arg_names.add(dep.name)
-                continue
+            # if isinstance(dep, StarDep):
+            #     kernel_arg_names.add(dep.name)
+            #     logger.debug(f"memory_planning: {dep.name} is StarDep in reads, added to kernel_arg_names")
+            #     continue
             read.add(dep.name)
 
     intermediates_written = written & read
     intermediates: set[str] = set()
+
+    output_alloc_ids: set[int] = set()
+    for out_name in graph_outputs:
+        out_buf = V.graph.get_buffer(out_name)
+        if out_buf is None:
+            continue
+        out_layout = out_buf.get_layout()
+        if isinstance(out_layout, FixedTiledLayout):
+            output_alloc_ids.add(id(out_layout.allocation))
+
+    input_alloc_ids: set[int] = set()
+    for inp_name in graph_inputs:
+        inp_buf = V.graph.get_buffer(inp_name)
+        if inp_buf is None:
+            continue
+        inp_layout = inp_buf.get_layout()
+        if isinstance(inp_layout, FixedTiledLayout):
+            input_alloc_ids.add(id(inp_layout.allocation))
+
     for node in nodes:
         for dep in node.read_writes.writes:
             name = dep.name
+            buf = V.graph.get_buffer(name)
             if (
                 name in graph_inputs
                 or name in graph_outputs
@@ -199,15 +225,27 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             layout = buf.get_layout()
             if not isinstance(layout, FixedTiledLayout):
                 continue
-            if layout.allocation:
+            if "lx" in layout.allocation:
                 # Allocation assigned already (e.g. lx) — skip.
+                continue
+            if (
+                id(layout.allocation) in output_alloc_ids
+                or id(layout.allocation) in input_alloc_ids
+            ):
                 continue
             intermediates.add(name)
 
     if not intermediates:
         V.graph.pool_size = 0
         return nodes
+
     logger.debug(f"hbm_planning: intermediates set={intermediates}")
+    logger.debug(f"hbm_planning: kernel_arg_names={kernel_arg_names}")
+    logger.debug(f"hbm_planning: graph_inputs={graph_inputs}")
+    logger.debug(f"hbm_planning: graph_outputs={graph_outputs}")
+    logger.debug(f"hbm_planning: written={written}")
+    logger.debug(f"hbm_planning: read={read}")
+    logger.debug(f"hbm_planning: intermediates_written={intermediates_written}")
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
     # Sort by start step so the allocator processes tensors in execution order.
@@ -258,8 +296,6 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         pool_extent / (1024**3),
         SEGMENT_SIZE / (1024**3),
     )
-
-    # Store peak usage for wrapper code generation
     V.graph.pool_size = pool_extent
 
     return nodes

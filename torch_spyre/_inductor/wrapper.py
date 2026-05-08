@@ -73,39 +73,26 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
     def generate(self, is_inference):
         """Override to add pool allocation into generated code."""
-        # Call parent's generate to set up most of the code
         result_tuple = super().generate(is_inference)
-
-        # result_tuple is (wrapper_code, kernel_declarations)
         wrapper_value_with_linemap, kernel_decls = result_tuple
 
-        # Now inject pool allocation after imports but before other code
         pool_size = getattr(V.graph, "pool_size", 0)
         if pool_size > 0:
             pool_alloc_code = self.allocate_pool()
-            # Extract the actual string from ValueWithLineMap
             wrapper_str = str(wrapper_value_with_linemap.value)
 
-            # Find where to insert the pool allocation - after args are unpacked
-            # Look for "args.clear()" and insert after it
-            import regex as re
+            # Inject _pool at module level, right after the SpyreAsyncCompile()
+            # line, so it is allocated once and reused across all calls.  The
+            # baked-in absolute HBM addresses in bundle.mlir are only correct
+            # when the pool tensor lives at a fixed address for the module's
+            # lifetime.
+            target = "async_compile = SpyreAsyncCompile()"
+            wrapper_str = wrapper_str.replace(
+                target,
+                target + "\n" + pool_alloc_code,
+                1,
+            )
 
-            # Match the args.clear() or args = [] line and insert after
-            pattern = r"(\s+)(args\.clear\(\)|args\s*=\s*\[\])"
-            replacement = r"\1\2\n\1" + pool_alloc_code
-            wrapper_str = re.sub(pattern, replacement, wrapper_str, count=1)
-            lines = wrapper_str.split("\n")
-            for i in range(len(lines) - 1, -1, -1):
-                line = lines[i].strip()
-                if line.startswith("return ("):
-                    indent = len(lines[i]) - len(lines[i].lstrip())
-                    lines.insert(i, " " * indent + "del _pool")
-                    break
-            wrapper_str = "\n".join(lines)
-
-            # Create a new ValueWithLineMap with the modified code
-            # Since we can't easily create a ValueWithLineMap, we'll just return it as-is
-            # The line mapping will be slightly off but the code will work
             from torch._inductor.utils import ValueWithLineMap
 
             wrapper_value_with_linemap = ValueWithLineMap(

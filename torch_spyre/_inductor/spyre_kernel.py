@@ -390,7 +390,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             and "pool" not in tensor.layout.allocation
         ):
             self.spyre_kernel_args.append((name, tensor_arg))
-            print("updating spyre kernel args:", self.spyre_kernel_args)
         return tensor_arg
 
     def create_op_spec(
@@ -472,11 +471,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
-        _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        # if "lx" not in layout.allocation and "pool" not in layout.allocation:
+        _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -528,18 +528,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
     ) -> None:
         """Convert an RValue"""
-        _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
-            print("")
         if isinstance(value, UnimplementedOp):
             self.op_specs.append(value)
             return
@@ -593,12 +592,10 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
-        print("actuals:", actuals)
         pool_size = getattr(V.graph, "pool_size", 0)
         has_pool_allocations = pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
-            print("tensor arg:", name, tensor_arg)
             tensor_arg.arg_index = actuals.index(name)
             tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
                 tensor_arg.arg_index + 1
