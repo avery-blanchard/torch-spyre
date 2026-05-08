@@ -147,77 +147,53 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
     graph_outputs: set[str] = set(V.graph.get_output_names())
+
+    def _is_kernel_arg_node(node: BaseSchedulerNode) -> bool:
+        return isinstance(
+            node,
+            (FallbackKernel, ExternKernelSchedulerNode, NopKernelSchedulerNode),
+        )
+
     kernel_arg_names: set[str] = set()
     written: set[str] = set()
     read: set[str] = set()
-    # Collect intermediate buffer names from all node write sets.
-    for node in nodes:
-        for dep in node.read_writes.writes:
-            if dep.name in graph_outputs:
-                kernel_arg_names.add(dep.name)
-                continue
-            if (
-                isinstance(node, FallbackKernel)
-                or isinstance(node, ExternKernelSchedulerNode)
-                or isinstance(node, NopKernelSchedulerNode)
-            ):
-                kernel_arg_names.add(dep.name)
-                continue
-            written.add(dep.name)
-        for dep in node.read_writes.reads:
-            if dep.name in graph_inputs:
-                kernel_arg_names.add(dep.name)
-                continue
-            if (
-                isinstance(node, FallbackKernel)
-                or isinstance(node, ExternKernelSchedulerNode)
-                or isinstance(node, NopKernelSchedulerNode)
-            ):
-                kernel_arg_names.add(dep.name)
-                continue
-            read.add(dep.name)
 
-    intermediates_written = written & read
-    intermediates: set[str] = set()
+    for node in nodes:
+        is_kernel_arg = _is_kernel_arg_node(node)
+        for dep in node.read_writes.writes:
+            if dep.name in graph_outputs or is_kernel_arg:
+                kernel_arg_names.add(dep.name)
+            else:
+                written.add(dep.name)
+        for dep in node.read_writes.reads:
+            if dep.name in graph_inputs or is_kernel_arg:
+                kernel_arg_names.add(dep.name)
+            else:
+                read.add(dep.name)
 
     # Mutation buffers share the same allocation dict object as their target, so a
-    # name-based check is insufficient.  Collect allocation identities for all
-    # graph inputs and outputs and use object identity to exclude aliases.
+    # name-based check is insufficient.
     io_alloc_ids: set[int] = set()
     for io_name in (*graph_outputs, *graph_inputs):
         io_buf = V.graph.get_buffer(io_name)
-        if io_buf is None:
+        if io_buf is not None:
+            io_layout = io_buf.get_layout()
+            if isinstance(io_layout, FixedTiledLayout):
+                io_alloc_ids.add(id(io_layout.allocation))
+
+    intermediates: set[str] = set()
+    for name in written & read:
+        if name in graph_inputs or name in graph_outputs or name in kernel_arg_names:
             continue
-        io_layout = io_buf.get_layout()
-        if isinstance(io_layout, FixedTiledLayout):
-            io_alloc_ids.add(id(io_layout.allocation))
-
-    for node in nodes:
-        for dep in node.read_writes.writes:
-            name = dep.name
-            if (
-                name in graph_inputs
-                or name in graph_outputs
-                or name in kernel_arg_names
-            ):
-                continue
-            if name not in intermediates_written:
-                continue
-            buf = V.graph.get_buffer(name)
-            if buf is None or isinstance(buf, FallbackKernel):
-                continue
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                continue
-            if "lx" in layout.allocation:
-                continue
-            if id(layout.allocation) in io_alloc_ids:
-                continue
-            intermediates.add(name)
-
-    logger.debug(f"memory_planning: intermediates={intermediates}")
-    logger.debug(f"memory_planning: kernel_arg_names={kernel_arg_names}")
-    logger.debug(f"memory_planning: written={written}, read={read}")
+        buf = V.graph.get_buffer(name)
+        if buf is None or isinstance(buf, FallbackKernel):
+            continue
+        layout = buf.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        if "lx" in layout.allocation or id(layout.allocation) in io_alloc_ids:
+            continue
+        intermediates.add(name)
 
     if not intermediates:
         V.graph.pool_size = 0
