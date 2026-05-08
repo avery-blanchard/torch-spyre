@@ -41,20 +41,12 @@ def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
     return None
 
 
-def _count_non_intermediate_tensors(tensor_names: set[str]) -> int:
-    """Count how many tensors are NOT intermediates or lx."""
-    count = 0
-    for name in tensor_names:
-        buf = V.graph.get_buffer(name)
-        if buf is None or isinstance(buf, FallbackKernel):
-            continue
-        layout = buf.get_layout()
-        if not isinstance(layout, FixedTiledLayout):
-            continue
-        if layout.allocation:
-            continue
-        count += 1
-    return count
+def _is_non_intermediate(name: str) -> bool:
+    buf = V.graph.get_buffer(name)
+    if buf is None or isinstance(buf, FallbackKernel):
+        return False
+    layout = buf.get_layout()
+    return isinstance(layout, FixedTiledLayout) and not layout.allocation
 
 
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
@@ -69,25 +61,33 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     if not _FUSION_ENABLED or len(nodes) == 0:
         return nodes
 
+    max_tensors = _max_bundle_tensors()
     fused_nodes: list[BaseSchedulerNode] = []
     cur_nodes: list[SchedulerNode] = []
     cur_tensors: set[str] = set()
+    cur_non_intermediate_count: int = 0
 
     for n in nodes:
         if isinstance(n, SchedulerNode):
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
-            candidate = cur_tensors | n_tensors
-            non_intermediate_count = _count_non_intermediate_tensors(candidate)
-            if non_intermediate_count <= _max_bundle_tensors():
+            new_tensors = n_tensors - cur_tensors
+            new_non_intermediate = sum(
+                1 for t in new_tensors if _is_non_intermediate(t)
+            )
+            if cur_non_intermediate_count + new_non_intermediate <= max_tensors:
                 # Ok to put in the current bundle
                 cur_nodes.append(n)
-                cur_tensors = candidate
+                cur_tensors |= n_tensors
+                cur_non_intermediate_count += new_non_intermediate
             else:
                 # Would be too many non-intermediate tensors; start a new bundle.
                 if fused := _make_fused(cur_nodes):
                     fused_nodes.append(fused)
                 cur_nodes = [n]
                 cur_tensors = n_tensors
+                cur_non_intermediate_count = sum(
+                    1 for t in n_tensors if _is_non_intermediate(t)
+                )
 
         else:
             # Other node types (eg Fallback nodes) force a bundle boundary.
@@ -96,6 +96,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             fused_nodes.append(n)
             cur_nodes = []
             cur_tensors = set()
+            cur_non_intermediate_count = 0
 
     if fused := _make_fused(cur_nodes):
         fused_nodes.append(fused)

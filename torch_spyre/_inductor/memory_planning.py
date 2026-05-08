@@ -138,7 +138,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """Assign intermediate tensors addresses in the same segment.
     Identifies intermediate buffers (not graph inputs/outputs, not already LX-allocated), performs
     live range analysis, and assigns layout.allocation["pool"] = address so
-    that non-overlapping intermediates share a hbm segement.
+    that non-overlapping intermediates share a hbm segment.
     """
 
     if not _MEMORY_PLAN_ENABLED:
@@ -156,7 +156,6 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             if dep.name in graph_outputs:
                 kernel_arg_names.add(dep.name)
                 continue
-            buf = V.graph.get_buffer(dep.name)
             if (
                 isinstance(node, FallbackKernel)
                 or isinstance(node, ExternKernelSchedulerNode)
@@ -164,10 +163,6 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             ):
                 kernel_arg_names.add(dep.name)
                 continue
-            # if isinstance(dep, StarDep):
-            #     kernel_arg_names.add(dep.name)
-            #     logger.debug(f"memory_planning: {dep.name} is StarDep in writes, added to kernel_arg_names")
-            #     continue
             written.add(dep.name)
         for dep in node.read_writes.reads:
             if dep.name in graph_inputs:
@@ -180,37 +175,26 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             ):
                 kernel_arg_names.add(dep.name)
                 continue
-            # if isinstance(dep, StarDep):
-            #     kernel_arg_names.add(dep.name)
-            #     logger.debug(f"memory_planning: {dep.name} is StarDep in reads, added to kernel_arg_names")
-            #     continue
             read.add(dep.name)
 
     intermediates_written = written & read
     intermediates: set[str] = set()
 
-    output_alloc_ids: set[int] = set()
-    for out_name in graph_outputs:
-        out_buf = V.graph.get_buffer(out_name)
-        if out_buf is None:
+    # Mutation buffers share the same allocation dict object as their target, so a
+    # name-based check is insufficient.  Collect allocation identities for all
+    # graph inputs and outputs and use object identity to exclude aliases.
+    io_alloc_ids: set[int] = set()
+    for io_name in (*graph_outputs, *graph_inputs):
+        io_buf = V.graph.get_buffer(io_name)
+        if io_buf is None:
             continue
-        out_layout = out_buf.get_layout()
-        if isinstance(out_layout, FixedTiledLayout):
-            output_alloc_ids.add(id(out_layout.allocation))
-
-    input_alloc_ids: set[int] = set()
-    for inp_name in graph_inputs:
-        inp_buf = V.graph.get_buffer(inp_name)
-        if inp_buf is None:
-            continue
-        inp_layout = inp_buf.get_layout()
-        if isinstance(inp_layout, FixedTiledLayout):
-            input_alloc_ids.add(id(inp_layout.allocation))
+        io_layout = io_buf.get_layout()
+        if isinstance(io_layout, FixedTiledLayout):
+            io_alloc_ids.add(id(io_layout.allocation))
 
     for node in nodes:
         for dep in node.read_writes.writes:
             name = dep.name
-            buf = V.graph.get_buffer(name)
             if (
                 name in graph_inputs
                 or name in graph_outputs
@@ -226,26 +210,19 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             if not isinstance(layout, FixedTiledLayout):
                 continue
             if "lx" in layout.allocation:
-                # Allocation assigned already (e.g. lx) — skip.
                 continue
-            if (
-                id(layout.allocation) in output_alloc_ids
-                or id(layout.allocation) in input_alloc_ids
-            ):
+            if id(layout.allocation) in io_alloc_ids:
                 continue
             intermediates.add(name)
+
+    logger.debug(f"memory_planning: intermediates={intermediates}")
+    logger.debug(f"memory_planning: kernel_arg_names={kernel_arg_names}")
+    logger.debug(f"memory_planning: written={written}, read={read}")
 
     if not intermediates:
         V.graph.pool_size = 0
         return nodes
 
-    logger.debug(f"hbm_planning: intermediates set={intermediates}")
-    logger.debug(f"hbm_planning: kernel_arg_names={kernel_arg_names}")
-    logger.debug(f"hbm_planning: graph_inputs={graph_inputs}")
-    logger.debug(f"hbm_planning: graph_outputs={graph_outputs}")
-    logger.debug(f"hbm_planning: written={written}")
-    logger.debug(f"hbm_planning: read={read}")
-    logger.debug(f"hbm_planning: intermediates_written={intermediates_written}")
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
     # Sort by start step so the allocator processes tensors in execution order.

@@ -21,6 +21,7 @@ from torch._inductor.codegen.wrapper import (
     SubgraphPythonWrapperCodegen,
 )
 from torch._inductor.ir import GraphPartitionSignature
+from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
@@ -92,8 +93,6 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                 target + "\n" + pool_alloc_code,
                 1,
             )
-
-            from torch._inductor.utils import ValueWithLineMap
 
             wrapper_value_with_linemap = ValueWithLineMap(
                 value=wrapper_str, line_map=wrapper_value_with_linemap.line_map

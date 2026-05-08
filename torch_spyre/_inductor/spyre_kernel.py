@@ -475,7 +475,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        # if "lx" not in layout.allocation and "pool" not in layout.allocation:
         _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
