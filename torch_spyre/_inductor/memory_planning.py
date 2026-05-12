@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-
+from sympy import Symbol
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     ExternKernelSchedulerNode,
@@ -147,54 +147,52 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
     graph_outputs: set[str] = set(V.graph.get_output_names())
+    io_names: set[str] = graph_inputs | graph_outputs
 
-    def _is_kernel_arg_node(node: BaseSchedulerNode) -> bool:
-        return isinstance(
-            node,
-            (FallbackKernel, ExternKernelSchedulerNode, NopKernelSchedulerNode),
-        )
+    _kernel_arg_types = (
+        FallbackKernel,
+        ExternKernelSchedulerNode,
+        NopKernelSchedulerNode,
+    )
+    non_kernel_nodes = [n for n in nodes if not isinstance(n, _kernel_arg_types)]
 
-    kernel_arg_names: set[str] = set()
-    written: set[str] = set()
-    read: set[str] = set()
-
-    for node in nodes:
-        is_kernel_arg = _is_kernel_arg_node(node)
-        for dep in node.read_writes.writes:
-            if dep.name in graph_outputs or is_kernel_arg:
-                kernel_arg_names.add(dep.name)
-            else:
-                written.add(dep.name)
-        for dep in node.read_writes.reads:
-            if dep.name in graph_inputs or is_kernel_arg:
-                kernel_arg_names.add(dep.name)
-            else:
-                read.add(dep.name)
+    written = {
+        dep.name
+        for node in non_kernel_nodes
+        for dep in node.read_writes.writes
+        if dep.name not in graph_outputs
+    }
+    read = {
+        dep.name
+        for node in non_kernel_nodes
+        for dep in node.read_writes.reads
+        if dep.name not in graph_inputs
+    }
 
     # Mutation buffers share the same allocation dict object as their target, so a
     # name-based check is insufficient.
-    io_alloc_ids: set[int] = set()
-    for io_name in (*graph_outputs, *graph_inputs):
-        io_buf = V.graph.get_buffer(io_name)
-        if io_buf is not None:
-            io_layout = io_buf.get_layout()
-            if isinstance(io_layout, FixedTiledLayout):
-                io_alloc_ids.add(id(io_layout.allocation))
+    io_alloc_ids: set[int] = {
+        id(layout.allocation)
+        for io_name in io_names
+        if (io_buf := V.graph.get_buffer(io_name)) is not None
+        and not isinstance(io_buf, Symbol)
+        and isinstance(layout := io_buf.get_layout(), FixedTiledLayout)
+    }
 
-    intermediates: set[str] = set()
-    for name in written & read:
-        if name in graph_inputs or name in graph_outputs or name in kernel_arg_names:
-            continue
+    def _is_intermediate(name: str) -> bool:
         buf = V.graph.get_buffer(name)
-        if buf is None or isinstance(buf, FallbackKernel):
-            continue
+        if buf is None:
+            return False
         layout = buf.get_layout()
-        if not isinstance(layout, FixedTiledLayout):
-            continue
-        if "lx" in layout.allocation or id(layout.allocation) in io_alloc_ids:
-            continue
-        intermediates.add(name)
+        return (
+            isinstance(layout, FixedTiledLayout)
+            and "lx" not in layout.allocation
+            and id(layout.allocation) not in io_alloc_ids
+        )
 
+    intermediates = {
+        name for name in (written & read) - io_names if _is_intermediate(name)
+    }
     if not intermediates:
         V.graph.pool_size = 0
         return nodes
