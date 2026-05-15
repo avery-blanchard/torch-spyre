@@ -275,7 +275,9 @@ def restickify_device_size(
     moving the stick from old_sd to new_sd."""
     new_device_size = list(old_device_size)
     new_device_size[-1] = stick_size
-    new_device_size[old_sd_outer_dim] = (new_sd_host_size + stick_size - 1) // stick_size
+    new_device_size[old_sd_outer_dim] = (
+        new_sd_host_size + stick_size - 1
+    ) // stick_size
     new_device_size[new_sd_outer_dim] = old_sd_host_size
     return new_device_size
 
