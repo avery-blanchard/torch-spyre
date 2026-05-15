@@ -246,8 +246,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_xavier((128, 2, 256)).transpose(0, 1),
                 ),
                 "4d": (
-                    cached_xavier((8, 2, 128, 128)),
-                    cached_xavier((8, 128, 2, 128)).transpose(1, 2),
+                    cached_xavier((2, 8, 128, 128)),
+                    cached_xavier((2, 128, 8, 128)).transpose(1, 2),
                 ),
             },
         },

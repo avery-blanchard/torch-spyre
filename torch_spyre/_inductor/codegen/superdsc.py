@@ -325,13 +325,13 @@ def _get_matmul_symbol_mapping(op_spec: OpSpec) -> dict[Symbol, Symbol]:
     ordered = list(
         dict.fromkeys(
             s
-            for coord in op_spec.args[2].device_coordinates
+            for coord in reversed(op_spec.args[2].device_coordinates)
             for s in coord.free_symbols
             if s in row_batch_syms
         )
     )
     remaining_labels = MATMUL_DIM_LABELS[: len(MATMUL_DIM_LABELS) - 2]
-    for sym, label in zip(ordered, remaining_labels[: len(ordered)][::-1]):
+    for sym, label in zip(ordered[::-1], remaining_labels[: len(ordered)]):
         mapping[sym] = Symbol(label)
 
     return mapping
