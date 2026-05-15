@@ -317,10 +317,6 @@ def _create_sdsc_tensors(
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] / dev_dim_size * it_dim_size
-            elif dim != stick_dim and dev_dim_size < it_dim_size:
-                # For non-stick dimensions where device has fewer elements than the
-                # current iteration space, set backGap to protect against out-of-bounds access.
-                backGap[dim] = it_dim_size - dev_dim_size
 
             max_dim_sizes[dim] = -1
 
