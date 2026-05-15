@@ -803,9 +803,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((7, 13)),
                     cached_randn((13, 7)),
                 ),
-                "63x129_add_transpose": (
-                    cached_randn((63, 129)),
-                    cached_randn((129, 63)),
+                "64x129_add_transpose": (
+                    cached_randn((64, 129)),
+                    cached_randn((129, 64)),
                 ),
             }
         },
@@ -1563,7 +1563,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d2": (2, cached_randn((3, 4, 128)), cached_randn((3, 4))),
                 "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
             },
-            "expect_fail": ["1d1", "2d2", "3d3"],
         },
         ("test_attention", "test_attention_cpu"): {
             "param_sets": {

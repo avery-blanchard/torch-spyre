@@ -499,16 +499,17 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         for sdsc_arg, op_spec_arg in zip(args, op_spec.args):
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]
-            for dim in layout["dim_order"]:
-                if dim == stick_dim:
+            for coord_idx, coord in enumerate(op_spec_arg.device_coordinates):
+                dim_sym = next(
+                    (s for s in symbol_mapping.values() if s in coord.free_symbols),
+                    None,
+                )
+                if dim_sym is None or dim_sym == stick_dim:
                     continue
-                padded_it_size = sdsc_iteration_space[dim]
-                dev_size = op_spec_arg.device_size[-2::-1]
-                dim_idx = layout["dim_order"].index(dim)
-                if dim_idx < len(dev_size):
-                    dev_dim_size = dev_size[dim_idx]
-                    if dev_dim_size < padded_it_size:
-                        sdsc_arg.backGap[dim] = padded_it_size - dev_dim_size
+                padded_it_size = sdsc_iteration_space[dim_sym]
+                dev_dim_size = op_spec_arg.device_size[coord_idx]
+                if dev_dim_size < padded_it_size:
+                    sdsc_arg.backGap[dim_sym] = padded_it_size - dev_dim_size
 
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
