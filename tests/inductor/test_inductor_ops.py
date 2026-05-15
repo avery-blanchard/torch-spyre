@@ -995,6 +995,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        ("test_restickify_add_transpose", "test_restickify_add_transpose_cpu"): {
+            "param_sets": {
+                "10x20_add_transpose": (
+                    cached_randn((10, 20)),
+                    cached_randn((20, 10)),
+                ),
+                "7x13_add_transpose": (
+                    cached_randn((7, 13)),
+                    cached_randn((13, 7)),
+                ),
+                "63x129_add_transpose": (
+                    cached_randn((63, 129)),
+                    cached_randn((129, 63)),
+                ),
+            }
+        },
         ("test_cmp", "test_binary_op_cpu"): {
             "ops_dict": {
                 "eq": torch.eq,
@@ -3844,6 +3860,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
         )
+
+    def test_restickify_add_transpose_cpu(self, a, b):
+        def fn(a, b):
+            return a + b.t()
+
+        self.compare_with_cpu(fn, a, b, run_eager=False)
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
