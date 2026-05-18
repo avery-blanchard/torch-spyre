@@ -272,12 +272,13 @@ def _get_padded_iteration_space(
         stick_dim = layout["stick_dim_order"]
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(layout["dim_order"]):
+            size = dev_size[idx] * layout["stick_size"]
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
-            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
-            if unaligned > 0:
-                padding[dim] = layout["stick_size"] - unaligned
-                sdsc_iteration_space[dim] += padding[dim]
+            unaligned = sdsc_iteration_space[dim] != size
+            if unaligned:
+                padding[dim] = size - sdsc_iteration_space[dim]
+                sdsc_iteration_space[dim] = size
     return padding
 
 
@@ -350,9 +351,20 @@ def _create_sdsc_tensors(
             dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
             if dim == stick_dim:
-                stick_size = arg.device_dtype.elems_per_stick()
-                dev_dim_size *= stick_size
-                it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+                # The stick dimension may span multiple device dimensions due to padding
+                # (e.g., outer-stick-tile dimension and within-stick dimension). Calculate
+                # the full padded extent by finding all device dimensions driven by the
+                # stick variable.
+                padded_size = 1
+                for dev_coord_orig, dev_sz in zip(
+                    arg.device_coordinates, arg.device_size
+                ):
+                    dev_coord = dev_coord_orig.subs(symbol_mapping)
+                    if dev_coord.has(dim):
+                        padded_size *= int(dev_sz)
+                # Update dev_dim_size to be the total padded size
+                dev_dim_size = padded_size
+                it_dim_size = ((it_dim_size - 1) // padded_size + 1) * padded_size
 
             if dev_dim_size > it_dim_size:
                 dim_coord = arg.device_coordinates[-stride_idx - 2]

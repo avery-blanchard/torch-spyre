@@ -85,11 +85,18 @@ def compute_coordinates(
     # find stride immediately strictly larger that dim stride
     n = len(size)
     next_stride = [sympy.oo] * n
+    stick_elem_size = _concretize_for_cmp(size[n - 1])
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
             if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
                 next_stride[i] = stride[j]
+        # For stick variable (last dim), if stride[0] == stick_elem_size, it defines
+        # a stick-tile boundary and should be included as a wrapping point
+        if i == n - 1 and n > 1:
+            st0 = _concretize_for_cmp(stride[0])
+            if st0 == stick_elem_size and st0 < next_stride[i]:
+                next_stride[i] = st0
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
@@ -109,25 +116,53 @@ def compute_coordinates(
                 continue  # ignore dim with size 1
             st = stride[dim]
             if st <= concrete_step and st > primary_stride:
-                # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
-            elif st > concrete_step and st < concrete_limit:
+        # Outer stick-tile dims have stride == elems_per_stick (== size[n-1]).
+        # Only the within-stick (column) variable — whose primary dim is the last
+        # dimension — should drive outer stick-tile dims.  A row/batch variable
+        # whose total range spans a stick-tile boundary must not contribute to
+        # those dims (the overlap is absorbed into its own primary dim below).
+        stick_elem_size = _concretize_for_cmp(size[n - 1])
+        is_stick_var = primary_dim == n - 1
+        for dim in range(n):
+            if size[dim] == 1:
+                continue  # ignore dim with size 1
+            st = stride[dim]
+            if st > concrete_step and st < concrete_limit:
+                if _concretize_for_cmp(st) == stick_elem_size and not is_stick_var:
+                    # Non-stick variable must not drive outer stick-tile dims.
+                    continue
                 # var range intersects dim, add term
                 if next_stride[dim] < concrete_limit:
                     # var range overflows dim
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
-        # add term for primary dim
+        # add term for primary dim; suppress the modulo wrap when the next stride
+        # boundary is the stick-tile boundary and this is not the stick variable —
+        # the variable fully occupies its primary dim without spilling into stick tiles.
         if primary_stride > 0:
-            if next_stride[primary_dim] < concrete_limit:
+            concrete_next = _concretize_for_cmp(next_stride[primary_dim])
+            if concrete_next < concrete_limit and (
+                is_stick_var or concrete_next != stick_elem_size
+            ):
                 coordinates[primary_dim] += (
                     # var range overflows primary dim
                     var * step % next_stride[primary_dim] // primary_stride
                 )
+                # For stick variable with stick boundary, also set dim 0
+                if is_stick_var and n > 1:
+                    st0 = _concretize_for_cmp(stride[0])
+                    if st0 == stick_elem_size:
+                        coordinates[0] = var * step // st0
             else:
                 coordinates[primary_dim] += var * step // primary_stride
+                # For stick variable with stick boundary, ensure dim 0 is set
+                if is_stick_var and n > 1:
+                    st0 = _concretize_for_cmp(stride[0])
+                    if st0 == stick_elem_size and concrete_limit > 0:
+                        coordinates[0] = var * step // st0
 
     vars = index.free_symbols
     offset = index.xreplace({v: 0 for v in vars})
