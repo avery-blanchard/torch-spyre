@@ -109,19 +109,45 @@ def compute_coordinates(
                 continue  # ignore dim with size 1
             st = stride[dim]
             if st <= concrete_step and st > primary_stride:
-                # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
-            elif st > concrete_step and st < concrete_limit:
+        stick_elem_size = _concretize_for_cmp(size[n - 1])
+        is_stick_var = primary_dim == n - 1
+        for dim in range(n):
+            if size[dim] == 1:
+                continue  # ignore dim with size 1
+            st = stride[dim]
+            if st > concrete_step and st < concrete_limit:
+                if _concretize_for_cmp(st) == stick_elem_size and not is_stick_var:
+                    # Non-stick variable must not drive outer stick-tile dims.
+                    continue
                 # var range intersects dim, add term
                 if next_stride[dim] < concrete_limit:
                     # var range overflows dim
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
-        # add term for primary dim
         if primary_stride > 0:
-            if next_stride[primary_dim] < concrete_limit:
+            # Detect multi-stick: stick var whose range crosses a stick boundary.
+            # Requires stride[0]==stick_elem_size (outermost dim tiles stick groups)
+            # AND the variable's limit actually overflows that boundary.
+            is_multistick_var = (
+                is_stick_var
+                and _concretize_for_cmp(stride[0]) == stick_elem_size
+                and _concretize_for_cmp(size[0]) > 1
+                and concrete_limit > _concretize_for_cmp(stride[0])
+            )
+
+            if is_multistick_var:
+                # The non-primary loop above already set coordinates[0] (stick tile
+                # index) via the st==stick_elem_size path.  Only the within-stick
+                # coordinate needs to be filled in here.
+                coordinates[primary_dim] += (
+                    var * step % stick_elem_size // primary_stride
+                )
+            elif next_stride[primary_dim] < concrete_limit and (
+                is_stick_var or next_stride[primary_dim] != stick_elem_size
+            ):
                 coordinates[primary_dim] += (
                     # var range overflows primary dim
                     var * step % next_stride[primary_dim] // primary_stride

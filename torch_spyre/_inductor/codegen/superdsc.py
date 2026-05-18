@@ -261,7 +261,6 @@ def _get_padded_iteration_space(
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
-
     Update sdsc_iteration_space when padding is needed.
     Returns a mapping of dim -> padding amount
     """
