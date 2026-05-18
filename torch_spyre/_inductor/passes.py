@@ -49,6 +49,7 @@ from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .dedup_constants import dedup_and_promote_constants
 
 
 logger = get_inductor_logger("passes")
@@ -229,6 +230,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         finalize_layouts(operations)
         insert_restickify(operations)
         insert_padding_ir(operations)
+        dedup_and_promote_constants(operations)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
@@ -243,6 +245,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     def uuid(self) -> Optional[Any]:
         files = [
             inspect.getfile(deadcode_elimination),
+            inspect.getfile(dedup_and_promote_constants),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
