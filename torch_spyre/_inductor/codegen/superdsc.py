@@ -500,8 +500,13 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]
             for coord_idx, coord in enumerate(op_spec_arg.device_coordinates):
+                mapped_coord = coord.subs(symbol_mapping)
                 dim_sym = next(
-                    (s for s in symbol_mapping.values() if s in coord.free_symbols),
+                    (
+                        s
+                        for s in symbol_mapping.values()
+                        if s in mapped_coord.free_symbols
+                    ),
                     None,
                 )
                 if dim_sym is None or dim_sym == stick_dim:
@@ -510,6 +515,10 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
                 dev_dim_size = op_spec_arg.device_size[coord_idx]
                 if dev_dim_size < padded_it_size:
                     sdsc_arg.backGap[dim_sym] = padded_it_size - dev_dim_size
+        for dim in padding:
+            dim_splits[dim] = 1
+            work_slices[dim] = 1
+        num_cores = math.prod(dim_splits.values())
 
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
