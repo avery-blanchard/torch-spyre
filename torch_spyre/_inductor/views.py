@@ -104,6 +104,10 @@ def compute_coordinates(
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
+        # find outer dim: the single dim above the variable's iteration range that
+        # should receive the above-range coordinate expression for multi-stick layouts
+        outer_stride = 0
+        outer_dim = -1
         for dim in range(n):
             if size[dim] == 1:
                 continue  # ignore dim with size 1
@@ -119,6 +123,21 @@ def compute_coordinates(
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
+            elif st > concrete_step and st > concrete_limit and st > outer_stride:
+                # var range does not reach this dim's stride boundary.  Track the
+                # outermost such dim (largest stride); only that one should receive
+                # the above-range coordinate expression to avoid emitting spurious
+                # zero terms on intermediate dimensions in multi-dimensional layouts.
+                outer_stride = st
+                outer_dim = dim
+        # Emit coordinate for the outermost above-range dim only when it is the
+        # outer stick-count dimension (stride == stick size, i.e. size[-1]).  This
+        # distinguishes multi-stick padding dims from ordinary batch/sequence dims
+        # that happen to have a large stride.  The expression evaluates to 0 for
+        # all valid indices but must be present so normalize_coordinates can build
+        # the correct outer-stick Term for multi-stick padded layouts.
+        if outer_dim >= 0 and outer_stride == size[-1]:
+            coordinates[outer_dim] += var * step // outer_stride
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
