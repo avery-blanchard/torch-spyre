@@ -270,9 +270,12 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
       const int64_t remaining_elements = current_elements / tile_stride;
 
       if (remaining_elements == 0) {
-        // The host data does not reach this device dimension — the entire
-        // tile falls in the padding region.  No elements to copy; stop.
-        break;
+        // The host data does not fill a full stride-unit of this device
+        // dimension.  The data fits within a single (partial) group at index
+        // 0; set dcsi_size to 1 so the DMA copies that one group and inner
+        // tiles can still be processed.  Do not update elements_before.
+        dcsi_sizes[tile_index] = 1;
+        continue;
       }
 
       if (current_elements % tile_stride == 0) {
