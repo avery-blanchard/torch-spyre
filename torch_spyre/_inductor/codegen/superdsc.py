@@ -272,10 +272,25 @@ def _get_padded_iteration_space(
         for idx, dim in enumerate(layout["dim_order"]):
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
-            size = dev_size[idx] * layout["stick_size"]
-            if size > sdsc_iteration_space[dim]:
-                padding[dim] = size - sdsc_iteration_space[dim]
-                sdsc_iteration_space[dim] = size
+            stick_size = layout["stick_size"]
+            if sdsc_arg.backGap.get(dim, 0) > 0:
+                # _create_sdsc_tensors already recorded a backGap for this dim,
+                # meaning the device allocation extends beyond the iteration range
+                # due to a slice/view into a larger parent buffer.  Extending the
+                # iteration space further would overcount that gap.  Only align
+                # to the next stick boundary.
+                unaligned = sdsc_iteration_space[dim] % stick_size
+                if unaligned > 0:
+                    padding[dim] = stick_size - unaligned
+                    sdsc_iteration_space[dim] += padding[dim]
+            else:
+                # No backGap: device_size reflects the tensor's own physical
+                # extent, which may include intentional multi-stick padding
+                # beyond the nearest stick boundary.
+                size = dev_size[idx] * stick_size
+                if size > sdsc_iteration_space[dim]:
+                    padding[dim] = size - sdsc_iteration_space[dim]
+                    sdsc_iteration_space[dim] = size
     return padding
 
 
