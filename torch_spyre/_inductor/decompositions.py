@@ -346,23 +346,6 @@ def new_ones_decomp(
     return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
 
-# To avoid constant folding, we introduce a custom op `spyre::full` that runs
-# torch.full on CPU and copies the result to Spyre. Remove this workaround once
-# Spyre supports one-element tensors.
-@register_spyre_decomposition([torch.ops.aten.full])
-def full_decomp(
-    size: list[Union[int, torch.SymInt]],
-    fill_value: torch.types.Number,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[torch.device] = None,
-    pin_memory: Optional[bool] = None,
-) -> torch.Tensor:
-    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
-    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
-    return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
-
-
 @register_spyre_decomposition([torch.ops.aten.logical_not])
 def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     # Currently falling back to torch.zeros_like for dtypes other than bool
@@ -713,7 +696,6 @@ def pad_decomp(
             )
 
     # Build the padded output shape and collect which dimensions need padding.
-    scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
     output_size = list(input.size())
     dims: list[int] = []
     offsets: list[int] = []
@@ -730,7 +712,9 @@ def pad_decomp(
     if not dims:
         return input
 
-    output = scalar.expand(output_size).clone()
+    output = torch.empty(output_size, dtype=input.dtype, device=input.device).fill_(
+        value
+    )
     output = torch.ops.spyre.overwrite_f(
         input=input, output=output, dims=dims, offsets=offsets
     )
