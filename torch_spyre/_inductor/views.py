@@ -114,21 +114,20 @@ def compute_coordinates(
                 primary_stride = st
                 primary_dim = dim
             elif st > concrete_step and st < concrete_limit:
-                # var range intersects dim; only emit if st divides step so the
-                # coefficient var*step//st is an integer.  A padded outer
-                # stick-count dim (stride == stick_size, size > 1) with
-                # step < stick_size would produce a non-integer otherwise.
-                if concrete_step % st == 0:
+                # var range intersects dim; emit var*step//st unless the
+                # coefficient would be non-integer.  step==1 always produces
+                # integer floor division.  step>1 requires st | step.
+                # A padded outer stick-count dim (stride == stick_size) with
+                # 1 < step < stick_size would yield a non-integer fraction.
+                if concrete_step == 1:
+                    coordinates[dim] += var * step // st
+                elif concrete_step % st == 0:
                     if next_stride[dim] < concrete_limit:
                         # var range overflows dim
                         coordinates[dim] += var * step % next_stride[dim] // st
                     else:
                         coordinates[dim] += var * step // st
-                elif concrete_step == 1 and st == stick_size and size[dim] > 1:
-                    # Within-stick variable crossing a padded outer stick-count
-                    # dim: emit floor(var / stick_size) so normalize_coordinates
-                    # builds the correct outer-stick Term.
-                    coordinates[dim] += var * step // st
+                # else: non-integer coefficient — skip this dim
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
