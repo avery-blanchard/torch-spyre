@@ -712,9 +712,22 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     if dtype is None:
         dtype = torch.get_default_dtype()
-    op_overload = torch.ops.spyre.constant.default
+    if dtype not in (torch.float16, torch.float32):
+        return ir.TensorBox.create(
+            ir.FallbackKernel.create(
+                torch.ops.aten.full.default,
+                size,
+                fill_value,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                pin_memory=pin_memory,
+            )
+        )
     scalar = ir.TensorBox.create(
-        SpyreConstantFallback(op_overload, float(fill_value), dtype, device)
+        SpyreConstantFallback(
+            torch.ops.spyre.constant.default, float(fill_value), dtype, device
+        )
     )
     scalar_loader = scalar.make_loader()
 
