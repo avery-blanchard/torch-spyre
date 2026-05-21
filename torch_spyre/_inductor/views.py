@@ -130,13 +130,12 @@ def compute_coordinates(
                 # zero terms on intermediate dimensions in multi-dimensional layouts.
                 outer_stride = st
                 outer_dim = dim
-        # Emit coordinate for the outermost above-range dim only when it is the
-        # outer stick-count dimension (stride == stick size, i.e. size[-1]).  This
-        # distinguishes multi-stick padding dims from ordinary batch/sequence dims
-        # that happen to have a large stride.  The expression evaluates to 0 for
-        # all valid indices but must be present so normalize_coordinates can build
-        # the correct outer-stick Term for multi-stick padded layouts.
-        if outer_dim >= 0 and outer_stride == size[-1]:
+        # Emit coordinate for the outermost above-range dim only when this is
+        # the within-stick variable (step == 1).  The outer stick-count dim has
+        # stride == stick_size; floor(var/stick_size) is always 0 for the valid
+        # index range but must be present so normalize_coordinates can build the
+        # correct outer-stick Term for multi-stick padded layouts.
+        if outer_dim >= 0 and outer_stride == size[-1] and concrete_step == 1:
             coordinates[outer_dim] += var * step // outer_stride
         # add term for primary dim
         if primary_stride > 0:
