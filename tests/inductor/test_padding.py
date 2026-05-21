@@ -601,8 +601,9 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_3d_add_two_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (2, 3, 16): dim_map=[1,2,0,2] → stride_map=[16, 64, 48, 1], padded to 2 sticks
-        stl = SpyreTensorLayout([2, 3, 2, 64], [16, 64, 48, 1], fp16)
+        # host (2, 3, 16): dim_map=[1,2,0,2] → device[0]=rows(3), device[1]=outer_stick, device[2]=batch(2)
+        # stride_map=[16, 64, 48, 1], outer stick padded to 2
+        stl = SpyreTensorLayout([3, 2, 2, 64], [16, 64, 48, 1], fp16)
 
         x_cpu = torch.randn(2, 3, 16, dtype=dtype)
         y_cpu = torch.randn(2, 3, 16, dtype=dtype)
@@ -616,9 +617,9 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_3d_add_four_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (4, 3, 16): dim_map=[1,2,0,2] → stride_map=[16, 64, 48, 1], padded to 4 sticks
-        # batch stride 48 < stick_size 64 exercises the guarded intersects-range path
-        stl = SpyreTensorLayout([4, 3, 4, 64], [16, 64, 48, 1], fp16)
+        # host (4, 3, 16): dim_map=[1,2,0,2] → device[0]=rows(3), device[1]=outer_stick, device[2]=batch(4)
+        # stride_map=[16, 64, 48, 1], outer stick padded to 4; batch stride 48 < stick_size 64
+        stl = SpyreTensorLayout([3, 4, 4, 64], [16, 64, 48, 1], fp16)
 
         x_cpu = torch.randn(4, 3, 16, dtype=dtype)
         y_cpu = torch.randn(4, 3, 16, dtype=dtype)
@@ -632,8 +633,9 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_4d_add_two_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (2, 3, 4, 16): dim_map=[1,2,3,0,3] → stride_map=[64, 16, 64, 192, 1], padded to 2 sticks
-        stl = SpyreTensorLayout([2, 3, 4, 2, 64], [64, 16, 64, 192, 1], fp16)
+        # host (2, 3, 4, 16): dim_map=[1,2,3,0,3] → device[0]=c1(3), device[1]=c2(4), device[2]=outer_stick, device[3]=c0(2)
+        # stride_map=[64, 16, 64, 192, 1], outer stick padded to 2
+        stl = SpyreTensorLayout([3, 4, 2, 2, 64], [64, 16, 64, 192, 1], fp16)
 
         x_cpu = torch.randn(2, 3, 4, 16, dtype=dtype)
         y_cpu = torch.randn(2, 3, 4, 16, dtype=dtype)
@@ -647,8 +649,9 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_4d_add_four_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (2, 3, 8, 16): dim_map=[1,2,3,0,3] → stride_map=[128, 16, 64, 384, 1], padded to 4 sticks
-        stl = SpyreTensorLayout([2, 3, 8, 4, 64], [128, 16, 64, 384, 1], fp16)
+        # host (2, 3, 8, 16): dim_map=[1,2,3,0,3] → device[0]=c1(3), device[1]=c2(8), device[2]=outer_stick, device[3]=c0(2)
+        # stride_map=[128, 16, 64, 384, 1], outer stick padded to 4
+        stl = SpyreTensorLayout([3, 8, 4, 2, 64], [128, 16, 64, 384, 1], fp16)
 
         x_cpu = torch.randn(2, 3, 8, 16, dtype=dtype)
         y_cpu = torch.randn(2, 3, 8, 16, dtype=dtype)
