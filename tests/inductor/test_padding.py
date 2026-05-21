@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""IR-level unit tests for insert_bmm_padding.
+"""Tests for the IR-level padding pass and multi-stick padded device layouts.
 
-Tests hook into CustomPreSchedulingPasses after insert_bmm_padding runs to inspect
-the operations list directly, without requiring end-to-end compilation to succeed.
+TestInsertPaddingIR hooks into CustomPreSchedulingPasses after insert_bmm_padding
+runs to inspect the operations list directly, without requiring end-to-end
+compilation to succeed.
+
+TestMultiStickPaddedLayout tests end-to-end compilation with tensors whose
+SpyreTensorLayout device_size spans more sticks than the host size requires.
 """
 
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
@@ -31,6 +35,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
@@ -545,6 +550,109 @@ class TestInsertPaddingIR(unittest.TestCase):
                         f"expected 1 (within-stick dim is contiguous); "
                         f"size={[int(s) for s in empty.get_size()]}",
                     )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end tests for multi-stick padded SpyreTensorLayout
+# ---------------------------------------------------------------------------
+
+
+class TestMultiStickPaddedLayout(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0xAFFE)
+        torch._dynamo.reset_code_caches()
+
+    def _compile_and_compare(self, fn, *cpu_args, spyre_args, atol=0.1, rtol=0.1):
+        cpu_result = fn(*cpu_args)
+        compiled = torch.compile(fn, fullgraph=True)
+        spyre_result = compiled(*spyre_args).cpu()
+        torch.testing.assert_close(cpu_result, spyre_result, atol=atol, rtol=rtol)
+
+    def test_2d_add_two_stick_padded(self):
+        dtype = torch.float16
+        fp16 = get_device_dtype(dtype)
+        # host (4, 16): stride_map=[64, 16, 1], device_size=[2, 4, 64]
+        stl = SpyreTensorLayout([2, 4, 64], [64, 16, 1], fp16)
+
+        x_cpu = torch.randn(4, 16, dtype=dtype)
+        y_cpu = torch.randn(4, 16, dtype=dtype)
+        self._compile_and_compare(
+            torch.add,
+            x_cpu,
+            y_cpu,
+            spyre_args=[x_cpu.to(device_layout=stl), y_cpu.to(device_layout=stl)],
+        )
+
+    def test_2d_add_four_stick_padded(self):
+        dtype = torch.float16
+        fp16 = get_device_dtype(dtype)
+        # host (8, 64): stride_map=[64, 64, 1], device_size=[4, 8, 64]
+        stl = SpyreTensorLayout([4, 8, 64], [64, 64, 1], fp16)
+
+        x_cpu = torch.randn(8, 64, dtype=dtype)
+        y_cpu = torch.randn(8, 64, dtype=dtype)
+        self._compile_and_compare(
+            torch.add,
+            x_cpu,
+            y_cpu,
+            spyre_args=[x_cpu.to(device_layout=stl), y_cpu.to(device_layout=stl)],
+        )
+
+    def test_3d_add_two_stick_padded(self):
+        dtype = torch.float16
+        fp16 = get_device_dtype(dtype)
+        stl = SpyreTensorLayout([2, 4, 2, 64], [64, 16, 64, 1], fp16)
+
+        x_cpu = torch.randn(2, 4, 16, dtype=dtype)
+        y_cpu = torch.randn(2, 4, 16, dtype=dtype)
+        self._compile_and_compare(
+            torch.add,
+            x_cpu,
+            y_cpu,
+            spyre_args=[x_cpu.to(device_layout=stl), y_cpu.to(device_layout=stl)],
+        )
+
+    def test_3d_add_four_stick_padded(self):
+        dtype = torch.float16
+        fp16 = get_device_dtype(dtype)
+        stl = SpyreTensorLayout([4, 8, 4, 64], [64, 64, 512, 1], fp16)
+
+        x_cpu = torch.randn(4, 8, 64, dtype=dtype)
+        y_cpu = torch.randn(4, 8, 64, dtype=dtype)
+        self._compile_and_compare(
+            torch.add,
+            x_cpu,
+            y_cpu,
+            spyre_args=[x_cpu.to(device_layout=stl), y_cpu.to(device_layout=stl)],
+        )
+
+    def test_4d_add_two_stick_padded(self):
+        dtype = torch.float16
+        fp16 = get_device_dtype(dtype)
+        stl = SpyreTensorLayout([2, 4, 3, 2, 64], [64, 16, 64, 192, 1], fp16)
+
+        x_cpu = torch.randn(2, 3, 4, 16, dtype=dtype)
+        y_cpu = torch.randn(2, 3, 4, 16, dtype=dtype)
+        self._compile_and_compare(
+            torch.add,
+            x_cpu,
+            y_cpu,
+            spyre_args=[x_cpu.to(device_layout=stl), y_cpu.to(device_layout=stl)],
+        )
+
+    def test_4d_add_four_stick_padded(self):
+        dtype = torch.float16
+        fp16 = get_device_dtype(dtype)
+        stl = SpyreTensorLayout([4, 8, 3, 2, 64], [64, 64, 512, 1536, 1], fp16)
+
+        x_cpu = torch.randn(2, 3, 8, 64, dtype=dtype)
+        y_cpu = torch.randn(2, 3, 8, 64, dtype=dtype)
+        self._compile_and_compare(
+            torch.add,
+            x_cpu,
+            y_cpu,
+            spyre_args=[x_cpu.to(device_layout=stl), y_cpu.to(device_layout=stl)],
+        )
 
 
 if __name__ == "__main__":
