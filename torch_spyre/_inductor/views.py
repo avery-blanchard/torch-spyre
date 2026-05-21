@@ -84,11 +84,20 @@ def compute_coordinates(
     )
     # find stride immediately strictly larger that dim stride
     n = len(size)
+    stick_size = size[-1]
     next_stride = [sympy.oo] * n
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
+            # Exclude the outer stick-count dim (stride == stick_size) from
+            # next_stride boundaries: it is a padding sentinel, not a real
+            # host dimension, so it must not truncate the primary-dim range.
+            if (
+                next_stride[i] > stride[j]
+                and stride[j] > stride[i]
+                and size[j] > 1
+                and not (stride[j] == stick_size and j != n - 1)
+            ):
                 next_stride[i] = stride[j]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
