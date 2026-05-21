@@ -112,12 +112,24 @@ def compute_coordinates(
             if size[dim] == 1:
                 continue  # ignore dim with size 1
             st = stride[dim]
-            if st <= concrete_step and st > primary_stride:
-                # found candidate primary dim
+            if (
+                st <= concrete_step
+                and st > primary_stride
+                and not (st == size[-1] and concrete_step != 1)
+            ):
+                # found candidate primary dim; skip the outer stick-count dim
+                # (stride == stick_size) for non-within-stick variables so it
+                # is never chosen as the primary for batch/spatial vars.
                 primary_stride = st
                 primary_dim = dim
             elif st > concrete_step and st < concrete_limit:
-                # var range intersects dim, add term
+                # var range intersects dim, add term.
+                # Skip the outer stick-count dim (stride == stick_size) for
+                # non-within-stick variables: that dim is a padding sentinel
+                # and any variable with step < stick_size would produce a
+                # non-integer coefficient (e.g. 3*c0/4) here.
+                if st == size[-1] and concrete_step != 1:
+                    continue
                 if next_stride[dim] < concrete_limit:
                     # var range overflows dim
                     coordinates[dim] += var * step % next_stride[dim] // st
