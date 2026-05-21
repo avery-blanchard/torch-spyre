@@ -84,20 +84,23 @@ def compute_coordinates(
     )
     # find stride immediately strictly larger that dim stride
     n = len(size)
-    stick_size = size[-1]
+    # The outer stick-count device dim is always at index n-3 (second-to-last
+    # non-stick dim).  Device layout: [...batch_dims..., outer_stick, batch0,
+    # within_stick] — outer_stick is the first occurrence of the stick host dim
+    # in dim_map, always at device index n-3.  Identifying it by index (not by
+    # stride value) is required because a real host dim may have the same stride
+    # value as the stick size (e.g. 4D host with inner stride 64).
+    outer_stick_dim = n - 3 if n >= 3 else -1
     next_stride = [sympy.oo] * n
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
-            # Exclude the outer stick-count dim (stride == stick_size) from
-            # next_stride boundaries: it is a padding sentinel, not a real
-            # host dimension, so it must not truncate the primary-dim range.
-            if (
-                next_stride[i] > stride[j]
-                and stride[j] > stride[i]
-                and size[j] > 1
-                and not (stride[j] == stick_size and j != n - 1)
-            ):
+            # Exclude the outer stick-count dim from next_stride boundaries: it
+            # is a padding sentinel whose stride value is not a real host
+            # boundary, so it must not truncate the primary-dim range formula.
+            if j == outer_stick_dim:
+                continue
+            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
                 next_stride[i] = stride[j]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
@@ -113,51 +116,36 @@ def compute_coordinates(
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
-        # find outer dim: the single dim above the variable's iteration range that
-        # should receive the above-range coordinate expression for multi-stick layouts
-        outer_stride = 0
-        outer_dim = -1
         for dim in range(n):
             if size[dim] == 1:
                 continue  # ignore dim with size 1
             st = stride[dim]
-            if (
-                st <= concrete_step
-                and st > primary_stride
-                and not (st == size[-1] and concrete_step != 1)
-            ):
-                # found candidate primary dim; skip the outer stick-count dim
-                # (stride == stick_size) for non-within-stick variables so it
-                # is never chosen as the primary for batch/spatial vars.
+            if dim == outer_stick_dim:
+                # The outer stick-count dim is a padding sentinel.  Only the
+                # within-stick variable (step == 1) should emit a coordinate
+                # for it via the explicit emit below; all other variables must
+                # skip it to avoid non-integer coefficients.
+                if concrete_step == 1:
+                    # Handled by the explicit outer-stick emit after the loop.
+                    pass
+                continue
+            if st <= concrete_step and st > primary_stride:
+                # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
             elif st > concrete_step and st < concrete_limit:
-                # var range intersects dim, add term.
-                # Skip the outer stick-count dim (stride == stick_size) for
-                # non-within-stick variables: that dim is a padding sentinel
-                # and any variable with step < stick_size would produce a
-                # non-integer coefficient (e.g. 3*c0/4) here.
-                if st == size[-1] and concrete_step != 1:
-                    continue
+                # var range intersects dim, add term
                 if next_stride[dim] < concrete_limit:
                     # var range overflows dim
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
-            elif st > concrete_step and st > concrete_limit and st > outer_stride:
-                # var range does not reach this dim's stride boundary.  Track the
-                # outermost such dim (largest stride); only that one should receive
-                # the above-range coordinate expression to avoid emitting spurious
-                # zero terms on intermediate dimensions in multi-dimensional layouts.
-                outer_stride = st
-                outer_dim = dim
-        # Emit coordinate for the outermost above-range dim only when this is
-        # the within-stick variable (step == 1).  The outer stick-count dim has
-        # stride == stick_size; floor(var/stick_size) is always 0 for the valid
-        # index range but must be present so normalize_coordinates can build the
-        # correct outer-stick Term for multi-stick padded layouts.
-        if outer_dim >= 0 and outer_stride == size[-1] and concrete_step == 1:
-            coordinates[outer_dim] += var * step // outer_stride
+        # Emit outer stick-count coordinate for the within-stick variable only.
+        # floor(var / stick_stride) is always 0 for valid indices but must be
+        # present so normalize_coordinates builds the correct outer-stick Term.
+        if outer_stick_dim >= 0 and concrete_step == 1 and size[outer_stick_dim] > 1:
+            outer_st = stride[outer_stick_dim]
+            coordinates[outer_stick_dim] += var * step // outer_st
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
