@@ -221,8 +221,18 @@ def _get_device_dim_order(
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
         expr = arg.device_coordinates[i].subs(symbol_mapping)
-        if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
+        # The outer stick-count coordinate is floor(stick_dim / stick_size) for
+        # multi-stick padded tensors (non-zero) or 0 for single-stick tensors.
+        # Both cases represent the stick_dim slot in dim_order; insert stick_dim
+        # here and skip the expression's free symbols so it is not added again.
+        is_outer_stick = (
+            stick_dim is not None
+            and stick_dim not in dim_order
+            and (expr == 0 or (expr.func == floor and stick_dim in expr.free_symbols))
+        )
+        if is_outer_stick:
             dim_order.append(stick_dim)
+            continue
         for sym in expr.free_symbols:
             if sym not in dim_order:
                 dim_order.append(sym)
