@@ -269,9 +269,11 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
       const int64_t current_elements = host_size / elements_before;
       const int64_t remaining_elements = current_elements / tile_stride;
 
-      TORCH_CHECK(
-          remaining_elements > 0,
-          "Invalid device sizes and stride map for host sizes and strides");
+      if (remaining_elements == 0) {
+        // The host data does not reach this device dimension — the entire
+        // tile falls in the padding region.  No elements to copy; stop.
+        break;
+      }
 
       if (current_elements % tile_stride == 0) {
         // When the current elements is evenly divisible by the tile stride then
