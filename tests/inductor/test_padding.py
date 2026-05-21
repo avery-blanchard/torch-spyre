@@ -618,7 +618,8 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_3d_add_four_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (4, 3, 16): strides (48, 16, 1) — no host stride equals 64
+        # host (4, 3, 16): strides (48, 16, 1) — batch stride 48 < stick_size 64,
+        # exercises the guarded "intersects range" path in compute_coordinates
         # device_size=[4, 3, 4, 64], stride_map=[64, 16, 48, 1]
         stl = SpyreTensorLayout([4, 3, 4, 64], [64, 16, 48, 1], fp16)
 
@@ -634,12 +635,12 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_4d_add_two_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (2, 3, 3, 16): strides (144, 48, 16, 1) — no host stride equals 64
-        # device_size=[2, 3, 3, 2, 64], stride_map=[64, 16, 48, 144, 1]
-        stl = SpyreTensorLayout([2, 3, 3, 2, 64], [64, 16, 48, 144, 1], fp16)
+        # host (2, 3, 4, 16): strides (192, 64, 16, 1)
+        # device_size=[2, 4, 3, 2, 64], stride_map=[64, 16, 64, 192, 1]
+        stl = SpyreTensorLayout([2, 4, 3, 2, 64], [64, 16, 64, 192, 1], fp16)
 
-        x_cpu = torch.randn(2, 3, 3, 16, dtype=dtype)
-        y_cpu = torch.randn(2, 3, 3, 16, dtype=dtype)
+        x_cpu = torch.randn(2, 3, 4, 16, dtype=dtype)
+        y_cpu = torch.randn(2, 3, 4, 16, dtype=dtype)
         self._compile_and_compare(
             torch.add,
             x_cpu,
@@ -650,12 +651,13 @@ class TestMultiStickPaddedLayout(unittest.TestCase):
     def test_4d_add_four_stick_padded(self):
         dtype = torch.float16
         fp16 = get_device_dtype(dtype)
-        # host (2, 3, 8, 128): row stride 128 > stick_size 64, no collision
-        # device_size=[8, 8, 3, 2, 64], stride_map=[64, 128, 1024, 3072, 1]
-        stl = SpyreTensorLayout([8, 8, 3, 2, 64], [64, 128, 1024, 3072, 1], fp16)
+        # host (2, 3, 8, 16): strides (384, 128, 16, 1) — batch strides 128, 384
+        # are multiples of stick_size 64, row stride 16 < 64
+        # device_size=[4, 8, 3, 2, 64], stride_map=[64, 16, 128, 384, 1]
+        stl = SpyreTensorLayout([4, 8, 3, 2, 64], [64, 16, 128, 384, 1], fp16)
 
-        x_cpu = torch.randn(2, 3, 8, 128, dtype=dtype)
-        y_cpu = torch.randn(2, 3, 8, 128, dtype=dtype)
+        x_cpu = torch.randn(2, 3, 8, 16, dtype=dtype)
+        y_cpu = torch.randn(2, 3, 8, 16, dtype=dtype)
         self._compile_and_compare(
             torch.add,
             x_cpu,
