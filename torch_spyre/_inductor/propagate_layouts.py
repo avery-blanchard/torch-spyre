@@ -85,6 +85,11 @@ def _get_prop_args(reads) -> list[PropArg]:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
             layout = buf.get_layout()
+            # Skip 0-d scalar constants — they have no meaningful STL to propagate.
+            # The consuming Pointwise's layout will be determined by its output size
+            # or other non-scalar inputs.
+            if isinstance(buf, SpyreConstantFallback) and not layout.size:
+                continue
             if hasattr(buf, "layouts"):
                 res.append(PropArg(arg, layout, list(buf.layouts)))
             else:
