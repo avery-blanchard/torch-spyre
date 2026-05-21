@@ -84,24 +84,13 @@ def compute_coordinates(
     )
     # find stride immediately strictly larger that dim stride
     n = len(size)
-    # The outer stick-count device dim is always at index n-3 (second-to-last
-    # non-stick dim).  Device layout: [...batch_dims..., outer_stick, batch0,
-    # within_stick] — outer_stick is the first occurrence of the stick host dim
-    # in dim_map, always at device index n-3.  Identifying it by index (not by
-    # stride value) is required because a real host dim may have the same stride
-    # value as the stick size (e.g. 4D host with inner stride 64).
-    outer_stick_dim = n - 3 if n >= 3 else -1
     next_stride = [sympy.oo] * n
     for i in range(n):
         for j in range(n):
             # n^2 is ok since n is small
-            # Exclude the outer stick-count dim from next_stride boundaries: it
-            # is a padding sentinel whose stride value is not a real host
-            # boundary, so it must not truncate the primary-dim range formula.
-            if j == outer_stick_dim:
-                continue
             if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
                 next_stride[i] = stride[j]
+    stick_size = size[n - 1]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
 
@@ -120,32 +109,26 @@ def compute_coordinates(
             if size[dim] == 1:
                 continue  # ignore dim with size 1
             st = stride[dim]
-            if dim == outer_stick_dim:
-                # The outer stick-count dim is a padding sentinel.  Only the
-                # within-stick variable (step == 1) should emit a coordinate
-                # for it via the explicit emit below; all other variables must
-                # skip it to avoid non-integer coefficients.
-                if concrete_step == 1:
-                    # Handled by the explicit outer-stick emit after the loop.
-                    pass
-                continue
             if st <= concrete_step and st > primary_stride:
                 # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
             elif st > concrete_step and st < concrete_limit:
-                # var range intersects dim, add term
-                if next_stride[dim] < concrete_limit:
-                    # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
-                else:
+                # var range intersects dim; only emit if st divides step so the
+                # coefficient var*step//st is an integer.  A padded outer
+                # stick-count dim (stride == stick_size, size > 1) with
+                # step < stick_size would produce a non-integer otherwise.
+                if concrete_step % st == 0:
+                    if next_stride[dim] < concrete_limit:
+                        # var range overflows dim
+                        coordinates[dim] += var * step % next_stride[dim] // st
+                    else:
+                        coordinates[dim] += var * step // st
+                elif concrete_step == 1 and st == stick_size and size[dim] > 1:
+                    # Within-stick variable crossing a padded outer stick-count
+                    # dim: emit floor(var / stick_size) so normalize_coordinates
+                    # builds the correct outer-stick Term.
                     coordinates[dim] += var * step // st
-        # Emit outer stick-count coordinate for the within-stick variable only.
-        # floor(var / stick_stride) is always 0 for valid indices but must be
-        # present so normalize_coordinates builds the correct outer-stick Term.
-        if outer_stick_dim >= 0 and concrete_step == 1 and size[outer_stick_dim] > 1:
-            outer_st = stride[outer_stick_dim]
-            coordinates[outer_stick_dim] += var * step // outer_st
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
