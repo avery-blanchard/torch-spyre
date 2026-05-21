@@ -707,8 +707,8 @@ def pad_decomp(
     if not dims:
         return input
 
-    output = torch.empty(output_size, dtype=input.dtype, device=input.device).fill_(
-        value
+    output = torch.ops.aten.full(
+        output_size, value, dtype=input.dtype, device=input.device
     )
     output = torch.ops.spyre.overwrite_f(
         input=input, output=output, dims=dims, offsets=offsets
