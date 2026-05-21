@@ -352,6 +352,16 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     return torch.eq(input, zero)
 
 
+@register_spyre_decomposition([torch.ops.aten.sign.default])
+def spyre_sign(input: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros_like(input)
+    return torch.where(
+        torch.gt(input, zero),
+        torch.ones_like(input),
+        torch.where(torch.lt(input, zero), -torch.ones_like(input), zero),
+    )
+
+
 @register_spyre_decomposition([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
 def addmm_decomp(
     input: torch.Tensor,
@@ -658,6 +668,13 @@ def decompose_cat(
         return orig_decomp
 
 
+@register_spyre_decomposition([torch.ops.aten.ceil.default])
+def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aten.neg.default(
+        torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
+    )
+
+
 @register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
 def pad_decomp(
     input: torch.Tensor,
@@ -735,6 +752,26 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
                 torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
             )
         )
+
+
+@register_spyre_decomposition([torch.ops.aten.sub.Tensor])
+def sub_with_alpha(
+    self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1
+) -> torch.Tensor:
+    """
+    Decompose torch.sub(a, b, alpha=alpha) into separate mul and sub operations.
+
+    The Spyre backend does not have a single operation for a - alpha * b.
+    When alpha != 1, we decompose into: a - (alpha * b)
+    This ensures the operations are not fused by Inductor's optimization passes.
+    """
+    if alpha == 1:
+        # Simple subtraction without alpha - use default behavior
+        return NotImplemented
+    else:
+        # Decompose: sub(a, b, alpha) = sub(a, mul(b, alpha))
+        scaled_other = torch.mul(other, alpha)
+        return torch.sub(self, scaled_other)
 
 
 ###############################################################################################
