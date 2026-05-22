@@ -189,9 +189,11 @@ def adjust_it_space_for_sticks(
 
     The original it_space is not mutated.
     """
-    # Pass 1: find the largest elems_per_stick per stick variable.
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
+    # allocated_sticks[var] collects (stick_count, elems_per_stick) pairs from
+    # tensors that have a zero-offset stick-count dim (i.e. not a parent view).
+    allocated_sticks: dict[Symbol, list[tuple[int, int]]] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -202,15 +204,30 @@ def adjust_it_space_for_sticks(
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
+        device_size = td.layout.device_layout.device_size
+        for dim_idx, coord in enumerate(td.device_coords[:-1]):
+            if stick_var in coord.free_symbols:
+                # Only count zero-offset stick-count dims. A non-zero offset
+                # means this tensor is a view into a parent buffer; its
+                # device_size reflects the parent, not this op's allocation.
+                if coord.subs(stick_var, 0) == 0:
+                    allocated_sticks.setdefault(stick_var, []).append(
+                        (device_size[dim_idx], elems_per_stick)
+                    )
+                break
 
-    # Pass 2: adjust each variable once using the maximum.
     for stick_var, elems_per_stick in max_elems.items():
-        # FIXME: here we assume padding to a full stick. It may not always be
-        #        the case and we should use a more robust way of computing the
-        #        number of sticks
-        adjusted_space[stick_var] = (
-            adjusted_space[stick_var] + elems_per_stick - 1
-        ) // elems_per_stick
+        it_elems = concretize_expr(adjusted_space[stick_var])
+        min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
+        # Convert each candidate's stick count to max_elems units, then take the
+        # smallest that is >= min_sticks. Converting units handles dtype mismatches
+        # (e.g. fp32 output sticks must be expressed as fp16 stick equivalents).
+        candidates = [
+            (n * eps + elems_per_stick - 1) // elems_per_stick
+            for n, eps in allocated_sticks.get(stick_var, [])
+            if (n * eps + elems_per_stick - 1) // elems_per_stick >= min_sticks
+        ]
+        adjusted_space[stick_var] = min(candidates) if candidates else min_sticks
 
     return adjusted_space, max_elems
 
