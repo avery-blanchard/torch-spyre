@@ -284,11 +284,16 @@ def _get_padded_iteration_space(
         sm = op_spec_arg.stride_map
         for i, coord in enumerate(op_spec_arg.device_coordinates[:-1]):
             if stick_sym in coord.free_symbols:
-                # stride_map[i+1] != 1 means a row dim exists between the
-                # stick-count and within-stick dims: a genuine beyond-nearest-
-                # stick allocation. stride_map[i+1] == 1 means this dim spans
-                # the flat host index (possibly a parent-buffer view).
-                if sm is not None and i + 1 < len(sm) and sm[i + 1] != 1:
+                # device_size[i] * stride_map[i] != stride_map[i+1] means the
+                # allocated sticks exceed what the row stride implies — a genuine
+                # beyond-nearest-stick allocation. When they are equal the sticks
+                # exactly tile the row (normal allocation or parent-buffer view).
+                if (
+                    sm is not None
+                    and i + 1 < len(sm)
+                    and sm[i + 1] not in (-1, 1)
+                    and op_spec_arg.device_size[i] * sm[i] != sm[i + 1]
+                ):
                     allocated_sticks.setdefault(stick_sym, []).append(
                         (op_spec_arg.device_size[i], stick_size)
                     )
