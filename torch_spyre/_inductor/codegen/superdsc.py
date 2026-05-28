@@ -284,19 +284,19 @@ def _get_padded_iteration_space(
         sm = op_spec_arg.stride_map
         for i, coord in enumerate(op_spec_arg.device_coordinates[:-1]):
             if stick_sym in coord.free_symbols:
-                # device_size[i] * stride_map[i] != stride_map[i+1] means the
-                # allocated sticks exceed what the row stride implies — a genuine
-                # beyond-nearest-stick allocation. When they are equal the sticks
-                # exactly tile the row (normal allocation or parent-buffer view).
-                if (
-                    sm is not None
-                    and i + 1 < len(sm)
-                    and sm[i + 1] not in (-1, 1)
-                    and op_spec_arg.device_size[i] * sm[i] != sm[i + 1]
-                ):
-                    allocated_sticks.setdefault(stick_sym, []).append(
-                        (op_spec_arg.device_size[i], stick_size)
-                    )
+                # A genuine beyond-nearest-stick allocation has
+                # device_size[i] * stride_map[i] != the nearest non-(-1) row
+                # stride. Check stride_map[i-1] first, then stride_map[i+1].
+                adj = None
+                if sm is not None:
+                    for j in [i - 1, i + 1]:
+                        if 0 <= j < len(sm) and sm[j] not in (-1, 1):
+                            adj = sm[j]
+                            break
+                    if adj is not None and op_spec_arg.device_size[i] * sm[i] != adj:
+                        allocated_sticks.setdefault(stick_sym, []).append(
+                            (op_spec_arg.device_size[i], stick_size)
+                        )
                 break
 
     padding: dict = {}
