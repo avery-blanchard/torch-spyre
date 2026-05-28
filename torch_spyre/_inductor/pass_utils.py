@@ -181,27 +181,6 @@ def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Exp
     return coords
 
 
-def padded_stick_count(
-    device_coords: list,
-    device_size: list[int],
-    stride_map: list[int],
-    stick_sym,
-) -> int | None:
-    """Return number of stick if dimension is padded beyond nearest
-    multiple of the stick size.
-    """
-    for i, coord in enumerate(device_coords[:-1]):
-        if stick_sym not in coord.free_symbols:
-            continue
-        for j in [i - 1, i + 1]:
-            if 0 <= j < len(stride_map) and stride_map[j] not in (-1, 1):
-                if device_size[i] * stride_map[i] != stride_map[j]:
-                    return device_size[i]
-                break
-        break
-    return None
-
-
 def iter_var_id(stick_expr) -> int:
     """Iteration variable index from a stick expr: Mod(d2,64) -> 2, d2 -> 2.
     Returns -1 for constant-zero (scalar/broadcast, no real stick).

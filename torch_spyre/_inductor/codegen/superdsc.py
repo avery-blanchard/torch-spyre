@@ -32,7 +32,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
-from torch_spyre._inductor.pass_utils import padded_stick_count
+from torch_spyre._inductor.views import padded_stick_count
 
 from .compute_ops import SymbolKind, generate_sdsc
 

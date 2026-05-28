@@ -646,3 +646,27 @@ def align_tensors(
     }
 
     return new_iteration_space, new_tensors
+
+
+def padded_stick_count(
+    device_coords: list,
+    device_size: list[int],
+    stride_map: list[int],
+    stick_sym,
+) -> int | None:
+    """Return the allocated stick count if the tensor has a beyond-nearest-stick
+    outer dim for stick_sym, otherwise None.
+
+    A beyond-nearest-stick dim has device_size[i] * stride_map[i] != the
+    nearest non-(-1) adjacent stride in stride_map.
+    """
+    for i, coord in enumerate(device_coords[:-1]):
+        if stick_sym not in coord.free_symbols:
+            continue
+        for j in [i - 1, i + 1]:
+            if 0 <= j < len(stride_map) and stride_map[j] not in (-1, 1):
+                if device_size[i] * stride_map[i] != stride_map[j]:
+                    return device_size[i]
+                break
+        break
+    return None

@@ -42,10 +42,10 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
-    padded_stick_count,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
 )
+from .views import padded_stick_count
 from typing import Callable
 
 from .logging_utils import get_inductor_logger
