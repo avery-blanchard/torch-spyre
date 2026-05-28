@@ -210,11 +210,12 @@ def adjust_it_space_for_sticks(
         device_size = td.layout.device_layout.device_size
         for dim_idx, coord in enumerate(td.device_coords[:-1]):
             if stick_var in coord.free_symbols:
-                if (
-                    dim_idx + 1 < len(sm)
-                    and sm[dim_idx + 1] not in (-1, 1)
-                    and device_size[dim_idx] * sm[dim_idx] != sm[dim_idx + 1]
-                ):
+                adj = None
+                for j in [dim_idx - 1, dim_idx + 1]:
+                    if 0 <= j < len(sm) and sm[j] not in (-1, 1):
+                        adj = sm[j]
+                        break
+                if adj is not None and device_size[dim_idx] * sm[dim_idx] != adj:
                     allocated_sticks.setdefault(stick_var, []).append(
                         (device_size[dim_idx], elems_per_stick)
                     )
