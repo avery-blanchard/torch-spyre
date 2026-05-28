@@ -21,7 +21,6 @@ from sympy import Integer, Symbol, Expr, Mod, floor
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
-    IDENTITY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
     LAYOUT_LABELS,
@@ -298,11 +297,15 @@ def _get_padded_iteration_space(
         stick_dim = stick_dims[stick_sym]
         it_elems = sdsc_iteration_space[stick_dim]
         min_sticks = (it_elems + stick_size - 1) // stick_size
-        # Convert each candidate to max stick_size units before comparing.
+        # The maximum valid allocated stick count is min_sticks scaled by the
+        # largest dtype ratio (max_stick_size / stick_size). This bounds genuine
+        # beyond-nearest-stick allocations and filters parent buffer views whose
+        # device_size can be arbitrarily larger.
+        max_valid = min_sticks * max_stick_size[stick_sym] // stick_size
         candidates = [
             (n * eps + stick_size - 1) // stick_size
             for n, eps in allocated_sticks.get(stick_sym, [])
-            if (n * eps + stick_size - 1) // stick_size >= min_sticks
+            if min_sticks <= (n * eps + stick_size - 1) // stick_size <= max_valid
         ]
         target = (min(candidates) if candidates else min_sticks) * stick_size
         if target > it_elems:
