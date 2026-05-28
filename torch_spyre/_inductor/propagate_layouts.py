@@ -150,20 +150,24 @@ def _single_arg_op_layout(
 
         case prims.convert_element_type.default:
             # Propagate the input's device layout to the output, scaling the
-            # stick-count output dtype.
+            # stick-count and within-stick dims for the output dtype.
+            # This preserves beyond-nearest-stick allocations across dtype
+            # conversions (e.g. fp16 -> fp32).
             in_eps = get_elem_in_stick(in_layout.dtype)
             out_eps = get_elem_in_stick(output.dtype)
             out_device_size = list(stl.device_size)
-            # Scale the stick-count dim (stride_map entry == in_eps) and
-            # replace the within-stick dim size.
+            out_stride_map = list(stl.stride_map)
+            # Identify the stick-count dim by stride_map[i] == in_eps and
+            # scale both device_size and stride_map for the output dtype.
+            out_device_size[-1] = out_eps
             for i, s in enumerate(stl.stride_map):
                 if s == in_eps:
                     out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+                    out_stride_map[i] = out_eps
                     break
-            out_device_size[-1] = out_eps
             return SpyreTensorLayout(
                 out_device_size,
-                list(stl.stride_map),
+                out_stride_map,
                 get_device_dtype(output.dtype),
             )
 
