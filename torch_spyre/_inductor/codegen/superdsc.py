@@ -31,8 +31,8 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import OpSpec
-from torch_spyre._inductor.op_spec import TensorArg
+from torch_spyre._inductor.op_spec import OpSpec, TensorArg
+from torch_spyre._inductor.pass_utils import padded_stick_count
 
 from .compute_ops import SymbolKind, generate_sdsc
 
@@ -260,13 +260,11 @@ def _get_padded_iteration_space(
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
 ) -> dict:
-    """Extend/align sdsc_iteration_space for each arg's stick dim.
-
-    Must run before _create_sdsc_tensors so backGap is computed against the
-    final iteration space.  Returns a mapping of dim -> padding added.
     """
-    # Collect candidate (stick_count, elems_per_stick) pairs per stick symbol,
-    # and the maximum elems_per_stick per symbol for unit conversion.
+    Compute padding per dim when device size exceeds iteration space.
+
+    Returns a mapping of dim -> padding amount
+    """
     allocated_sticks: dict = {}
     max_stick_size: dict = {}
     stick_dims: dict = {}
@@ -282,23 +280,15 @@ def _get_padded_iteration_space(
         if stick_sym not in max_stick_size or stick_size > max_stick_size[stick_sym]:
             max_stick_size[stick_sym] = stick_size
         stick_dims[stick_sym] = stick_dim
-        sm = op_spec_arg.stride_map
-        for i, coord in enumerate(op_spec_arg.device_coordinates[:-1]):
-            if stick_sym in coord.free_symbols:
-                # A genuine beyond-nearest-stick allocation has
-                # device_size[i] * stride_map[i] != the nearest non-(-1) row
-                # stride. Check stride_map[i-1] first, then stride_map[i+1].
-                adj = None
-                if sm is not None:
-                    for j in [i - 1, i + 1]:
-                        if 0 <= j < len(sm) and sm[j] not in (-1, 1):
-                            adj = sm[j]
-                            break
-                    if adj is not None and op_spec_arg.device_size[i] * sm[i] != adj:
-                        allocated_sticks.setdefault(stick_sym, []).append(
-                            (op_spec_arg.device_size[i], stick_size)
-                        )
-                break
+        if op_spec_arg.stride_map is not None:
+            n = padded_stick_count(
+                op_spec_arg.device_coordinates,
+                op_spec_arg.device_size,
+                op_spec_arg.stride_map,
+                stick_sym,
+            )
+            if n is not None:
+                allocated_sticks.setdefault(stick_sym, []).append((n, stick_size))
 
     padding: dict = {}
     for stick_sym, stick_size in max_stick_size.items():
@@ -546,9 +536,7 @@ def _extend_matmul_k_to_padded(
     k_current = sdsc_iteration_space[k_sym]
     k_padded = ((k_current + stick_size - 1) // stick_size) * stick_size
 
-    # Also extend K if y was allocated with more sticks than the minimum (beyond-
-    # nearest-stick padding). Locate the device dim whose coordinate is
-    # floor(k_sym/stick_size) to find the allocated K stick count.
+    # Also extend K if y was allocated with more sticks than the minimum.
     k_outer_coord = floor(k_sym / stick_size)
     k_stick_count_dim = next(
         (
@@ -614,7 +602,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Must run before _create_sdsc_tensors so backGap sees the final space.
     padding = _get_padded_iteration_space(
         list(op_spec.args), sdsc_iteration_space, symbol_mapping
     )
