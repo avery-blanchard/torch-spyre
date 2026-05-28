@@ -219,13 +219,15 @@ def adjust_it_space_for_sticks(
     for stick_var, elems_per_stick in max_elems.items():
         it_elems = concretize_expr(adjusted_space[stick_var])
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
-        # Convert each candidate's stick count to max_elems units, then take the
-        # smallest that is >= min_sticks. Converting units handles dtype mismatches
-        # (e.g. fp32 output sticks must be expressed as fp16 stick equivalents).
+        # Cap at min_sticks * dtype_ratio to filter parent buffer views whose
+        # device_size can be arbitrarily larger than the op's working extent.
+        max_valid = min_sticks * max_elems[stick_var] // elems_per_stick
         candidates = [
             (n * eps + elems_per_stick - 1) // elems_per_stick
             for n, eps in allocated_sticks.get(stick_var, [])
-            if (n * eps + elems_per_stick - 1) // elems_per_stick >= min_sticks
+            if min_sticks
+            <= (n * eps + elems_per_stick - 1) // elems_per_stick
+            <= max_valid
         ]
         adjusted_space[stick_var] = min(candidates) if candidates else min_sticks
 
