@@ -191,8 +191,10 @@ def adjust_it_space_for_sticks(
     """
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
-    # allocated_sticks[var] collects (stick_count, elems_per_stick) pairs from
-    # tensors that have a zero-offset stick-count dim (i.e. not a parent view).
+    # (stick_count, elems_per_stick) pairs keyed by stick variable, collected
+    # from tensors with a beyond-nearest-stick outer dim. The stride_map check
+    # (stride_map[i+1] != 1) distinguishes genuine beyond-nearest-stick
+    # allocations from flat parent buffer views.
     allocated_sticks: dict[Symbol, list[tuple[int, int]]] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
@@ -204,13 +206,11 @@ def adjust_it_space_for_sticks(
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
+        sm = td.layout.device_layout.stride_map
         device_size = td.layout.device_layout.device_size
         for dim_idx, coord in enumerate(td.device_coords[:-1]):
             if stick_var in coord.free_symbols:
-                # Only count zero-offset stick-count dims. A non-zero offset
-                # means this tensor is a view into a parent buffer; its
-                # device_size reflects the parent, not this op's allocation.
-                if coord.subs(stick_var, 0) == 0:
+                if dim_idx + 1 < len(sm) and sm[dim_idx + 1] != 1:
                     allocated_sticks.setdefault(stick_var, []).append(
                         (device_size[dim_idx], elems_per_stick)
                     )
@@ -219,15 +219,11 @@ def adjust_it_space_for_sticks(
     for stick_var, elems_per_stick in max_elems.items():
         it_elems = concretize_expr(adjusted_space[stick_var])
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
-        # Cap at min_sticks * dtype_ratio to filter parent buffer views whose
-        # device_size can be arbitrarily larger than the op's working extent.
-        max_valid = min_sticks * max_elems[stick_var] // elems_per_stick
+        # Convert candidates to max_elems units to handle dtype mismatches.
         candidates = [
             (n * eps + elems_per_stick - 1) // elems_per_stick
             for n, eps in allocated_sticks.get(stick_var, [])
-            if min_sticks
-            <= (n * eps + elems_per_stick - 1) // elems_per_stick
-            <= max_valid
+            if (n * eps + elems_per_stick - 1) // elems_per_stick >= min_sticks
         ]
         adjusted_space[stick_var] = min(candidates) if candidates else min_sticks
 
