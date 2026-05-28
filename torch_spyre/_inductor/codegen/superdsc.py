@@ -281,12 +281,14 @@ def _get_padded_iteration_space(
         if stick_sym not in max_stick_size or stick_size > max_stick_size[stick_sym]:
             max_stick_size[stick_sym] = stick_size
         stick_dims[stick_sym] = stick_dim
+        sm = op_spec_arg.stride_map
         for i, coord in enumerate(op_spec_arg.device_coordinates[:-1]):
             if stick_sym in coord.free_symbols:
-                # Only count zero-offset stick-count dims. A non-zero offset
-                # means this tensor is a view into a parent buffer; its
-                # device_size reflects the parent, not this op's allocation.
-                if coord.subs(stick_sym, 0) == 0 and not op_spec_arg.is_input:
+                # stride_map[i+1] != 1 means a row dim exists between the
+                # stick-count and within-stick dims: a genuine beyond-nearest-
+                # stick allocation. stride_map[i+1] == 1 means this dim spans
+                # the flat host index (possibly a parent-buffer view).
+                if sm is not None and i + 1 < len(sm) and sm[i + 1] != 1:
                     allocated_sticks.setdefault(stick_sym, []).append(
                         (op_spec_arg.device_size[i], stick_size)
                     )
@@ -297,15 +299,10 @@ def _get_padded_iteration_space(
         stick_dim = stick_dims[stick_sym]
         it_elems = sdsc_iteration_space[stick_dim]
         min_sticks = (it_elems + stick_size - 1) // stick_size
-        # The maximum valid allocated stick count is min_sticks scaled by the
-        # largest dtype ratio (max_stick_size / stick_size). This bounds genuine
-        # beyond-nearest-stick allocations and filters parent buffer views whose
-        # device_size can be arbitrarily larger.
-        max_valid = min_sticks * max_stick_size[stick_sym] // stick_size
         candidates = [
             (n * eps + stick_size - 1) // stick_size
             for n, eps in allocated_sticks.get(stick_sym, [])
-            if min_sticks <= (n * eps + stick_size - 1) // stick_size <= max_valid
+            if (n * eps + stick_size - 1) // stick_size >= min_sticks
         ]
         target = (min(candidates) if candidates else min_sticks) * stick_size
         if target > it_elems:
