@@ -260,16 +260,17 @@ def _get_padded_iteration_space(
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
 ) -> dict:
-    """
-    Compute padding per dim when device size exceeds iteration space.
+    """Extend sdsc_iteration_space to match each arg's device allocation.
 
-    Returns a mapping of dim -> padding amount
+    Must run before _create_sdsc_tensors so backGap is computed against the
+    final iteration space.  Returns a mapping of dim -> padding added.
     """
-    allocated_sticks: dict = {}
-    max_stick_size: dict = {}
+    max_elems_per_stick: dict = {}
     stick_dims: dict = {}
+    # (device_stick_count, elems_per_stick) keyed by stick symbol.
+    device_stick_counts: dict = {}
     for op_spec_arg in op_spec_args:
-        stick_size = op_spec_arg.device_dtype.elems_per_stick()
+        elems_per_stick = op_spec_arg.device_dtype.elems_per_stick()
         orig_syms = op_spec_arg.device_coordinates[-1].free_symbols
         if len(orig_syms) != 1:
             continue
@@ -277,30 +278,39 @@ def _get_padded_iteration_space(
         stick_dim = symbol_mapping.get(stick_sym)
         if stick_dim is None or stick_dim not in sdsc_iteration_space:
             continue
-        if stick_sym not in max_stick_size or stick_size > max_stick_size[stick_sym]:
-            max_stick_size[stick_sym] = stick_size
+        if (
+            stick_sym not in max_elems_per_stick
+            or elems_per_stick > max_elems_per_stick[stick_sym]
+        ):
+            max_elems_per_stick[stick_sym] = elems_per_stick
         stick_dims[stick_sym] = stick_dim
         if op_spec_arg.stride_map is not None:
-            n = padded_stick_count(
+            device_stick_count = padded_stick_count(
                 op_spec_arg.device_coordinates,
                 op_spec_arg.device_size,
                 op_spec_arg.stride_map,
                 stick_sym,
             )
-            if n is not None:
-                allocated_sticks.setdefault(stick_sym, []).append((n, stick_size))
+            if device_stick_count is not None:
+                device_stick_counts.setdefault(stick_sym, []).append(
+                    (device_stick_count, elems_per_stick)
+                )
 
     padding: dict = {}
-    for stick_sym, stick_size in max_stick_size.items():
+    for stick_sym, elems_per_stick in max_elems_per_stick.items():
         stick_dim = stick_dims[stick_sym]
         it_elems = sdsc_iteration_space[stick_dim]
-        min_sticks = (it_elems + stick_size - 1) // stick_size
-        candidates = [
-            (n * eps + stick_size - 1) // stick_size
-            for n, eps in allocated_sticks.get(stick_sym, [])
-            if (n * eps + stick_size - 1) // stick_size >= min_sticks
-        ]
-        target = (min(candidates) if candidates else min_sticks) * stick_size
+        min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
+        # Use the smallest device stick count that covers min_sticks, converting
+        # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
+        result = min_sticks
+        for dev_sticks, dev_elems_per_stick in device_stick_counts.get(stick_sym, []):
+            in_max_units = (
+                dev_sticks * dev_elems_per_stick + elems_per_stick - 1
+            ) // elems_per_stick
+            if min_sticks <= in_max_units < result:
+                result = in_max_units
+        target = result * elems_per_stick
         if target > it_elems:
             padding[stick_dim] = target - it_elems
             sdsc_iteration_space[stick_dim] = target

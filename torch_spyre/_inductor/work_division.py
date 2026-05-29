@@ -192,7 +192,8 @@ def adjust_it_space_for_sticks(
     """
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
-    allocated_sticks: dict[Symbol, list[tuple[int, int]]] = {}
+    # (device_stick_count, elems_per_stick) keyed by stick variable.
+    device_stick_counts: dict[Symbol, list[tuple[int, int]]] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -203,25 +204,30 @@ def adjust_it_space_for_sticks(
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
-        n = padded_stick_count(
+        device_stick_count = padded_stick_count(
             td.device_coords,
             td.layout.device_layout.device_size,
             td.layout.device_layout.stride_map,
             stick_var,
         )
-        if n is not None:
-            allocated_sticks.setdefault(stick_var, []).append((n, elems_per_stick))
+        if device_stick_count is not None:
+            device_stick_counts.setdefault(stick_var, []).append(
+                (device_stick_count, elems_per_stick)
+            )
 
     for stick_var, elems_per_stick in max_elems.items():
         it_elems = concretize_expr(adjusted_space[stick_var])
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
-        # Convert candidates to max_elems units to handle dtype mismatches.
-        candidates = [
-            (n * eps + elems_per_stick - 1) // elems_per_stick
-            for n, eps in allocated_sticks.get(stick_var, [])
-            if (n * eps + elems_per_stick - 1) // elems_per_stick >= min_sticks
-        ]
-        adjusted_space[stick_var] = min(candidates) if candidates else min_sticks
+        # Use the smallest device stick count that covers min_sticks, converting
+        # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
+        result = min_sticks
+        for dev_sticks, dev_elems_per_stick in device_stick_counts.get(stick_var, []):
+            in_max_units = (
+                dev_sticks * dev_elems_per_stick + elems_per_stick - 1
+            ) // elems_per_stick
+            if min_sticks <= in_max_units < result:
+                result = in_max_units
+        adjusted_space[stick_var] = result
 
     return adjusted_space, max_elems
 
