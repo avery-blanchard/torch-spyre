@@ -323,6 +323,7 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
+    work_slices: dict | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
@@ -365,6 +366,10 @@ def _create_sdsc_tensors(
 
             dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
+            # LX buffers are per-core: compare against the per-core slice size.
+            is_lx = "lx" in arg.allocation
+            if is_lx and work_slices and dim in work_slices and work_slices[dim] > 1:
+                it_dim_size = it_dim_size // work_slices[dim]
             if dim == stick_dim:
                 stick_size = arg.device_dtype.elems_per_stick()
                 dev_dim_size *= stick_size
@@ -574,6 +579,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space,
         op_dim_order,
         op_stick_dim,
+        work_slices=work_slices,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices
