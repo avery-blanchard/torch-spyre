@@ -397,7 +397,9 @@ def _create_sdsc_tensors(
                 data_format=arg_data_format,
                 scales=scales,
                 strides=strides,
-                offsets=offsets,
+                offsets=offsets
+                if "lx" not in arg.allocation
+                else {},  # TODO: handle lx offsets
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
                 start_address=arg.allocation.get("pool")
@@ -405,7 +407,9 @@ def _create_sdsc_tensors(
                 else arg.allocation.get("lx")
                 if "lx" in arg.allocation
                 else arg.allocation.get("hbm"),
-                backGap=backGap,
+                backGap=backGap
+                if "lx" not in arg.allocation
+                else {},  # TODO: handle lx backgaps
             )
         )
 
