@@ -336,7 +336,13 @@ def generate_sdsc(
             if "lx" in tensor.allocation:
                 # Mirrors the use_symbols=True branch above.
                 return {
-                    f"[{c}, 0, 0]": str(tensor.start_address)
+                    f"[{c}, 0, 0]": str(
+                        tensor.start_address
+                        + core_idx_to_slice_offset(
+                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                        )
+                        * num_bytes(tensor.data_format)
+                    )
                     for c in range(sdsc_spec.num_cores)
                 }
             return {
@@ -465,9 +471,18 @@ def generate_sdsc(
                                     **(
                                         {
                                             "backGapCore_": {
-                                                str(dim): {
-                                                    "-1": str(gap)  # HBM is -1
-                                                }
+                                                str(dim): (
+                                                    # LX: per-core keys 0..num_cores-1
+                                                    {
+                                                        str(c): str(gap)
+                                                        for c in range(
+                                                            sdsc_spec.num_cores
+                                                        )
+                                                    }
+                                                    if "lx" in tensor.allocation
+                                                    # HBM: -1 sentinel covers all cores
+                                                    else {"-1": str(gap)}
+                                                )
                                                 for dim, gap in tensor.backGap.items()
                                             }
                                         }
