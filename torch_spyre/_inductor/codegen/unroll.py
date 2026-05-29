@@ -70,6 +70,8 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
     sub_range = {**sub_zero, tiled_sym: tile_range}
     total_elem_stride = 0
     for d, coord_expr in enumerate(arg.device_coordinates):
+        if arg.stride_map[d] == -1:
+            continue
         at_range = int(coord_expr.subs(sub_range))
         at_zero = int(coord_expr.subs(sub_zero))
         total_elem_stride += (at_range - at_zero) * arg.stride_map[d]
@@ -116,6 +118,8 @@ def _tile_device_size(
         tile_range = int(iteration_space[tiled_sym][0])
         sub_range = {**sub_zero, tiled_sym: tile_range}
         for d, coord_expr in enumerate(arg.device_coordinates):
+            if arg.stride_map[d] == -1:
+                continue
             at_range = int(coord_expr.subs(sub_range))
             at_zero = int(coord_expr.subs(sub_zero))
             delta = at_range - at_zero

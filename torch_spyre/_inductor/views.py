@@ -245,9 +245,10 @@ def normalize_coordinates(
         offset = expr.xreplace({var: sympy.S.Zero for var in vars})
 
         if len(vars) == 0:
-            if dim_size > 1 and dim_idx != len(size) - 1:
-                # A non-stick dimension with no variables but size > 1 indicates an elided
-                # dimension with offset/gap. Create a new variable to restore this dimension.
+            if dim_size > 1 and dim_idx != len(size) - 1 and offset != sympy.S.Zero:
+                # A non-stick dimension with no variables, size > 1, and a non-zero
+                # constant coordinate indicates an elided dimension with offset/gap.
+                # Create a new variable to restore this dimension.
                 var = create_var_fn()
                 var_ranges[var] = 1
                 num = den = mod = sympy.S.One
@@ -511,11 +512,15 @@ def align_tensors(
             # if no candidate outer stick dim, add 1 to desired rank
             rank = max(rank, len(t["size"]) + not_found)
 
-    # extend each tensor to desired rank with outer dims of size 1
+    # extend each tensor to desired rank with outer dims of size 1.
+    # Prepend -1 sentinels to stride_map for padding dims that have no real
+    # layout entry; unroll.py skips stride_map entries with value -1.
     for t in new_tensors:
         gap = rank - len(t["size"])
         t["size"] = [sympy.S.One] * gap + t["size"]
         t["coordinates"] = [sympy.S.Zero] * gap + t["coordinates"]
+        if t.get("stride_map") is not None:
+            t["stride_map"] = [-1] * gap + t["stride_map"]
 
     # ensure stick dim var occurs twice if it occurs once using a dim of size 1
     for t in new_tensors:

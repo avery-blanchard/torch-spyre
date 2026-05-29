@@ -777,6 +777,9 @@ def simplify_op_spec(op_spec):
             {
                 "size": arg.device_size,
                 "coordinates": arg.device_coordinates,
+                "stride_map": list(arg.stride_map)
+                if arg.stride_map is not None
+                else None,
             }
             for arg in op_spec.args
         ],
@@ -785,3 +788,5 @@ def simplify_op_spec(op_spec):
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
+        if t.get("stride_map") is not None:
+            arg.stride_map = t["stride_map"]
