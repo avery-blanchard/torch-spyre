@@ -354,6 +354,130 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
 }
 
 /*
+ * Compute output_dimwise_ea_ entries for an FP8_MULTI_DIM_STICK layout.
+ *
+ * For each host dimension i, collect the device dimensions that map to it
+ * (those whose stride_map value falls in the host stride range for dim i),
+ * then derive subElems_, subStride_, cumElemsBefore_, and cumOffset_ from
+ * their device sizes and cumulative contiguous strides.
+ *
+ * The stride_map values are in PyTorch (outermost-first) order here, matching
+ * device_size.  The returned vector is also outermost-first (one entry per host
+ * dimension), so callers must reverse it to innermost-first before storing in
+ * output_dimwise_ea_.
+ */
+auto generate_fp8_multidim_ea(const SpyreTensorLayout& stl, int host_rank)
+    -> std::vector<perdim_element_arrangement> {
+  const int device_rank = static_cast<int>(stl.device_size.size());
+
+  // Contiguous device strides (outermost-first, matching device_size order).
+  std::vector<int64_t> dev_contiguous_strides(device_rank, 1);
+  for (int i = device_rank - 2; i >= 0; --i) {
+    dev_contiguous_strides[i] =
+        dev_contiguous_strides[i + 1] * stl.device_size[i + 1];
+  }
+
+  // Sort the device dimensions by stride_map value descending so we can assign
+  // each device dim to the host dim whose stride range it falls into.
+  // host_stride[i] = product of host sizes from dim i+1 onward (contiguous).
+  // We reconstruct host strides from stride_map: sort unique stride_map values.
+  std::vector<std::pair<int64_t, int>> sm_indexed;  // (stride_map_val, dev_idx)
+  for (int d = 0; d < device_rank; ++d) {
+    if (stl.stride_map[d] > 0) {
+      sm_indexed.emplace_back(stl.stride_map[d], d);
+    }
+  }
+  // Sort descending by stride_map (outermost device dims first).
+  std::sort(sm_indexed.begin(), sm_indexed.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+
+  // Group device dims into host_rank buckets.  The first bucket (highest
+  // stride) gets min(host_rank, ...) outermost dims.  Heuristic: device dims
+  // are bucketed so that the number assigned per host dim reflects the 2D-stick
+  // structure: the innermost host dim owns the stick device dims (last 2), all
+  // others get one device dim each.
+  //
+  // Simple rule: assign greedily — each host dim gets the next device dim(s)
+  // until the stride_map value drops below the host's "stride boundary".
+  // The host stride boundary for host dim i is stride_map of the last device
+  // dim assigned to host dim i-1 (or +inf for i=0).
+
+  // Build result: one entry per host dim (outermost-first).
+  std::vector<perdim_element_arrangement> result(host_rank);
+
+  // Compute host sizes from stride_map: for each host dim, dimShape_ is the
+  // quotient of consecutive stride_map boundaries.
+  // Collect unique stride_map values (descending) to derive host sizes.
+  std::vector<int64_t> host_boundaries;
+  for (const auto& [sm_val, _] : sm_indexed) {
+    if (host_boundaries.empty() || host_boundaries.back() != sm_val) {
+      host_boundaries.push_back(sm_val);
+    }
+  }
+
+  // Build a mapping: stride_map_value -> list of dev indices (for that host
+  // dim) Strategy: group by proximity — each unique host-stride-range gets a
+  // bucket. The number of distinct buckets == host_rank.
+  //
+  // We group consecutive sm_indexed entries into host_rank groups of sizes
+  // that split the device dims evenly, with the innermost (last) host dim
+  // getting more device dims when there is a 2D stick (the extra stick dim).
+  int extra = static_cast<int>(sm_indexed.size()) - host_rank;  // >= 0
+
+  std::vector<std::vector<int>> host_dev_groups(host_rank);
+  int si = 0;
+  for (int h = 0; h < host_rank; ++h) {
+    // Innermost host dim (last) absorbs the extra device dims (the 2D stick).
+    int count = 1 + (h == host_rank - 1 ? extra : 0);
+    for (int k = 0; k < count && si < static_cast<int>(sm_indexed.size());
+         ++k, ++si) {
+      host_dev_groups[h].push_back(sm_indexed[si].second);
+    }
+  }
+
+  for (int h = 0; h < host_rank; ++h) {
+    const auto& dev_dims = host_dev_groups[h];
+    perdim_element_arrangement ea{};
+
+    // dimShape_ = product of device sizes for this host dim.
+    int64_t dim_shape = 1;
+    for (int d : dev_dims) dim_shape *= stl.device_size[d];
+    ea.dimShape_ = dim_shape;
+
+    // subElems_: each device dim contributes its size.
+    // subStride_: contiguous device stride for each device dim.
+    // cumElemsBefore_ and cumOffset_: bookkeeping for the DCI engine.
+    //   cumElemsBefore_[j] = product of device sizes of dims after j (within
+    //   this group), used as a stride multiplier.
+    //   cumOffset_[j] = contiguous device stride of dim j.
+    for (int idx = 0; idx < static_cast<int>(dev_dims.size()); ++idx) {
+      int d = dev_dims[idx];
+      ea.subElems_.push_back(stl.device_size[d]);
+      ea.subStride_.push_back(dev_contiguous_strides[d]);
+    }
+
+    // cumElemsBefore_: cumulative product of device sizes *before* each
+    // position within this group (innermost-first within the group).
+    // First entry is always 1.
+    int64_t cum = 1;
+    ea.cumElemsBefore_.push_back(cum);
+    for (int idx = 0; idx < static_cast<int>(dev_dims.size()) - 1; ++idx) {
+      cum *= stl.device_size[dev_dims[idx]];
+      ea.cumElemsBefore_.push_back(cum);
+    }
+
+    // cumOffset_: contiguous device stride of each dim in the group.
+    for (int d : dev_dims) {
+      ea.cumOffset_.push_back(dev_contiguous_strides[d]);
+    }
+
+    result[h] = ea;
+  }
+
+  return result;
+}
+
+/*
  * Generate description of data conversion for a tensor.
  *
  * @param cpu_tensor: CPU-side tensor (source for H2D, destination for D2H)
@@ -418,6 +542,18 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
+
+  if (stl.element_arrangement == ElementArrangement::FP8_MULTI_DIM_STICK &&
+      !t_sizes.empty()) {
+    const int host_rank = static_cast<int>(t_sizes.size());
+    auto ea_outermost_first = generate_fp8_multidim_ea(stl, host_rank);
+    // output_dimwise_ea_ is innermost-first; reverse the outermost-first
+    // result.
+    std::vector<perdim_element_arrangement> ea_innermost_first(
+        ea_outermost_first.rbegin(), ea_outermost_first.rend());
+    dci.output_dimwise_ea_ = std::move(ea_innermost_first);
+  }
+
   if (g_debug_info_enabled) {
     std::stringstream s;
     dci.exportJson(s);
