@@ -225,12 +225,11 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
 
         if is_multidim_stick and is_stick:
             si, so = stick_size  # stick_inner=2, stick_outer=64
-            # stick_dim_order[0] is the outer (N/generated) dim,
-            # stick_dim_order[1] is the inner (K/reduction) dim.
-            is_outer = dim == stick_dim_order[0]
+            # stick_dim_order[0] is the inner (K/reduction) dim ("in"),
+            # stick_dim_order[1] is the outer (N/generated) dim ("out").
+            is_outer = dim == stick_dim_order[1]
             if is_outer:
-                # Outer stick dim covers N via stick_outer groups.
-                # size=so (elements per group), nsplits=N_total//so (one group per core).
+                # Outer stick dim (N/generated): elemArr=3, size=so, nsplits=N//so.
                 n_total = sdsc_spec.iteration_space[dim]
                 result[str(dim)] = gen_coord_info_value(
                     size=so,
@@ -240,8 +239,7 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
                     is_outer_stick_dim=True,
                 )
             else:
-                # Inner stick dim: standard elemArr=2 but with stick_inner
-                # instead of full elems_per_stick.
+                # Inner stick dim (K/reduction): elemArr=2 with stick_inner.
                 result[str(dim)] = gen_coord_info_value(
                     size=size,
                     nsplits=nsplits,
