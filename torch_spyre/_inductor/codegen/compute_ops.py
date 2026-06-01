@@ -225,11 +225,10 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
 
         if is_multidim_stick and is_stick:
             si, so = stick_size  # stick_inner=2, stick_outer=64
-            # stick_dim_order[0] is the inner (K/reduction) dim ("in"),
-            # stick_dim_order[1] is the outer (N/generated) dim ("out").
+            # stick_dim_order[0] is "in" (K), stick_dim_order[1] is "out" (N).
             is_outer = dim == stick_dim_order[1]
             if is_outer:
-                # Outer stick dim (N/generated): elemArr=3, size=so, nsplits=N//so.
+                # "out" (N): elemArr=3, size=so, nsplits=N//so.
                 n_total = sdsc_spec.iteration_space[dim]
                 result[str(dim)] = gen_coord_info_value(
                     size=so,
@@ -239,13 +238,14 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
                     is_outer_stick_dim=True,
                 )
             else:
-                # Inner stick dim (K/reduction): elemArr=2 with stick_inner.
+                # "in" (K): elemArr=2, size=K//si, nsplits=si.
+                k_total = sdsc_spec.iteration_space[dim]
                 result[str(dim)] = gen_coord_info_value(
-                    size=size,
-                    nsplits=nsplits,
+                    size=k_total // si,
+                    nsplits=si,
                     elems_per_stick=tensor.data_format.elems_per_stick(),
                     is_stick_dim=True,
-                    is_stick_reduction=(tensor.scales[dim] == -2),
+                    is_stick_reduction=False,
                     stick_inner=si,
                 )
         else:
