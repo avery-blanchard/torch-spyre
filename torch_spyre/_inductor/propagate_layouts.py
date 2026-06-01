@@ -370,9 +370,17 @@ def _matmul_layouts(
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
     )
-    y_req_stl = find_stick_compatible_input_layout(
-        y, generated_var, data.reduction_type, "y"
-    )
+    if data.reduction_type == BATCH_MATMUL_FP8_OP:
+        # The FP8 weight (y/Input1) uses a 2D-stick layout whose stride_map does
+        # not satisfy the standard single-stick contract assumed by
+        # find_stick_compatible_input_layout / device_coordinates.  The SDSC
+        # codegen handles it as a per-tile-fixed kernel tensor, so no stick
+        # compatibility check or restickify is needed here.
+        y_req_stl = next(iter(y.layouts))
+    else:
+        y_req_stl = find_stick_compatible_input_layout(
+            y, generated_var, data.reduction_type, "y"
+        )
 
     out_stick_dim = next(
         (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),

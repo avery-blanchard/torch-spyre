@@ -33,12 +33,13 @@ mat_b = torch.eye(K, N, dtype=torch.float16)
 # Quantize mat_b to FP8 on CPU, then upload with the FP8_MULTI_DIM_STICK layout.
 mat_b_fp8_cpu = mat_b.to(torch.float8_e4m3fn)
 
-# device_size and stride_map derived from the reference DCI for [4096, 1024]:
-#   device_size (outermost-first): [2, 64, K/2, N/16] = [2, 64, 2048, 16]
-#   stride_map  (outermost-first): [1, K, 2, K*N//2]  = [1, 4096, 2, 262144]
+# Standard 3D STL with FP8_MULTI_DIM_STICK: device_size=[N/128, K, 128],
+# stride_map=[128, K_stride, 1].  generate_dci expands this to the correct
+# 4D DMA transfer layout internally.
+eps = 128  # elems_per_stick for SEN143_FP8
 fp8_stl = SpyreTensorLayout(
-    [2, 64, 2048, 16],
-    [1, 4096, 2, 262144],
+    [N // eps, K, eps],
+    [eps, K, 1],
     DataFormats.SEN143_FP8,
     ElementArrangement.FP8_MULTI_DIM_STICK,
 )
