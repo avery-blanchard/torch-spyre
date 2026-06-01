@@ -39,7 +39,7 @@ mat_b_fp8_cpu = mat_b.to(torch.float8_e4m3fn)
 eps = 128  # elems_per_stick for SEN143_FP8
 fp8_stl = SpyreTensorLayout(
     [N // eps, K, eps],
-    [eps, K, 1],
+    [eps, N, 1],
     DataFormats.SEN143_FP8,
     ElementArrangement.FP8_MULTI_DIM_STICK,
 )

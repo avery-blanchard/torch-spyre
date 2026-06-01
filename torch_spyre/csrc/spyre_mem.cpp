@@ -489,6 +489,33 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
         generate_fp8_multidim_stick_dcsi(stl, host2device ? cpu_offset : 0)};
     dci.input_shape_ = host2device ? cpu_shape : expanded_dev_shape;
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
+
+    // output_dimwise_ea_: one entry per host dimension, outermost-first.
+    // Derived from the same STL parameters used for dcsi_.
+    const int64_t sm3 = K_sm * N / si / si;
+    const int64_t dst2 = si * so;
+
+    // K dimension (outermost host dim):
+    //   dimShape_=K, subElems_=[K], subStride_=[1],
+    //   cumElemsBefore_=[1, si], cumOffset_=[1, dst2]
+    perdim_element_arrangement ea_K;
+    ea_K.dimShape_ = K;
+    ea_K.subElems_ = {K};
+    ea_K.subStride_ = {1};
+    ea_K.cumElemsBefore_ = {1, si};
+    ea_K.cumOffset_ = {1, dst2};
+
+    // N dimension (innermost host dim):
+    //   dimShape_=N, subElems_=[so, si, N/eps], subStride_=[si, 1, dst2],
+    //   cumElemsBefore_=[1, so], cumOffset_=[si, sm3]
+    perdim_element_arrangement ea_N;
+    ea_N.dimShape_ = N;
+    ea_N.subElems_ = {so, si, N / eps};
+    ea_N.subStride_ = {si, 1, dst2};
+    ea_N.cumElemsBefore_ = {1, so};
+    ea_N.cumOffset_ = {si, sm3};
+
+    dci.output_dimwise_ea_ = {ea_K, ea_N};
   } else {
     // Reverse PyTorch ordering
     std::reverse(cpu_shape.begin(), cpu_shape.end());
