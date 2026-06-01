@@ -202,9 +202,10 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
     For standard layouts the stick is a single dimension with elems_per_stick
     elements (elemArr=2).  For multi-dimensional sticks (e.g. FP8 kernel with
     stick_size=[2, 64]) the two stick dimensions need different treatment:
-      - outer stick dim (stick_dim_order[0]): elemArr=3, size=stick_outer
-      - inner stick dim (stick_dim_order[1]): elemArr=2, stick_inner overrides
-        elems_per_stick
+      - outer stick dim (stick_dim_order[0], the N/generated dim): elemArr=3,
+        size=stick_outer, nsplits=N_total//stick_outer
+      - inner stick dim (stick_dim_order[1], the K/reduction dim): elemArr=2,
+        stick_inner overrides elems_per_stick
     """
     layout_info = sdsc_spec.layouts[tensor.layout]
     dim_order = layout_info["dim_order"]
@@ -224,16 +225,31 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
 
         if is_multidim_stick and is_stick:
             si, so = stick_size  # stick_inner=2, stick_outer=64
+            # stick_dim_order[0] is the outer (N/generated) dim,
+            # stick_dim_order[1] is the inner (K/reduction) dim.
             is_outer = dim == stick_dim_order[0]
-            result[str(dim)] = gen_coord_info_value(
-                size=size,
-                nsplits=nsplits,
-                elems_per_stick=tensor.data_format.elems_per_stick(),
-                is_stick_dim=not is_outer,
-                is_stick_reduction=(tensor.scales[dim] == -2),
-                stick_inner=si if not is_outer else 0,
-                is_outer_stick_dim=is_outer,
-            )
+            if is_outer:
+                # Outer stick dim covers N via stick_outer groups.
+                # size=so (elements per group), nsplits=N_total//so (one group per core).
+                n_total = sdsc_spec.iteration_space[dim]
+                result[str(dim)] = gen_coord_info_value(
+                    size=so,
+                    nsplits=n_total // so,
+                    elems_per_stick=tensor.data_format.elems_per_stick(),
+                    is_stick_dim=False,
+                    is_outer_stick_dim=True,
+                )
+            else:
+                # Inner stick dim: standard elemArr=2 but with stick_inner
+                # instead of full elems_per_stick.
+                result[str(dim)] = gen_coord_info_value(
+                    size=size,
+                    nsplits=nsplits,
+                    elems_per_stick=tensor.data_format.elems_per_stick(),
+                    is_stick_dim=True,
+                    is_stick_reduction=(tensor.scales[dim] == -2),
+                    stick_inner=si,
+                )
         else:
             result[str(dim)] = gen_coord_info_value(
                 size=size,
