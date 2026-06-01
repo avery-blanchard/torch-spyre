@@ -228,21 +228,20 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
             # stick_dim_order[0] is "in" (K), stick_dim_order[1] is "out" (N).
             is_outer = dim == stick_dim_order[1]
             if is_outer:
-                # "out" (N): elemArr=3, size=so, nsplits=N//so.
-                n_total = sdsc_spec.iteration_space[dim]
+                # "out" (N): elemArr=3, size=so, core_fold from work_slices.
                 result[str(dim)] = gen_coord_info_value(
                     size=so,
-                    nsplits=n_total // so,
+                    nsplits=nsplits,
                     elems_per_stick=tensor.data_format.elems_per_stick(),
                     is_stick_dim=False,
                     is_outer_stick_dim=True,
                 )
             else:
-                # "in" (K): elemArr=2, size=K//si, nsplits=si.
+                # "in" (K): elemArr=2, size=K//si, core_fold from work_slices.
                 k_total = sdsc_spec.iteration_space[dim]
                 result[str(dim)] = gen_coord_info_value(
                     size=k_total // si,
-                    nsplits=si,
+                    nsplits=nsplits,
                     elems_per_stick=tensor.data_format.elems_per_stick(),
                     is_stick_dim=True,
                     is_stick_reduction=False,
