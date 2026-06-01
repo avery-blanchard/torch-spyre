@@ -96,9 +96,10 @@ def gen_coord_info_value(
                            False for the inner (K-facing, already is_stick_dim=True)
     """
     if is_outer_stick_dim:
-        # Outer stick dim: elemArr=3.  size=stick_outer, nsplits=N//stick_outer.
-        # Split stick_outer into two equal halves for elem_arr_0 and elem_arr_1.
-        so = size  # stick_outer (e.g. 64)
+        # Outer stick dim: elemArr=3.
+        # size     = N per core (iteration_space[out] // work_slices[out])
+        # stick_inner parameter reused to carry so (stick_outer) here.
+        so = stick_inner  # stick_outer passed via stick_inner argument
         so_split = int(math.isqrt(so))
         return {
             "spatial": 3,
@@ -107,7 +108,7 @@ def gen_coord_info_value(
             "padding": "nopad",
             "folds": {
                 "dim_prop_func": [
-                    {"Affine": {"alpha_": so, "beta_": 0}},
+                    {"Affine": {"alpha_": size, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": so, "beta_": 0}},
@@ -228,13 +229,16 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
             # stick_dim_order[0] is "in" (K), stick_dim_order[1] is "out" (N).
             is_outer = dim == stick_dim_order[1]
             if is_outer:
-                # "out" (N): elemArr=3, size=so, core_fold from work_slices.
+                # "out" (N): elemArr=3.
+                # size = N per core, nsplits = work_slices, stick_inner carries so.
+                n_total = sdsc_spec.iteration_space[dim]
                 result[str(dim)] = gen_coord_info_value(
-                    size=so,
+                    size=n_total // nsplits if nsplits > 0 else n_total,
                     nsplits=nsplits,
                     elems_per_stick=tensor.data_format.elems_per_stick(),
                     is_stick_dim=False,
                     is_outer_stick_dim=True,
+                    stick_inner=so,
                 )
             else:
                 # "in" (K): elemArr=2, size=K//si, core_fold from work_slices.
