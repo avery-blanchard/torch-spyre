@@ -167,6 +167,11 @@ PYBIND11_MODULE(_C, m) {
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
+  py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
+      .value("DEFAULT", spyre::ElementArrangement::DEFAULT)
+      .value("FP8_MULTI_DIM_STICK",
+             spyre::ElementArrangement::FP8_MULTI_DIM_STICK);
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
@@ -251,11 +256,6 @@ PYBIND11_MODULE(_C, m) {
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
   m.def("reinterpret_tensor_with_layout",
         &spyre::reinterpret_tensor_with_layout);
-
-  py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
-      .value("DEFAULT", spyre::ElementArrangement::DEFAULT)
-      .value("FP8_MULTI_DIM_STICK",
-             spyre::ElementArrangement::FP8_MULTI_DIM_STICK);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
