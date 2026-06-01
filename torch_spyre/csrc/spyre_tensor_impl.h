@@ -104,7 +104,7 @@ class SpyreTensorLayout {
 
   std::string toString() const;
 
-  int64_t elems_per_stick() {
+  int64_t elems_per_stick() const {
     return spyre::elems_per_stick(this->device_dtype);
   }
 
