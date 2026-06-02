@@ -303,14 +303,15 @@ def _get_padded_iteration_space(
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
         # Use the smallest device stick count that covers min_sticks, converting
         # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
-        result = min_sticks
+        result = None
         for dev_sticks, dev_elems_per_stick in device_stick_counts.get(stick_sym, []):
             in_max_units = (
                 dev_sticks * dev_elems_per_stick + elems_per_stick - 1
             ) // elems_per_stick
-            if min_sticks <= in_max_units < result:
-                result = in_max_units
-        target = result * elems_per_stick
+            if in_max_units >= min_sticks:
+                if result is None or in_max_units < result:
+                    result = in_max_units
+        target = (result if result is not None else min_sticks) * elems_per_stick
         if target > it_elems:
             padding[stick_dim] = target - it_elems
             sdsc_iteration_space[stick_dim] = target
@@ -556,10 +557,20 @@ def _extend_matmul_k_to_padded(
         ),
         None,
     )
-    if k_stick_count_dim is not None:
+    if k_stick_count_dim is not None and y_arg.stride_map is not None:
         k_min_sticks = (k_current + stick_size - 1) // stick_size
-        k_device_sticks = y_arg.device_size[k_stick_count_dim]
-        if k_device_sticks > k_min_sticks:
+        k_sym_var = next(iter(y_arg.device_coordinates[-1].free_symbols), None)
+        k_device_sticks = (
+            padded_stick_count(
+                y_arg.device_coordinates,
+                y_arg.device_size,
+                y_arg.stride_map,
+                k_sym_var,
+            )
+            if k_sym_var is not None
+            else None
+        )
+        if k_device_sticks is not None and k_device_sticks > k_min_sticks:
             k_padded = max(k_padded, k_device_sticks * stick_size)
 
     if k_padded > k_current:

@@ -649,10 +649,10 @@ def align_tensors(
 
 
 def padded_stick_count(
-    device_coords: list,
+    device_coords: list[sympy.Expr],
     device_size: list[int],
     stride_map: list[int],
-    stick_sym,
+    stick_sym: sympy.Symbol,
 ) -> int | None:
     """Return padded stick count if stick dim padding is beyond the
     nearest multiple of the stick size.

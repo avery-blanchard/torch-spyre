@@ -220,14 +220,15 @@ def adjust_it_space_for_sticks(
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
         # Use the smallest device stick count that covers min_sticks, converting
         # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
-        result = min_sticks
+        result = None
         for dev_sticks, dev_elems_per_stick in device_stick_counts.get(stick_var, []):
             in_max_units = (
                 dev_sticks * dev_elems_per_stick + elems_per_stick - 1
             ) // elems_per_stick
-            if min_sticks <= in_max_units < result:
-                result = in_max_units
-        adjusted_space[stick_var] = result
+            if in_max_units >= min_sticks:
+                if result is None or in_max_units < result:
+                    result = in_max_units
+        adjusted_space[stick_var] = result if result is not None else min_sticks
 
     return adjusted_space, max_elems
 
