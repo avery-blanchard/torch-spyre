@@ -333,18 +333,6 @@ def generate_sdsc(
         affine_strides = [{} for _ in sdsc_spec.args]
 
         def _start_addr_data(tensor):
-            if "lx" in tensor.allocation:
-                # Mirrors the use_symbols=True branch above.
-                return {
-                    f"[{c}, 0, 0]": str(
-                        tensor.start_address
-                        + core_idx_to_slice_offset(
-                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                        )
-                        * num_bytes(tensor.data_format)
-                    )
-                    for c in range(sdsc_spec.num_cores)
-                }
             return {
                 f"[{c}, 0, 0]": str(
                     tensor.start_address
