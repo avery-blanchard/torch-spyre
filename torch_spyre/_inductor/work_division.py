@@ -204,14 +204,18 @@ def adjust_it_space_for_fp8_multidim_stick(
         ):
             continue
         # This is the kernel tensor. Its last two device coords cover the stick.
-        # Adjust "in" (K, not in output coords) by si, "out" (N, in output coords) by so.
+        # "out" (N, in output coords): divide by so=64 (N-stick outer groups).
+        # "in" (K, reduction): divide by eps=128 (full K-sticks), not si=2,
+        #   because the minimum per-core K granularity is one full stick (128 elements).
+        eps = layout.elems_per_stick()
+        so = eps // si
         for sym in it_space:
             if sym in out_coord_vars:
-                adjusted[sym] = (adjusted[sym] + 64 - 1) // 64  # so=64
-                stick_vars[sym] = 64
+                adjusted[sym] = (adjusted[sym] + so - 1) // so
+                stick_vars[sym] = so
             else:
-                adjusted[sym] = (adjusted[sym] + si - 1) // si
-                stick_vars[sym] = si
+                adjusted[sym] = (adjusted[sym] + eps - 1) // eps
+                stick_vars[sym] = eps
 
     return adjusted, stick_vars
 
