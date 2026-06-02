@@ -481,9 +481,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     // output_dimwise_ea_: one entry per host dimension, outermost-first.
     const int64_t dst2 = si * so;  // = eps = 128
-    // cumOffset_[1] for N entry: device stride between adjacent N/eps groups =
-    // K*so
-    const int64_t cum_offset_n = K * so;
+    const int64_t dst3 =
+        dst2 * K;  // contiguous device stride for dim3 (N/eps groups)
+    // cumOffset_[1] for N entry = dst3 (device stride between adjacent N/eps
+    // groups)
+    const int64_t cum_offset_n = dst3;
 
     // K dimension (outermost host dim):
     //   dimShape_=K, subElems_=[K], subStride_=[1],

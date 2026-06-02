@@ -15,12 +15,11 @@
 import torch
 import torch.spyre
 from torch_spyre._C import (
-    DataFormats,
     ElementArrangement,
     SpyreTensorLayout,
+    copy_tensor,
     spyre_empty_with_layout,
 )
-from torch_spyre._C import copy_tensor
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
@@ -36,11 +35,11 @@ mat_b_fp8_cpu = mat_b.to(torch.float8_e4m3fn)
 # Standard 3D STL with FP8_MULTI_DIM_STICK: device_size=[N/128, K, 128],
 # stride_map=[128, K_stride, 1].  generate_dci expands this to the correct
 # 4D DMA transfer layout internally.
-eps = 128  # elems_per_stick for SEN143_FP8
 fp8_stl = SpyreTensorLayout(
-    [N // eps, K, eps],
-    [eps, N, 1],
-    DataFormats.SEN143_FP8,
+    [K, N],
+    list(mat_b_fp8_cpu.stride()),
+    mat_b_fp8_cpu.dtype,
+    [0, 1],
     ElementArrangement.FP8_MULTI_DIM_STICK,
 )
 

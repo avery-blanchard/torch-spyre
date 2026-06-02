@@ -75,10 +75,12 @@ class SpyreTensorLayout {
    * using the default device memory layout.
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
-  SpyreTensorLayout(std::vector<int64_t> host_size,
-                    std::vector<int64_t> host_strides, c10::ScalarType dtype,
-                    std::vector<int32_t> dim_order) {
+  SpyreTensorLayout(
+      std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
+      c10::ScalarType dtype, std::vector<int32_t> dim_order,
+      ElementArrangement element_arrangement_ = ElementArrangement::DEFAULT) {
     init(host_size, host_strides, dtype, dim_order);
+    element_arrangement = element_arrangement_;
   }
 
   /**

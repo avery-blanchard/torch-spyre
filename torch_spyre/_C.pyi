@@ -159,6 +159,7 @@ class SpyreTensorLayout:
         host_strides: collections.abc.Sequence[typing.SupportsInt],
         dtype: torch.dtype,
         dim_order: collections.abc.Sequence[typing.SupportsInt],
+        element_arrangement: ElementArrangement = ...,
     ) -> None: ...
     @typing.overload
     def __init__(

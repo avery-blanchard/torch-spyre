@@ -192,9 +192,10 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, c10::ScalarType,
-                    std::vector<int32_t>>(),
+                    std::vector<int32_t>, spyre::ElementArrangement>(),
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
-           py::arg("dim_order"))
+           py::arg("dim_order"),
+           py::arg("element_arrangement") = spyre::ElementArrangement::DEFAULT)
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
                     spyre::ElementArrangement>(),
            py::arg("device_size"), py::arg("stride_map"),
