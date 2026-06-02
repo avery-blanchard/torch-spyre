@@ -517,6 +517,19 @@ class TestSpyreTensorLayout(TestCase):
         compiled_result = compiled(x_dev, y_dev).cpu()
         torch.testing.assert_close(cpu_result, compiled_result, rtol=1e-3, atol=1e-3)
 
+    def test_add_with_beyond_stick_padding_1d(self):
+        x = torch.rand(80, dtype=torch.float16)
+        y = torch.rand(80, dtype=torch.float16)
+        cpu_result = x + y
+        fp16 = get_device_dtype(torch.float16)
+        stl = SpyreTensorLayout([3, 64], [64, 1], fp16)
+        _ = x.to("spyre")  # required for lazy device initialization
+        x_dev = x.to(device_layout=stl)
+        y_dev = y.to(device_layout=stl)
+        compiled = torch.compile(torch.add)
+        compiled_result = compiled(x_dev, y_dev).cpu()
+        torch.testing.assert_close(cpu_result, compiled_result, rtol=1e-3, atol=1e-3)
+
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
         x = torch.rand(3, 2, 2048, dtype=torch.float16)

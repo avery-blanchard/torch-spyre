@@ -290,6 +290,7 @@ def _get_padded_iteration_space(
                 op_spec_arg.device_size,
                 op_spec_arg.stride_map,
                 stick_sym,
+                it_elems=sdsc_iteration_space[stick_dim],
             )
             if device_stick_count is not None:
                 device_stick_counts.setdefault(stick_sym, []).append(

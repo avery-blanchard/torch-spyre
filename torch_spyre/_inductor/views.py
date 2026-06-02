@@ -653,6 +653,7 @@ def padded_stick_count(
     device_size: list[int],
     stride_map: list[int],
     stick_sym: sympy.Symbol,
+    it_elems: int | None = None,
 ) -> int | None:
     """Return padded stick count if stick dim padding is beyond the
     nearest multiple of the stick size.
@@ -662,10 +663,19 @@ def padded_stick_count(
         if stick_sym not in coord.free_symbols:
             continue
         offset = int(coord.as_coeff_Add()[0])
+        found_adj = False
         for j in [i - 1, i + 1]:
             if 0 <= j < last and stride_map[j] not in (-1, 1):
-                if device_size[i] * stride_map[i] != stride_map[j]:
+                found_adj = True
+                if stride_map[j] > stride_map[i] and (
+                    device_size[i] * stride_map[i] != stride_map[j]
+                ):
                     return device_size[i] - offset
                 break
+        if not found_adj and it_elems is not None and stride_map[last] == 1:
+            nearest = (it_elems + stride_map[i] - 1) // stride_map[i]
+            remaining = device_size[i] - offset
+            if remaining > nearest:
+                return remaining
         break
     return None
