@@ -396,7 +396,7 @@ auto generate_fp8_multidim_stick_dcsi(const SpyreTensorLayout& stl,
   const int64_t dim2 = (N / si) * (K / so) / dim3;
 
   const int64_t sm3 = K_sm * N / si / si;
-  const int64_t sm1 = sm3 / so;
+  const int64_t sm1 = si * si * K_sm;
 
   const int64_t dst2 = si * so;
   const int64_t dst3 = dst2 * dim2;
