@@ -258,13 +258,10 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
                 k_total = sdsc_spec.iteration_space[dim]
                 n_total = sdsc_spec.iteration_space[out_dim]
                 k_per_core = k_total // nsplits if nsplits > 0 else k_total
-                n_per_core = n_total // out_nsplits if out_nsplits > 0 else n_total
-                temporal_iters = n_per_core // so
-                k_per_temporal = (
-                    k_per_core // temporal_iters if temporal_iters > 0 else k_per_core
-                )
+                # Provide full per-core K coverage; deeptools distributes
+                # across temporal iterations driven by "out" elem_arr_2.
                 result[str(dim)] = gen_coord_info_value(
-                    size=k_per_temporal,
+                    size=k_per_core,
                     nsplits=nsplits,
                     elems_per_stick=tensor.data_format.elems_per_stick(),
                     is_stick_dim=True,
