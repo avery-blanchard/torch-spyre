@@ -120,7 +120,7 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": 1, "label_": "elem_arr_2"},
+                    {"factor_": size // so, "label_": "elem_arr_2"},
                     {"factor_": so_split, "label_": "elem_arr_1"},
                     {"factor_": so_split, "label_": "elem_arr_0"},
                 ],
