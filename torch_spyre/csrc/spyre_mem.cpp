@@ -367,19 +367,18 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
  * All vectors are innermost-first (matching generate_dci's reversed output
  * convention).
  *
- * Derivation (derived outermost-first, then stored innermost-first):
+ * Derivation (innermost-first, valid for any [K, N] with N divisible by eps):
  *   si   = stick_inner = 2
- *   so   = stick_outer = eps/si = 64
- *   K_sm = stride_map[1]   (host K-row stride)
- *   K    = device_size[1]
+ *   so   = eps/si = 64
+ *   K    = device_size[1]   (from 3D STL outermost-first: [N/eps, K, eps])
  *   N    = device_size[0] * eps
  *
- *   dim3 = si² × K / K_sm
- *   dim2 = (N/si) × (K/so) / dim3
+ *   The device stores FP8 pairs packed into FP16 words. For each K row and
+ *   each N/eps stick group, si consecutive FP8 bytes occupy one FP16 word.
  *
- *   size_       innermost-first: [si,   so,           dim2,         dim3 ]
- *   stride_src_ innermost-first: [1,    K_sm×N/si²/so, si,          K_sm×N/si²]
- *   stride_dst_ innermost-first: [1,    si,            si×so, si×so×dim2]
+ *   size_       innermost-first: [si,   so,  K,       N/eps]
+ *   stride_src_ innermost-first: [1,    si,  N,       eps  ]
+ *   stride_dst_ innermost-first: [1,    si,  si×so,   si×so×K]
  */
 auto generate_fp8_multidim_stick_dcsi(const SpyreTensorLayout& stl,
                                       int64_t cpu_offset)
@@ -390,21 +389,14 @@ auto generate_fp8_multidim_stick_dcsi(const SpyreTensorLayout& stl,
   // 3D device_size outermost-first: [N/eps, K, eps]
   const int64_t K = stl.device_size[1];
   const int64_t N = stl.device_size[0] * eps;
-  const int64_t K_sm = stl.stride_map[1];
 
-  const int64_t dim3 = si * si * K / K_sm;
-  const int64_t dim2 = (N / si) * (K / so) / dim3;
-
-  const int64_t sm3 = K_sm * N / si / si;
-  const int64_t sm1 = si * si * K_sm;
-
-  const int64_t dst2 = si * so;
-  const int64_t dst3 = dst2 * dim2;
+  const int64_t dst2 = si * so;  // = eps
+  const int64_t dst3 = dst2 * K;
 
   DataConversionStrideInfo dcsi;
-  // innermost-first
-  dcsi.size_ = {si, so, dim2, dim3};
-  dcsi.stride_src_ = {1, sm1, si, sm3};
+  // innermost-first: [si, so, K, N/eps]
+  dcsi.size_ = {si, so, K, N / eps};
+  dcsi.stride_src_ = {1, si, N, eps};
   dcsi.stride_dst_ = {1, si, dst2, dst3};
   dcsi.offset_src_ = cpu_offset;
   dcsi.offset_dst_ = 0;
@@ -477,13 +469,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t so = eps / si;
     const int64_t K = stl.device_size[1];
     const int64_t N = stl.device_size[0] * eps;
-    const int64_t K_sm = stl.stride_map[1];
-    const int64_t dim3 = si * si * K / K_sm;
-    const int64_t dim2 = (N / si) * (K / so) / dim3;
 
-    // cpu_shape and expanded dev_shape are innermost-first.
+    // Expanded 4D device shape (innermost-first): [si, so, K, N/eps]
     std::reverse(cpu_shape.begin(), cpu_shape.end());
-    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    const std::vector<int64_t> expanded_dev_shape = {si, so, K, N / eps};
 
     dci.dcsi_ = {
         generate_fp8_multidim_stick_dcsi(stl, host2device ? cpu_offset : 0)};
@@ -491,9 +480,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
 
     // output_dimwise_ea_: one entry per host dimension, outermost-first.
-    // Derived from the same STL parameters used for dcsi_.
-    const int64_t sm3 = K_sm * N / si / si;
-    const int64_t dst2 = si * so;
+    const int64_t dst2 = si * so;  // = eps = 128
+    // cumOffset_[1] for N entry: device stride between adjacent N/eps groups =
+    // K*so
+    const int64_t cum_offset_n = K * so;
 
     // K dimension (outermost host dim):
     //   dimShape_=K, subElems_=[K], subStride_=[1],
@@ -513,7 +503,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     ea_N.subElems_ = {so, si, N / eps};
     ea_N.subStride_ = {si, 1, dst2};
     ea_N.cumElemsBefore_ = {1, so};
-    ea_N.cumOffset_ = {si, sm3};
+    ea_N.cumOffset_ = {si, cum_offset_n};
 
     dci.output_dimwise_ea_ = {ea_K, ea_N};
   } else {
