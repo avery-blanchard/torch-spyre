@@ -34,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -167,6 +167,53 @@ def multi_dim_iteration_space_split(
             splits[best_dim] = best_split
 
     return splits
+
+
+def adjust_it_space_for_fp8_multidim_stick(
+    it_space: dict[Symbol, Expr],
+    tensor_deps: list[TensorDep],
+) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
+    """Adjust iteration space for FP8_MULTI_DIM_STICK kernel tensor work division.
+
+    For BATCH_MATMUL_FP8_OP the kernel (Input1) has a 2D stick [si=2, so=64].
+    The "in" (K/reduction) variable must be divided by si=2 (not the flat
+    elems_per_stick=128) and the "out" (N/generated) variable by so=64, so
+    the work planner assigns core splits that align with the 2D stick structure.
+    """
+    from torch_spyre._C import ElementArrangement
+
+    si = 2
+    adjusted = dict(it_space)
+    stick_vars: dict[Symbol, int] = {}
+
+    # The kernel tensor has element_arrangement==FP8_MULTI_DIM_STICK and
+    # stick_dim_order=[in_sym, out_sym] (both dims are stick dims).
+    # Identify which symbols are "in" (reduction) and "out" (generated) by
+    # checking whether they appear in the output tensor's non-stick coords.
+    # collect_tensor_deps returns (input_tds, output_td); the caller passes
+    # all_tds = input_tds + [output_td], so the last entry is the output.
+    output_td = tensor_deps[-1]
+
+    out_coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+
+    for td in tensor_deps:
+        layout = td.layout.device_layout
+        if (
+            not hasattr(layout, "element_arrangement")
+            or layout.element_arrangement != ElementArrangement.FP8_MULTI_DIM_STICK
+        ):
+            continue
+        # This is the kernel tensor. Its last two device coords cover the stick.
+        # Adjust "in" (K, not in output coords) by si, "out" (N, in output coords) by so.
+        for sym in it_space:
+            if sym in out_coord_vars:
+                adjusted[sym] = (adjusted[sym] + 64 - 1) // 64  # so=64
+                stick_vars[sym] = 64
+            else:
+                adjusted[sym] = (adjusted[sym] + si - 1) // si
+                stick_vars[sym] = si
+
+    return adjusted, stick_vars
 
 
 def adjust_it_space_for_sticks(
@@ -502,6 +549,22 @@ def apply_splits(
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
+def _is_fp8_multidim_stick_op(op: ComputedBuffer) -> bool:
+    return (
+        isinstance(op.data, Reduction) and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    )
+
+
+def _adjust_it_space(
+    op: ComputedBuffer,
+    it_space: dict[Symbol, Expr],
+    all_tds: list,
+) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
+    if _is_fp8_multidim_stick_op(op):
+        return adjust_it_space_for_fp8_multidim_stick(it_space, all_tds)
+    return adjust_it_space_for_sticks(it_space, all_tds)
+
+
 def span_reduction_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -516,7 +579,7 @@ def span_reduction_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, stick_vars = _adjust_it_space(op, it_space, all_tds)
     min_splits = must_split_vars(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores
     )
@@ -559,7 +622,7 @@ def work_distribution_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, _ = _adjust_it_space(op, it_space, all_tds)
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
