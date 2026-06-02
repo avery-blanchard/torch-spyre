@@ -657,12 +657,13 @@ def padded_stick_count(
     """Return padded stick count if stick dim padding is beyond the
     nearest multiple of the stick size.
     """
+    last = len(stride_map) - 1
     for i, coord in enumerate(device_coords[:-1]):
         if stick_sym not in coord.free_symbols:
             continue
         offset = int(coord.as_coeff_Add()[0])
         for j in [i - 1, i + 1]:
-            if 0 <= j < len(stride_map) and stride_map[j] not in (-1, 1):
+            if 0 <= j < last and stride_map[j] not in (-1, 1):
                 if device_size[i] * stride_map[i] != stride_map[j]:
                     return device_size[i] - offset
                 break
