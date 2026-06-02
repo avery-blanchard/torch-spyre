@@ -370,15 +370,12 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
  * Derivation (innermost-first, valid for any [K, N] with N divisible by eps):
  *   si   = stick_inner = 2
  *   so   = eps/si = 64
- *   K    = device_size[1]   (from 3D STL outermost-first: [N/eps, K, eps])
- *   N    = device_size[0] * eps
+ *   K    = device_size[0] * eps   (from 3D STL outermost-first: [K/eps, N,
+ * eps]) N    = device_size[1]
  *
- *   The device stores FP8 pairs packed into FP16 words. For each K row and
- *   each N/eps stick group, si consecutive FP8 bytes occupy one FP16 word.
- *
- *   size_       innermost-first: [si,   so,  K,       N/eps]
- *   stride_src_ innermost-first: [1,    si,  N,       eps  ]
- *   stride_dst_ innermost-first: [1,    si,  si×so,   si×so×K]
+ *   size_       innermost-first: [si,    so,       K//si,        N//so        ]
+ *   stride_src_ innermost-first: [1,     si²×N,    si,           K×so         ]
+ *   stride_dst_ innermost-first: [1,     si,       si×so,        si×so×(K//si)]
  */
 auto generate_fp8_multidim_stick_dcsi(const SpyreTensorLayout& stl,
                                       int64_t cpu_offset)
@@ -386,17 +383,17 @@ auto generate_fp8_multidim_stick_dcsi(const SpyreTensorLayout& stl,
   const int64_t eps = stl.elems_per_stick();
   const int64_t si = 2;
   const int64_t so = eps / si;
-  // 3D device_size outermost-first: [N/eps, K, eps]
-  const int64_t K = stl.device_size[1];
-  const int64_t N = stl.device_size[0] * eps;
+  // 3D device_size outermost-first: [K/eps, N, eps]
+  const int64_t K = stl.device_size[0] * eps;
+  const int64_t N = stl.device_size[1];
 
-  const int64_t dst2 = si * so;  // = eps
-  const int64_t dst3 = dst2 * K;
+  const int64_t dst2 = si * so;          // = eps = 128
+  const int64_t dst3 = dst2 * (K / si);  // = eps * (K//si)
 
   DataConversionStrideInfo dcsi;
-  // innermost-first: [si, so, K, N/eps]
-  dcsi.size_ = {si, so, K, N / eps};
-  dcsi.stride_src_ = {1, si, N, eps};
+  // innermost-first: [si, so, K//si, N//so]
+  dcsi.size_ = {si, so, K / si, N / so};
+  dcsi.stride_src_ = {1, si * si * N, si, K * so};
   dcsi.stride_dst_ = {1, si, dst2, dst3};
   dcsi.offset_src_ = cpu_offset;
   dcsi.offset_dst_ = 0;
@@ -467,12 +464,12 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t eps = stl.elems_per_stick();
     const int64_t si = 2;
     const int64_t so = eps / si;
-    const int64_t K = stl.device_size[1];
-    const int64_t N = stl.device_size[0] * eps;
+    const int64_t K = stl.device_size[0] * eps;
+    const int64_t N = stl.device_size[1];
 
-    // Expanded 4D device shape (innermost-first): [si, so, K, N/eps]
+    // Expanded 4D device shape (innermost-first): [si, so, K//si, N//so]
     std::reverse(cpu_shape.begin(), cpu_shape.end());
-    const std::vector<int64_t> expanded_dev_shape = {si, so, K, N / eps};
+    const std::vector<int64_t> expanded_dev_shape = {si, so, K / si, N / so};
 
     dci.dcsi_ = {
         generate_fp8_multidim_stick_dcsi(stl, host2device ? cpu_offset : 0)};
@@ -480,12 +477,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
 
     // output_dimwise_ea_: one entry per host dimension, outermost-first.
+    // stride_dst = [1, si, si*so, si*so*(K//si)]; cumOffset_[1] = K*so.
     const int64_t dst2 = si * so;  // = eps = 128
-    const int64_t dst3 =
-        dst2 * K;  // contiguous device stride for dim3 (N/eps groups)
-    // cumOffset_[1] for N entry = dst3 (device stride between adjacent N/eps
-    // groups)
-    const int64_t cum_offset_n = dst3;
+    const int64_t cum_offset_n = K * so;
 
     // K dimension (outermost host dim):
     //   dimShape_=K, subElems_=[K], subStride_=[1],
