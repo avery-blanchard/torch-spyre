@@ -256,10 +256,9 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
                 k_total = sdsc_spec.iteration_space[dim]
                 n_total = sdsc_spec.iteration_space[out_dim]
                 k_per_core = k_total // nsplits if nsplits > 0 else k_total
-                n_per_core = n_total // out_nsplits if out_nsplits > 0 else n_total
-                # out_temporal_groups = number of so-groups per core on the N side,
-                # which drives how many temporal passes are made over "in".
-                out_temporal_groups = n_per_core // so
+                # elem_arr_1 = K per core / si: total K elements per core
+                # divided by stick_inner, covering the full per-core K range.
+                # deeptools distributes this across temporal iterations internally.
                 result[str(dim)] = gen_coord_info_value(
                     size=k_per_core,
                     nsplits=nsplits,
@@ -267,7 +266,6 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
                     is_stick_dim=True,
                     is_stick_reduction=False,
                     stick_inner=si,
-                    elem_arr_1_override=k_per_core // (out_temporal_groups * si),
                 )
         else:
             result[str(dim)] = gen_coord_info_value(
