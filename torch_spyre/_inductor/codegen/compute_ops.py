@@ -87,6 +87,7 @@ def gen_coord_info_value(
     is_stick_reduction: bool = False,
     stick_inner: int = 0,
     is_outer_stick_dim: bool = False,
+    elem_arr_1_override: int = 0,
 ):
     """Generate coordinate info for one dimension.
 
@@ -174,7 +175,13 @@ def gen_coord_info_value(
                 {"factor_": 1, "label_": "corelet_fold"},
                 {"factor_": 1, "label_": "row_fold"},
                 {
-                    "factor_": 1 if is_stick_reduction else (size // inner),
+                    "factor_": 1
+                    if is_stick_reduction
+                    else (
+                        elem_arr_1_override
+                        if elem_arr_1_override > 0
+                        else size // inner
+                    ),
                     "label_": "elem_arr_1",
                 },
                 {"factor_": inner, "label_": "elem_arr_0"},
@@ -241,15 +248,26 @@ def _gen_coord_info(tensor, sdsc_spec) -> dict:
                     stick_inner=so,
                 )
             else:
-                # "in" (K): elemArr=2, size=K//si, core_fold from work_slices.
+                # "in" (K): elemArr=2.
+                # alpha_[0]=K//work_slices[in], alpha_[3]=si,
+                # elem_arr_1=N//work_slices[out], elem_arr_0=si.
+                out_dim = stick_dim_order[1]
+                out_nsplits = sdsc_spec.work_slices.get(out_dim, 1)
                 k_total = sdsc_spec.iteration_space[dim]
+                n_total = sdsc_spec.iteration_space[out_dim]
+                k_per_core = k_total // nsplits if nsplits > 0 else k_total
+                n_per_core = n_total // out_nsplits if out_nsplits > 0 else n_total
+                # out_temporal_groups = number of so-groups per core on the N side,
+                # which drives how many temporal passes are made over "in".
+                out_temporal_groups = n_per_core // so
                 result[str(dim)] = gen_coord_info_value(
-                    size=k_total // si,
+                    size=k_per_core,
                     nsplits=nsplits,
                     elems_per_stick=tensor.data_format.elems_per_stick(),
                     is_stick_dim=True,
                     is_stick_reduction=False,
                     stick_inner=si,
+                    elem_arr_1_override=k_per_core // (out_temporal_groups * si),
                 )
         else:
             result[str(dim)] = gen_coord_info_value(
