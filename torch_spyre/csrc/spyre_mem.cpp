@@ -506,22 +506,12 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     ea_K.cumOffset_ = {1, dst2};
 
     // N dimension (innermost host dim):
-    //   When N > eps: subElems_=[so, si, N/eps], subStride_=[si, 1, dst2],
-    //                 cumElemsBefore_=[1, so], cumOffset_=[si, sm3]
-    //   When N == eps: the N/eps=1 outer group is redundant; omit it to avoid
-    //                  a trailing size-1 entry that confuses deeptools.
-    //                  subElems_=[so, si], subStride_=[si, 1],
-    //                  cumElemsBefore_=[1, so], cumOffset_=[si, sm3]
+    //   dimShape_=N, subElems_=[so, si, N/eps], subStride_=[si, 1, dst2],
+    //   cumElemsBefore_=[1, so], cumOffset_=[si, sm3]
     perdim_element_arrangement ea_N;
     ea_N.dimShape_ = N;
-    const int64_t n_outer = N / eps;
-    if (n_outer > 1) {
-      ea_N.subElems_ = {so, si, n_outer};
-      ea_N.subStride_ = {si, 1, dst2};
-    } else {
-      ea_N.subElems_ = {so, si};
-      ea_N.subStride_ = {si, 1};
-    }
+    ea_N.subElems_ = {so, si, N / eps};
+    ea_N.subStride_ = {si, 1, dst2};
     ea_N.cumElemsBefore_ = {1, so};
     ea_N.cumOffset_ = {si, sm3};
 
