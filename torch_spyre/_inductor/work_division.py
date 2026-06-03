@@ -180,8 +180,6 @@ def adjust_it_space_for_fp8_multidim_stick(
     elems_per_stick=128) and the "out" (N/generated) variable by so=64, so
     the work planner assigns core splits that align with the 2D stick structure.
     """
-    from torch_spyre._C import ElementArrangement
-
     si = 2
     adjusted = dict(it_space)
     stick_vars: dict[Symbol, int] = {}
@@ -196,26 +194,37 @@ def adjust_it_space_for_fp8_multidim_stick(
 
     out_coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
 
-    for td in tensor_deps:
-        layout = td.layout.device_layout
-        if (
-            not hasattr(layout, "element_arrangement")
-            or layout.element_arrangement != ElementArrangement.FP8_MULTI_DIM_STICK
-        ):
-            continue
-        # This is the kernel tensor. Its last two device coords cover the stick.
-        # "out" (N, in output coords): divide by so=64 (N-stick outer groups).
-        # "in" (K, reduction): divide by eps=128 (full K-sticks), not si=2,
-        #   because the minimum per-core K granularity is one full stick (128 elements).
-        eps = layout.elems_per_stick()
-        so = eps // si
-        for sym in it_space:
-            if sym in out_coord_vars:
-                adjusted[sym] = (adjusted[sym] + so - 1) // so
-                stick_vars[sym] = so
-            else:
-                adjusted[sym] = (adjusted[sym] + eps - 1) // eps
-                stick_vars[sym] = eps
+    # For BATCH_MATMUL_FP8_OP the kernel has a 2D stick with so=64 for the N
+    # (output/stick) dimension and eps=128 as the minimum K granularity.
+    # Use the output tensor's dtype to derive eps and so.
+    eps = output_td.layout.device_layout.elems_per_stick()
+    so = eps // si
+
+    # Identify the stick variable from the output tensor's stick coordinate.
+    stick_sym = next(
+        (v for v in output_td.device_coords[-1].free_symbols if v in it_space),
+        None,
+    )
+
+    for sym in it_space:
+        if sym == stick_sym:
+            # N/generated (stick): divide by so=64.
+            adjusted[sym] = (adjusted[sym] + so - 1) // so
+            stick_vars[sym] = so
+        elif sym not in out_coord_vars:
+            # K/reduction: divide by eps=128.
+            adjusted[sym] = (adjusted[sym] + eps - 1) // eps
+            stick_vars[sym] = eps
+        else:
+            # Batch/mb output dim: use standard adjust_it_space_for_sticks
+            # logic so the planner can split mb after out is saturated.
+            # We do NOT adjust here; leave it to adjust_it_space_for_sticks
+            # by keeping the original value — the planner sorts output_dims
+            # by decreasing size, so mb (large) will be split before out
+            # unless we shrink mb_adj below out_adj.
+            # Set mb_adj = mb // (so * si) so that out_adj (N//so) dominates.
+            adjusted[sym] = (adjusted[sym] + so * si - 1) // (so * si)
+            stick_vars[sym] = so * si
 
     return adjusted, stick_vars
 
