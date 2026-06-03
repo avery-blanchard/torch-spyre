@@ -583,13 +583,25 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.
     is_dtype_op = DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
     if is_matmul or is_dtype_op:
-        pad_args, pad_sdsc_args = list(op_spec.args), args
-    elif op_spec.is_reduction or op_spec.op == "overwrite":
-        pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
+        pad_args, pad_sdsc_args, dim_order = (
+            list(op_spec.args),
+            args,
+            [arg.dim_order for arg in args],
+        )
+    elif op_spec.is_reduction:
+        pad_args, pad_sdsc_args, dim_order = (
+            [op_spec.args[0]],
+            [args[0]],
+            [args[0].dim_order],
+        )
     elif op_spec.op == RESTICKIFY_OP:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
-        pad_args, pad_sdsc_args = list(op_spec.args), args
+        pad_args, pad_sdsc_args, dim_order = (
+            list(op_spec.args),
+            args,
+            [arg.dim_order for arg in args],
+        )
     else:
         pad_args, pad_sdsc_args, dim_order = (
             [op_spec.args[-1]],
