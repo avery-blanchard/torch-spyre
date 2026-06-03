@@ -53,6 +53,12 @@ def make_lx_planning_class(cls):
     )
 
 
+def _copy_inherited_methods(src, dst, attrs):
+    for attr in attrs:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+
+
 def _canonical_test_names(test_cls):
     """Pick one representative test name per (prefix, op) cell of
     ``test_cls.PARAMS``, plus all non-parameterized test methods.
@@ -84,7 +90,9 @@ def _canonical_test_names(test_cls):
     return canonical
 
 
-def _copy_canonical_tests(src_cls, dst_cls, suffix, test_failures):
+def _copy_canonical_tests(
+    src_cls, dst_cls, suffix, test_failures, inherited_test_attributes
+):
     """Copy test methods from ``src_cls`` into ``dst_cls`` with ``_{suffix}``
     appended to each name. Unless ``TEST_LX_PLANNING_FULL`` is set, restrict
     to the canonical subset derived from ``TestOps.PARAMS``."""
@@ -107,30 +115,19 @@ def _copy_canonical_tests(src_cls, dst_cls, suffix, test_failures):
         if test_failures and name in test_failures:
             new_test = unittest.skip("Skipped!")(new_test)
         setattr(dst_cls, f"{name}_{suffix}", new_test)
-    if hasattr(src_cls, "is_dtype_supported"):
-        dst_cls.is_dtype_supported = src_cls.is_dtype_supported
+    _copy_inherited_methods(src_cls, dst_cls, inherited_test_attributes)
 
+
+INHERITED_TEST_ATTRIBUTES = [
+    "is_dtype_supported",
+    "_get_core_reduction_invalid_dim_cases",
+    "_get_single_dim_reduction_invalid_dim_cases",
+]
 
 POINTWISE_TEST_FAILURES = [
     "test_addmm_1152_10x1152_1152x1152",
     "test_bmm_bmm_2x55x2_2x2x99",
     "test_bmm_bmm_2x99x65_2x65x55",
-    "test_cat_1d_dim0",
-    "test_cat_1d_dim0_three_tensors",
-    "test_cat_2d_dim0_diff_size",
-    "test_cat_2d_dim0_three_tensors",
-    "test_cat_2d_dim1_diff_size",
-    "test_cat_3d_dim0",
-    "test_cat_3d_dim1",
-    "test_cat_3d_dim1_size1",
-    "test_cat_3d_dim2",
-    "test_cat_4d_dim0",
-    "test_cat_4d_dim1",
-    "test_cat_4d_dim2",
-    "test_cat_4d_dim3",
-    "test_cat_4d_dim3_fp32",
-    "test_core_reduction_invalid_dims_api",
-    "test_core_reduction_invalid_dims_spyre",
     "test_einsum_einsum_55x2_2x99",
     "test_einsum_einsum_67x255_255x128",
     "test_einsum_einsum_67x256_256x128",
@@ -138,6 +135,20 @@ POINTWISE_TEST_FAILURES = [
     "test_fallback_1d",
     "test_fallback_2d",
     "test_fallback_3d",
+    # torch.flatten tests - Contiguous access pattern with span of 4 elements
+    # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
+    # support for partially-filled contiguous regions. See PR #1866.
+    "test_flatten_2d_full",
+    "test_flatten_3d_full",
+    "test_flatten_3d_mixed_dims",
+    "test_flatten_3d_neg_dims",
+    "test_flatten_3d_neg_full",
+    "test_flatten_3d_noncontig_full",
+    "test_flatten_3d_noncontig_partial",
+    "test_flatten_3d_trailing",
+    "test_flatten_4d_full",
+    "test_flatten_4d_large_full",
+    "test_flatten_4d_trailing",
     "test_full_value_1",
     "test_full_value_2",
     "test_large_matmul_matmul_3d_M3_K11_N2880",
@@ -165,11 +176,14 @@ POINTWISE_TEST_FAILURES = [
     "test_pad_3d_dim1_right",
     "test_pad_3d_last_dim_right",
     "test_pad_4d_dim0_left",
+    "test_pointwise_binary_op_int64_add_1d",
+    "test_pointwise_binary_op_int64_maximum_1d",
+    "test_pointwise_binary_op_int64_minimum_1d",
+    "test_pointwise_binary_op_int64_mul_1d",
+    "test_pointwise_binary_op_int64_sub_1d",
     "test_qkv_attn_paths_fms_decode_gqa",
     "test_reduce_edge_multidim_keepdim0_sum_large_2d_dim_01_all",
     "test_reduce_edge_multidim_keepdim1_sum_large_2d_dim_01_all",
-    "test_single_dim_reduction_invalid_dims_api",
-    "test_single_dim_reduction_invalid_dims_spyre",
     "test_squeeze_reduction_sum_3d0",
     "test_squeeze_reduction_sum_4d0",
     "test_squeeze_single_3d0",
@@ -255,11 +269,13 @@ _copy_canonical_tests(
     LxPlanningTwoOpPointwiseAdditionTest,
     "lx_planning_pointwise",
     POINTWISE_TEST_FAILURES if not tests_lx_planning_run_skips else None,
+    INHERITED_TEST_ATTRIBUTES,
 )
 
 
 REDUCTION_TEST_FAILURES = [
     "test_activation_cls_gelu_fp16",
+    "test_addmm_1152_10x1152_1152x1152",
     "test_addmm_out_basic",
     "test_addmm_scaled_alpha_0_5",
     "test_alias_operands_cube_67x71x256",
@@ -267,24 +283,8 @@ REDUCTION_TEST_FAILURES = [
     "test_alias_operands_triple_67x71x256",
     "test_bmm_bmm_2x55x2_2x2x99",
     "test_bmm_bmm_2x99x65_2x65x55",
-    "test_cat_1d_dim0",
-    "test_cat_1d_dim0_three_tensors",
-    "test_cat_2d_dim0_diff_size",
-    "test_cat_2d_dim0_three_tensors",
-    "test_cat_2d_dim1_diff_size",
-    "test_cat_3d_dim0",
-    "test_cat_3d_dim1",
-    "test_cat_3d_dim1_size1",
-    "test_cat_3d_dim2",
-    "test_cat_4d_dim0",
-    "test_cat_4d_dim1",
-    "test_cat_4d_dim2",
-    "test_cat_4d_dim3",
-    "test_cat_4d_dim3_fp32",
     "test_copy_roundtrip_3d",
     "test_copy_roundtrip_4d_stick",
-    "test_core_reduction_invalid_dims_api",
-    "test_core_reduction_invalid_dims_spyre",
     "test_einsum_einsum_55x2_2x99",
     "test_einsum_einsum_67x255_255x128",
     "test_einsum_einsum_67x256_256x128",
@@ -292,6 +292,13 @@ REDUCTION_TEST_FAILURES = [
     "test_fallback_1d",
     "test_fallback_2d",
     "test_fallback_3d",
+    # torch.flatten tests - Contiguous access pattern with span of 4 elements
+    # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
+    # support for partially-filled contiguous regions. See PR #1866.
+    "test_flatten_3d_neg_dims",
+    "test_flatten_3d_noncontig_partial",
+    "test_flatten_3d_trailing",
+    "test_flatten_4d_trailing",
     "test_full_value_1",
     "test_full_value_2",
     "test_large_matmul_matmul_2d_M2048_K2048_N65536",
@@ -322,6 +329,11 @@ REDUCTION_TEST_FAILURES = [
     "test_pad_3d_dim1_right",
     "test_pad_3d_last_dim_right",
     "test_pad_4d_dim0_left",
+    "test_pointwise_binary_op_int64_add_1d",
+    "test_pointwise_binary_op_int64_maximum_1d",
+    "test_pointwise_binary_op_int64_minimum_1d",
+    "test_pointwise_binary_op_int64_mul_1d",
+    "test_pointwise_binary_op_int64_sub_1d",
     "test_permute_4d_0_3_1_2",
     "test_permute_4d_0_m2_m1_1",
     "test_pointwise_binary_op_add_67x71x256_67x71x256",
@@ -339,15 +351,6 @@ REDUCTION_TEST_FAILURES = [
     "test_scalar_cpu_div_2d",
     "test_scalar_cpu_mul_2d",
     "test_scalar_cpu_true_divide_2d",
-    "test_single_dim_reduction_invalid_dims_api",
-    "test_single_dim_reduction_invalid_dims_spyre",
-    "test_split_split3_1d0s0",
-    "test_split_split3_1d0s1",
-    "test_split_split3_1d0s2",
-    "test_split_split3_2d0s1",
-    "test_split_split3_2d0s2",
-    "test_split_split3_3d0s1",
-    "test_split_split3_3d0s2",
     "test_squeeze_reduction_sum_3d0",
     "test_squeeze_reduction_sum_4d0",
     "test_squeeze_single_3d0",
@@ -392,4 +395,5 @@ _copy_canonical_tests(
     LxPlanningTwoOpReductionTest,
     "lx_planning_reduction",
     REDUCTION_TEST_FAILURES if not tests_lx_planning_run_skips else None,
+    INHERITED_TEST_ATTRIBUTES,
 )
