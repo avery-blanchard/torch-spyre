@@ -4930,5 +4930,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
 
+FP8_QUANT_DEQUANT_SHAPES = [
+    (4, 128),
+    (4, 256),
+    (4, 64, 128),
+]
+
+FP8_QUANT_DEQUANT_SCALES = [
+    0.5,
+    1.0,
+    2.0,
+]
+
+FP8_QUANT_DEQUANT_PARAMS = {
+    f"scale{scale}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=torch.float16, scale=0.1),
+        torch.tensor([scale], dtype=torch.float16),
+    )
+    for shape in FP8_QUANT_DEQUANT_SHAPES
+    for scale in FP8_QUANT_DEQUANT_SCALES
+}
+
+
+class TestFp8QuantDequant(unittest.TestCase, metaclass=ParameterizedTestMeta):
+    """Tests for the quantize_fp8_with_scale -> fp18todl16 (FP8->FP16) round-trip.
+
+    The compiled path produces:
+      reciprocal, mul, clip, qfp8ch  (fp16 -> fp8 via quantize_fp8_with_scale)
+      fp18todl16                      (fp8 -> fp16)
+    """
+
+    torch.manual_seed(0xAFFE)
+
+    PARAMS = {
+        ("test_fp8_quant_dequant", "test_fp8_quant_dequant_base"): {
+            "param_sets": FP8_QUANT_DEQUANT_PARAMS,
+        },
+    }
+
+    def test_fp8_quant_dequant_base(self, x, scale):
+        def fn(x, scale):
+            q = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return q.to(torch.float16)
+
+        compare_with_cpu(fn, x, scale, run_eager=False)
+
+
 if __name__ == "__main__":
     unittest.main()
