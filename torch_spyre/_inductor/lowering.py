@@ -924,6 +924,7 @@ def lower_quantize_fp8_with_scale(x, scale):
 
     return x_fp8
 
+
 @register_spyre_lowering(torch.ops.aten.cat.default, type_promotion_kind=None)
 def lower_cat(inputs, dim=0):
     output_size = list(inputs[0].get_size())
@@ -1026,3 +1027,62 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
     lowering.mutate_to(sliced_output, cropped_input)
 
     return output
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8wt)
+def lower_qfp8wt(x):
+    """
+    Lower qfp8ch operation - channel-wise FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+    x.realize()
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.quantize_weight_fp8_with_scale)
+def lower_quantize_weight_fp8_with_scale(x, scale):
+    """
+    Lower quantize_fp8_with_scale operation.
+
+    Composes four operations:
+    1. Compute inverse scale using reciprocal (POINTWISE, sfp unit)
+    2. Multiply by inverse scale (POINTWISE)
+    3. Clamp to FP8 range [-448, 448] (POINTWISE)
+    4. Convert to FP8 format using qfp8ch (POINTWISE format conversion)
+    """
+    x.realize()
+    scale.realize()
+
+    # Step 1: Compute inverse scale using hardware reciprocal (sfp unit)
+    inv_scale = lower_reciprocal(scale)
+    inv_scale.realize()  # Force realization to prevent fusion
+
+    # Step 2: Multiply by inverse scale
+    x_scaled = lowering.mul(x, inv_scale)
+    x_scaled.realize()  # Force realization to prevent fusion
+
+    # Step 3: Clamp to FP8 E4M3 range
+    x_clamped = lower_clamp(x_scaled, -448.0, 448.0)
+    x_clamped.realize()  # Force realization to prevent fusion
+
+    # Step 4: Convert to FP8 format
+    x_fp8 = lower_qfp8wt(x_clamped)
+
+    return x_fp8

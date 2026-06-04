@@ -34,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -167,66 +167,6 @@ def multi_dim_iteration_space_split(
             splits[best_dim] = best_split
 
     return splits
-
-
-def adjust_it_space_for_fp8_multidim_stick(
-    it_space: dict[Symbol, Expr],
-    tensor_deps: list[TensorDep],
-) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
-    """Adjust iteration space for FP8_MULTI_DIM_STICK kernel tensor work division.
-
-    For BATCH_MATMUL_FP8_OP the kernel (Input1) has a 2D stick [si=2, so=64].
-    The "in" (K/reduction) variable must be divided by si=2 (not the flat
-    elems_per_stick=128) and the "out" (N/generated) variable by so=64, so
-    the work planner assigns core splits that align with the 2D stick structure.
-    """
-    si = 2
-    adjusted = dict(it_space)
-    stick_vars: dict[Symbol, int] = {}
-
-    # The kernel tensor has element_arrangement==FP8_MULTI_DIM_STICK and
-    # stick_dim_order=[in_sym, out_sym] (both dims are stick dims).
-    # Identify which symbols are "in" (reduction) and "out" (generated) by
-    # checking whether they appear in the output tensor's non-stick coords.
-    # collect_tensor_deps returns (input_tds, output_td); the caller passes
-    # all_tds = input_tds + [output_td], so the last entry is the output.
-    output_td = tensor_deps[-1]
-
-    out_coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-
-    # For BATCH_MATMUL_FP8_OP the kernel has a 2D stick with so=64 for the N
-    # (output/stick) dimension and eps=128 as the minimum K granularity.
-    # Use the output tensor's dtype to derive eps and so.
-    eps = output_td.layout.device_layout.elems_per_stick()
-    so = eps // si
-
-    # Identify the stick variable from the output tensor's stick coordinate.
-    stick_sym = next(
-        (v for v in output_td.device_coords[-1].free_symbols if v in it_space),
-        None,
-    )
-
-    for sym in it_space:
-        if sym == stick_sym:
-            # N/generated (stick): divide by so=64.
-            adjusted[sym] = (adjusted[sym] + so - 1) // so
-            stick_vars[sym] = so
-        elif sym not in out_coord_vars:
-            # K/reduction: divide by eps=128.
-            adjusted[sym] = (adjusted[sym] + eps - 1) // eps
-            stick_vars[sym] = eps
-        else:
-            # Batch/mb output dim: use standard adjust_it_space_for_sticks
-            # logic so the planner can split mb after out is saturated.
-            # We do NOT adjust here; leave it to adjust_it_space_for_sticks
-            # by keeping the original value — the planner sorts output_dims
-            # by decreasing size, so mb (large) will be split before out
-            # unless we shrink mb_adj below out_adj.
-            # Set mb_adj = mb // (so * si) so that out_adj (N//so) dominates.
-            adjusted[sym] = (adjusted[sym] + so * si - 1) // (so * si)
-            stick_vars[sym] = so * si
-
-    return adjusted, stick_vars
 
 
 def adjust_it_space_for_sticks(
@@ -562,22 +502,6 @@ def apply_splits(
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
-def _is_fp8_multidim_stick_op(op: ComputedBuffer) -> bool:
-    return (
-        isinstance(op.data, Reduction) and op.data.reduction_type == BATCH_MATMUL_FP8_OP
-    )
-
-
-def _adjust_it_space(
-    op: ComputedBuffer,
-    it_space: dict[Symbol, Expr],
-    all_tds: list,
-) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
-    if _is_fp8_multidim_stick_op(op):
-        return adjust_it_space_for_fp8_multidim_stick(it_space, all_tds)
-    return adjust_it_space_for_sticks(it_space, all_tds)
-
-
 def span_reduction_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -592,7 +516,7 @@ def span_reduction_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, stick_vars = _adjust_it_space(op, it_space, all_tds)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
     min_splits = must_split_vars(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores
     )
@@ -635,7 +559,7 @@ def work_distribution_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, _ = _adjust_it_space(op, it_space, all_tds)
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.

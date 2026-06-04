@@ -507,7 +507,35 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
-@torch.library.custom_op("spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre")
+@torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")
+def qfp8wt(input: torch.Tensor) -> torch.Tensor:
+    """
+    Channel-wise FP8 format conversion (pointwise, optimized for matmul).
+
+    Converts input tensor to FP8 E4M3 format with channel-wise semantics.
+    This operation ONLY performs format conversion - scaling must be done separately.
+
+    Args:
+        input: Input tensor (FP16/FP32/BF16) to convert to FP8
+               Should already be scaled and clamped
+
+    Returns:
+        FP8 E4M3 tensor (same shape as input)
+
+    Maps to: deeptools Qfp8ch operation
+    """
+    pass
+
+
+@qfp8wt.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
 def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
     Quantize FP16 tensor to FP8 using pre-computed scale.
@@ -539,6 +567,47 @@ def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.T
 
 
 @quantize_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+def quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """
+    Quantize FP16 tensor to FP8 using pre-computed scale.
+
+    Performs four steps:
+    1. Compute inverse scale: inv_scale = 1 / scale (reciprocal, POINTWISE on sfp unit)
+    2. Scale the input: x_scaled = x * inv_scale (POINTWISE)
+    3. Clamp to FP8 E4M3 range: x_clamped = clamp(x_scaled, -448, 448) (POINTWISE)
+    4. Convert to FP8 format: x_fp8 = qfp8ch(x_clamped) (POINTWISE format conversion)
+
+    Args:
+        input: Input tensor (FP16) to quantize, shape [batch, seq, hidden]
+        scale: Quantization scale (FP16/FP32), shape [batch, seq, 1]
+               scale = max(abs(x)) * 2.0 (from quantscalepertokenfp8)
+
+    Returns:
+        FP8 E4M3 tensor (same shape as input)
+
+    Example:
+        >>> x = torch.randn(2, 4, 8, dtype=torch.float16, device='spyre')
+        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+    Note:
+        - Works with torch.compile for hardware acceleration
+        - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
+        - Uses qfp8ch operation (has hidden_dim <= 8 limitation on current hardware)
+    """
+    pass
+
+
+@quantize_weight_fp8_with_scale.register_fake
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)

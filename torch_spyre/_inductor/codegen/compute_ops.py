@@ -13,8 +13,6 @@
 # limitations under the License.
 
 
-import math
-
 from torch_spyre._C import encode_constant, DataFormats
 from sympy import Symbol
 
@@ -85,109 +83,126 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
-    stick_inner: int = 0,
-    is_outer_stick_dim: bool = False,
-    elem_arr_1_override: int = 0,
 ):
-    """Generate coordinate info for one dimension.
-
-    For multi-dimensional sticks (FP8 kernel tensors), pass:
-      stick_inner   — the inner stick size (e.g. 2 for FP8)
-      is_outer_stick_dim — True for the outer stick dimension (N-facing),
-                           False for the inner (K-facing, already is_stick_dim=True)
-    """
-    if is_outer_stick_dim:
-        # Outer stick dim: elemArr=3.
-        # size     = N per core (iteration_space[out] // work_slices[out])
-        # stick_inner parameter reused to carry so (stick_outer) here.
-        so = stick_inner  # stick_outer passed via stick_inner argument
-        so_split = int(math.isqrt(so))
-        return {
-            "spatial": 3,
-            "temporal": 0,
-            "elemArr": 3,
-            "padding": "nopad",
-            "folds": {
-                "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": so, "beta_": 0}},
-                    {"Affine": {"alpha_": so_split, "beta_": 0}},
-                    {"Affine": {"alpha_": 1, "beta_": 0}},
-                ],
-                "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": size // so, "label_": "elem_arr_2"},
-                    {"factor_": so_split, "label_": "elem_arr_1"},
-                    {"factor_": so_split, "label_": "elem_arr_0"},
-                ],
-            },
-        }
-
-    if not is_stick_dim:
-        return {
+    return (
+        {
             "spatial": 3,
             "temporal": 0,
             "elemArr": 1,
             "padding": "nopad",
             "folds": {
                 "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                    {
+                        "Affine": {
+                            "alpha_": size,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0,
+                        }
+                    },
                 ],
                 "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": size, "label_": "elem_arr_0"},
+                    {
+                        "factor_": nsplits,
+                        "label_": "core_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "corelet_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "row_fold",
+                    },
+                    {
+                        "factor_": size,
+                        "label_": "elem_arr_0",
+                    },
                 ],
             },
         }
-
-    # Standard stick dim (elemArr=2).
-    # For multi-dim sticks, stick_inner overrides elems_per_stick for the inner size.
-    inner = stick_inner if stick_inner > 0 else elems_per_stick
-    return {
-        "spatial": 3,
-        "temporal": 0,
-        "elemArr": 2,
-        "padding": "nopad",
-        "folds": {
-            "dim_prop_func": [
-                {
-                    "Affine": {
-                        "alpha_": inner if is_stick_reduction else size,
-                        "beta_": 0,
-                    }
-                },
-                {"Affine": {"alpha_": 0, "beta_": 0}},
-                {"Affine": {"alpha_": 0, "beta_": 0}},
-                {"Affine": {"alpha_": inner, "beta_": 0}},
-                {"Affine": {"alpha_": 0 if is_stick_reduction else 1, "beta_": 0}},
-            ],
-            "dim_prop_attr": [
-                {"factor_": nsplits, "label_": "core_fold"},
-                {"factor_": 1, "label_": "corelet_fold"},
-                {"factor_": 1, "label_": "row_fold"},
-                {
-                    "factor_": 1
-                    if is_stick_reduction
-                    else (
-                        elem_arr_1_override
-                        if elem_arr_1_override > 0
-                        else size // inner
-                    ),
-                    "label_": "elem_arr_1",
-                },
-                {"factor_": inner, "label_": "elem_arr_0"},
-            ],
-        },
-    }
+        if not is_stick_dim
+        else {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 2,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {
+                        "Affine": {
+                            "alpha_": elems_per_stick if is_stick_reduction else size,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": elems_per_stick,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0 if is_stick_reduction else 1,
+                            "beta_": 0,
+                        }
+                    },
+                ],
+                "dim_prop_attr": [
+                    {
+                        "factor_": nsplits,
+                        "label_": "core_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "corelet_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "row_fold",
+                    },
+                    {
+                        "factor_": 1
+                        if is_stick_reduction
+                        else (size // elems_per_stick),
+                        "label_": "elem_arr_1",
+                    },
+                    {
+                        "factor_": elems_per_stick,
+                        "label_": "elem_arr_0",
+                    },
+                ],
+            },
+        }
+    )
 
 
 def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
@@ -202,81 +217,6 @@ def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
     return int(
         per_iter_range * tensor.strides[tiled_sym] * num_bytes(tensor.data_format)
     )
-
-
-def _gen_coord_info(tensor, sdsc_spec) -> dict:
-    """Build the coordInfo dict for one tensor in an SDSC.
-
-    For standard layouts the stick is a single dimension with elems_per_stick
-    elements (elemArr=2).  For multi-dimensional sticks (e.g. FP8 kernel with
-    stick_size=[2, 64]) the two stick dimensions need different treatment:
-      - outer stick dim (stick_dim_order[0], the N/generated dim): elemArr=3,
-        size=stick_outer, nsplits=N_total//stick_outer
-      - inner stick dim (stick_dim_order[1], the K/reduction dim): elemArr=2,
-        stick_inner overrides elems_per_stick
-    """
-    layout_info = sdsc_spec.layouts[tensor.layout]
-    dim_order = layout_info["dim_order"]
-    stick_dim_order = layout_info["stick_dim_order"]
-    stick_size = layout_info["stick_size"]  # list: [eps] or [si, so]
-    is_multidim_stick = len(stick_size) == 2
-
-    result = {}
-    for dim in dim_order:
-        is_stick = dim in stick_dim_order
-        size = (
-            sdsc_spec.iteration_space[dim] // sdsc_spec.work_slices[dim]
-            if tensor.scales[dim] == 1
-            else 1
-        )
-        nsplits = sdsc_spec.work_slices[dim] if tensor.scales[dim] == 1 else 1
-
-        if is_multidim_stick and is_stick:
-            si, so = stick_size  # stick_inner=2, stick_outer=64
-            # stick_dim_order[0] is "in" (K), stick_dim_order[1] is "out" (N).
-            is_outer = dim == stick_dim_order[1]
-            if is_outer:
-                # "out" (N): elemArr=3.
-                # size = N per core, nsplits = work_slices, stick_inner carries so.
-                n_total = sdsc_spec.iteration_space[dim]
-                result[str(dim)] = gen_coord_info_value(
-                    size=n_total // nsplits if nsplits > 0 else n_total,
-                    nsplits=nsplits,
-                    elems_per_stick=tensor.data_format.elems_per_stick(),
-                    is_stick_dim=False,
-                    is_outer_stick_dim=True,
-                    stick_inner=so,
-                )
-            else:
-                # "in" (K): elemArr=2.
-                # The "out" elem_arr_2 drives temporal iterations over "in".
-                # alpha_[0] = K per temporal pass = k_per_core // temporal_iters
-                # where temporal_iters = n_per_core // so (so-groups per core).
-                # elem_arr_1 = alpha_[0] // si, elem_arr_0 = si.
-                out_dim = stick_dim_order[1]
-                out_nsplits = sdsc_spec.work_slices.get(out_dim, 1)
-                k_total = sdsc_spec.iteration_space[dim]
-                n_total = sdsc_spec.iteration_space[out_dim]
-                k_per_core = k_total // nsplits if nsplits > 0 else k_total
-                # Provide full per-core K coverage; deeptools distributes
-                # across temporal iterations driven by "out" elem_arr_2.
-                result[str(dim)] = gen_coord_info_value(
-                    size=k_per_core,
-                    nsplits=nsplits,
-                    elems_per_stick=tensor.data_format.elems_per_stick(),
-                    is_stick_dim=True,
-                    is_stick_reduction=False,
-                    stick_inner=si,
-                )
-        else:
-            result[str(dim)] = gen_coord_info_value(
-                size=size,
-                nsplits=nsplits,
-                elems_per_stick=tensor.data_format.elems_per_stick(),
-                is_stick_dim=is_stick,
-                is_stick_reduction=(tensor.scales[dim] == -2),
-            )
-    return result
 
 
 def generate_sdsc(
@@ -530,7 +470,41 @@ def generate_sdsc(
                                         else {}
                                     ),
                                     "coordinates_": {
-                                        "coordInfo": _gen_coord_info(tensor, sdsc_spec),
+                                        "coordInfo": {
+                                            str(dim): gen_coord_info_value(
+                                                size=sdsc_spec.iteration_space[dim]
+                                                // sdsc_spec.work_slices[dim]
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
+                                                nsplits=sdsc_spec.work_slices[dim]
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
+                                                elems_per_stick=sdsc_spec.layouts[
+                                                    tensor.layout
+                                                ]["stick_size"][
+                                                    sdsc_spec.layouts[tensor.layout][
+                                                        "stick_dim_order"
+                                                    ].index(dim)
+                                                ]
+                                                if dim
+                                                in sdsc_spec.layouts[tensor.layout][
+                                                    "stick_dim_order"
+                                                ]
+                                                else tensor.data_format.elems_per_stick(),
+                                                is_stick_dim=(
+                                                    dim
+                                                    in sdsc_spec.layouts[tensor.layout][
+                                                        "stick_dim_order"
+                                                    ]
+                                                ),
+                                                is_stick_reduction=(
+                                                    tensor.scales[dim] == -2
+                                                ),
+                                            )
+                                            for dim in sdsc_spec.layouts[tensor.layout][
+                                                "dim_order"
+                                            ]
+                                        },
                                         "coreIdToWkSlice_": {},
                                     },
                                 }

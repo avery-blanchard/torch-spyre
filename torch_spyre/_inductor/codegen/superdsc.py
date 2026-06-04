@@ -355,6 +355,8 @@ def _create_sdsc_tensors(
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
+        is_fp8_matmul = op_spec.op in (BATCH_MATMUL_FP8_OP)
+        is_fp8_quant = op_spec.op in ("qfp8ch")
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             if dim in reduced_dims and op_spec.op != "layernormscale":
@@ -380,14 +382,21 @@ def _create_sdsc_tensors(
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
-
+            if is_fp8_matmul and len(sdsc_args) == 0 and dim is not stick_dim:
+                scales[dim] = -1
+            if is_fp8_quant and dim is not stick_dim and len(sdsc_args) == 0:
+                scales[dim] = -1
             max_dim_sizes[dim] = -1
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
 
         # Special handling for FP8 matmul KERNEL tensor
         is_fp8_matmul = op_spec.op == BATCH_MATMUL_FP8_OP
-        is_kernel_tensor = is_fp8_matmul and len(sdsc_args) == 1
+        if is_fp8_matmul and len(sdsc_args) == 0:
+            scales[dim]
+        is_kernel_tensor = (is_fp8_matmul or op_spec.op == "qfp8wt") and len(
+            sdsc_args
+        ) == 1
         base_stick_size = arg.device_dtype.elems_per_stick()
         if is_kernel_tensor:
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
