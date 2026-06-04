@@ -20,8 +20,8 @@ torch.manual_seed(0xAFFE)
 
 M, K, N = 128, 128, 128
 
-mat_a = torch.ones(M, K, dtype=torch.float16)
-mat_b = torch.ones(K, N, dtype=torch.float16)
+mat_a = torch.rand(M, K, dtype=torch.float16) * 0.01
+mat_b = torch.rand(K, N, dtype=torch.float16) * 0.01
 
 mat_a_s = mat_a.to(DEVICE)
 mat_b_s = mat_b.to(DEVICE)
@@ -41,9 +41,10 @@ def qfp8ch_scaled_mm(a, b, sa, sb):
 compiled_mm = torch.compile(qfp8ch_scaled_mm)
 spyre_result = compiled_mm(mat_a_s, mat_b_s, scale_a, scale_b).cpu()
 
-cpu_result = mat_a @ mat_b
+cpu_result = (mat_a.to(torch.float8_e4m3fn) @ mat_b.to(torch.float8_e4m3fn)).to(
+    torch.float16
+)
 max_delta = torch.abs(spyre_result - cpu_result).max()
-torch.set_printoptions(profile="full")
 print(f"spyre_result: {spyre_result}")
 print(f"cpu_result: {cpu_result}")
 
