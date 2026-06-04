@@ -22,6 +22,7 @@ from utils_inductor import (
     cached_randn,
     cached_xavier,
     compare_with_cpu,
+    compare_with_pytorch,
     make_param_dict,
     unique_randn_along_dim,
     shapes2key,
@@ -271,6 +272,7 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
     for src, dst in ALL_DTYPE_PAIRS
 }
 
+
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
@@ -278,7 +280,6 @@ TO_DTYPE_OP_PARAMS_SETS = {
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.bool and dst != torch.bool
 }
 
 TO_DTYPE_OP_EXPECT_FAIL = [
@@ -4955,9 +4956,12 @@ FP8_QUANT_DEQUANT_PARAMS = {
 class TestFp8QuantDequant(unittest.TestCase, metaclass=ParameterizedTestMeta):
     """Tests for the quantize_fp8_with_scale -> fp18todl16 (FP8->FP16) round-trip.
 
-    The compiled path produces:
+    The Spyre compiled path produces:
       reciprocal, mul, clip, qfp8ch  (fp16 -> fp8 via quantize_fp8_with_scale)
       fp18todl16                      (fp8 -> fp16)
+
+    The CPU reference is the plain fp16 input tensor (identity), since the
+    round-trip is expected to recover the original values within FP8 precision.
     """
 
     torch.manual_seed(0xAFFE)
@@ -4973,7 +4977,17 @@ class TestFp8QuantDequant(unittest.TestCase, metaclass=ParameterizedTestMeta):
             q = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
             return q.to(torch.float16)
 
-        compare_with_cpu(fn, x, scale, run_eager=False)
+        # CPU reference: the plain fp16 input tensor unchanged.
+        # The Spyre path goes fp16 -> quantize_fp8_with_scale -> fp18todl16 -> fp16
+        # and should recover the original values within FP8 quantization precision.
+        compare_with_pytorch(
+            fn,
+            lambda x, scale: x,
+            x,
+            scale,
+            atol=0.1,
+            rtol=0.1,
+        )
 
 
 if __name__ == "__main__":
