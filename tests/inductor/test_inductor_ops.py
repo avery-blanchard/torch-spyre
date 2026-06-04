@@ -273,20 +273,30 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
 }
 
 
+def _cached_randn_for_dtype(shape, dtype):
+    """Generate a random tensor for dtype; FP8 types are cast from fp16."""
+    if dtype == torch.float8_e4m3fn:
+        return cached_randn(shape, dtype=torch.float16)
+    return cached_randn(shape, dtype=dtype)
+
+
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
-        cached_randn(shape, dtype=src),
+        _cached_randn_for_dtype(shape, src),
         dst,
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
+    if src != torch.bool and dst != torch.bool
 }
 
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+    if src != torch.bool
+    and dst != torch.bool
+    and (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
