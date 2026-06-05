@@ -4942,15 +4942,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
 
 FP8_QUANT_DEQUANT_SHAPES = [
-    (4, 128),
     (4, 256),
-    (4, 64, 128),
+    (128, 128),
+    (4096, 4096),
+    (4, 64, 512),
+    (2, 32, 2048),
 ]
 
 FP8_QUANT_DEQUANT_SCALES = [
-    0.5,
     1.0,
-    2.0,
 ]
 
 FP8_QUANT_DEQUANT_PARAMS = {

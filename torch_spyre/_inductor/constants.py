@@ -20,7 +20,7 @@ BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 # Type casting operators from deeptools
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
-FP8TODL16_OP = "fp18todl16"
+FP8TODL16_OP = "fp8todl16"
 
 DEVICE_NAME = "spyre"
 
@@ -69,6 +69,6 @@ MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 
 
 # Populate more valid labels from deeptools here if needed
-INPUT_DIM_LABELS = ["in", "x", "y", "i", "j", "ki", "kj"]
+INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
