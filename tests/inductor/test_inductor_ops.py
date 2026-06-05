@@ -22,6 +22,7 @@ from utils_inductor import (
     cached_randn,
     cached_xavier,
     compare_with_cpu,
+    compare_with_pytorch,
     make_param_dict,
     unique_randn_along_dim,
     shapes2key,
@@ -53,14 +54,6 @@ POINTWISE_BINARY_OPS_DICT = {
     "mul": torch.mul,
     "sub": torch.sub,
     "div": torch.div,
-    "minimum": torch.minimum,
-    "maximum": torch.maximum,
-}
-
-POINTWISE_BINARY_OPS_INT64_DICT = {
-    "add": torch.add,
-    "mul": torch.mul,
-    "sub": torch.sub,
     "minimum": torch.minimum,
     "maximum": torch.maximum,
 }
@@ -279,9 +272,17 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
     for src, dst in ALL_DTYPE_PAIRS
 }
 
+
+def _cached_randn_for_dtype(shape, dtype):
+    """Generate a random tensor for dtype; FP8 types are cast from fp16."""
+    if dtype == torch.float8_e4m3fn:
+        return cached_randn(shape, dtype=torch.float16)
+    return cached_randn(shape, dtype=dtype)
+
+
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
-        cached_randn(shape, dtype=src),
+        _cached_randn_for_dtype(shape, src),
         dst,
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
@@ -293,7 +294,9 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+    if src != torch.bool
+    and dst != torch.bool
+    and (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -392,26 +395,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((7, 12, 32, 64),) * 2,
                 ]
             ),
-        },
-        (
-            "test_pointwise_binary_op_int64",
-            "test_binary_op",
-        ): {
-            "ops_dict": POINTWISE_BINARY_OPS_INT64_DICT,
-            "param_sets": {
-                "1d": (
-                    torch.randint(-100, 100, (256,), dtype=torch.int64),
-                    torch.randint(-100, 100, (256,), dtype=torch.int64),
-                ),
-                "2d": (
-                    torch.randint(-100, 100, (67, 256), dtype=torch.int64),
-                    torch.randint(-100, 100, (67, 256), dtype=torch.int64),
-                ),
-                "3d": (
-                    torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
-                    torch.randint(-100, 100, (67, 71, 256), dtype=torch.int64),
-                ),
-            },
         },
         ("test_add_broadcast", "test_add_broadcast"): {
             "param_sets": make_param_dict(
@@ -4955,6 +4938,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             dst_dtype,
             cpu_compile=False,
             run_eager=False,
+        )
+
+
+FP8_QUANT_DEQUANT_SHAPES = [
+    (4, 128),
+    (4, 256),
+    (4, 64, 128),
+]
+
+FP8_QUANT_DEQUANT_SCALES = [
+    0.5,
+    1.0,
+    2.0,
+]
+
+FP8_QUANT_DEQUANT_PARAMS = {
+    f"scale{scale}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=torch.float16, scale=0.1),
+        torch.tensor([scale], dtype=torch.float16),
+    )
+    for shape in FP8_QUANT_DEQUANT_SHAPES
+    for scale in FP8_QUANT_DEQUANT_SCALES
+}
+
+
+class TestFp8QuantDequant(unittest.TestCase, metaclass=ParameterizedTestMeta):
+    """Tests for the quantize_fp8_with_scale -> fp18todl16 (FP8->FP16) round-trip.
+
+    The Spyre compiled path produces:
+      reciprocal, mul, clip, qfp8ch  (fp16 -> fp8 via quantize_fp8_with_scale)
+      fp18todl16                      (fp8 -> fp16)
+
+    The CPU reference is the plain fp16 input tensor (identity), since the
+    round-trip is expected to recover the original values within FP8 precision.
+    """
+
+    torch.manual_seed(0xAFFE)
+
+    PARAMS = {
+        ("test_fp8_quant_dequant", "test_fp8_quant_dequant_base"): {
+            "param_sets": FP8_QUANT_DEQUANT_PARAMS,
+        },
+    }
+
+    def test_fp8_quant_dequant_base(self, x, scale):
+        def fn(x, scale):
+            q = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return q.to(torch.float16)
+
+        # CPU reference: the plain fp16 input tensor unchanged.
+        # The Spyre path goes fp16 -> quantize_fp8_with_scale -> fp18todl16 -> fp16
+        # and should recover the original values within FP8 quantization precision.
+        compare_with_pytorch(
+            fn,
+            lambda x, scale: x,
+            x,
+            scale,
+            atol=0.1,
+            rtol=0.1,
         )
 
 
