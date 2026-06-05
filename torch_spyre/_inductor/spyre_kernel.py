@@ -240,6 +240,10 @@ class SpyreOpFuncs:
         return PointwiseOp("reciprocal", [x])
 
     @staticmethod
+    def qfp8ch(x):
+        return PointwiseOp("qfp8ch", [x])
+
+    @staticmethod
     def relu(x):
         return PointwiseOp("relufwd", [x])
 
@@ -427,8 +431,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op in [IDENTITY_OP, RESTICKIFY_OP]
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
-                or arg.device_dtype == DataFormats.SEN169_FP16
-                or arg.device_dtype == DataFormats.SEN143_FP8
+                or arg.device_dtype
+                in [
+                    DataFormats.SEN169_FP16,
+                    DataFormats.SEN143_FP8,
+                    DataFormats.SEN152_FP8,
+                ]
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 
