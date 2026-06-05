@@ -20,6 +20,7 @@ BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 # Type casting operators from deeptools
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
+FP8TODL16_OP = "fp8todl16"
 
 DEVICE_NAME = "spyre"
 
