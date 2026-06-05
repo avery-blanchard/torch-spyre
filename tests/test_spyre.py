@@ -717,9 +717,11 @@ class TestSpyre(TestCase):
             # - D2H with conversion FROM FP8: does not match with expected output due to "anywhere valid" issue
             # - D2H with conversion TO FP8: does not match with expected output due to "anywhere valid" issue
             # FP8 operations work correctly in torch.compile mode via custom ops
-            if src_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or dst_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            if src_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or dst_dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
                 continue
-
 
             ctx = f"H2D {src_dtype}->{dst_dtype}"
             h2d_src = _make_cpu_tensor(src_dtype)
