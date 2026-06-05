@@ -1111,7 +1111,6 @@ def lower_qfp8ch(x):
 
     Pointwise format conversion only (no scaling).
     """
-    x.realize()
 
     fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
     x_loader = x.make_loader()
@@ -1131,33 +1130,21 @@ def lower_qfp8ch(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.quantize_fp8_with_scale)
-def lower_quantize_fp8_with_scale(x, scale):
-    """
-    Lower quantize_fp8_with_scale operation.
+@register_spyre_lowering(torch.ops.spyre.qfp8wt)
+def lower_qfp8wt(x):
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
 
-    Composes four operations:
-    1. Compute inverse scale using reciprocal (POINTWISE, sfp unit)
-    2. Multiply by inverse scale (POINTWISE)
-    3. Clamp to FP8 range [-448, 448] (POINTWISE)
-    4. Convert to FP8 format using qfp8ch (POINTWISE format conversion)
-    """
-    x.realize()
-    scale.realize()
+    def inner_fn(index):
+        return fn(x_loader(index))
 
-    # Step 1: Compute inverse scale using reciprocal
-    inv_scale = lowering.reciprocal(scale)
-    inv_scale.realize()  # Force realization to prevent fusion
-
-    # Step 2: Multiply by inverse scale
-    x_scaled = lowering.mul(x, inv_scale)
-    x_scaled.realize()  # Force realization to prevent fusion
-
-    # Step 3: Clamp to FP8 E4M3 range
-    x_clamped = lower_clamp(x_scaled, -448.0, 448.0)
-    x_clamped.realize()  # Force realization to prevent fusion
-
-    # Step 4: Convert to FP8 format
-    x_fp8 = lower_qfp8ch(x_clamped)
-
-    return x_fp8
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
