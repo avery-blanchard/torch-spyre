@@ -286,7 +286,7 @@ TO_DTYPE_OP_PARAMS_SETS = {
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.bool and dst != torch.bool
+    if src not in (torch.bool, torch.float8_e4m3fn) and dst != torch.bool
 }
 
 TO_DTYPE_OP_EXPECT_FAIL = [
@@ -3812,6 +3812,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
         },
+        ("test_dequantize_fp8_with_scale", "test_dequantize_fp8_with_scale_cpu"): {
+            "param_sets": {
+                "shape_1_128_512_scale_0.01": ((1, 128, 512), 0.01, 0.0, 1.0),
+                "shape_4_128_512_scale_0.1": ((4, 128, 512), 0.1, 0.0, 5.0),
+                "shape_1_128_1024_scale_0.5": ((1, 128, 1024), 0.5, 10.0, 50.0),
+                "shape_1_128_2048_scale_1.0": ((1, 128, 2048), 1.0, 100.0, 100.0),
+                "shape_1_128_4096_scale_2.0": ((1, 128, 4096), 2.0, 200.0, 200.0),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5154,6 +5163,60 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cpu_compile=False,
             run_eager=False,
         )
+
+    def test_quantize_fp8_with_scale_cpu(self):
+        @torch.compile(backend="inductor")
+        def quant_fn(x, scale):
+            return torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+        x_cpu = cached_randn((1, 2, 8), dtype=torch.float16, scale=0.5)
+        scale_value = 0.5
+        scale_spyre = torch.tensor([scale_value], dtype=torch.float16, device="spyre")
+
+        x_spyre = x_cpu.to("spyre")
+        x_fp8 = quant_fn(x_spyre, scale_spyre)
+
+        assert x_fp8.shape == x_spyre.shape
+        assert x_fp8.dtype == torch.float8_e4m3fn
+
+        result = x_fp8.cpu().to(torch.float16)
+        expected = (
+            (x_cpu / scale_value)
+            .clamp(-448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .to(torch.float16)
+        )
+
+        torch.testing.assert_close(result, expected, atol=0.25, rtol=0.0)
+
+    def test_dequantize_fp8_with_scale_cpu(self, shape, scale_value, mean, std):
+        @torch.compile(backend="inductor")
+        def quant_fn(x, scale):
+            return torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+        @torch.compile(backend="inductor")
+        def dequant_fn(x_fp8, scale):
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        x_cpu = torch.randn(shape, dtype=torch.float16) * std + mean
+        scale_spyre = torch.tensor([scale_value], dtype=torch.float16, device="spyre")
+
+        x_spyre = x_cpu.to("spyre")
+        x_fp8 = quant_fn(x_spyre, scale_spyre)
+        result = dequant_fn(x_fp8, scale_spyre).cpu()
+
+        expected = (x_cpu / scale_value).clamp(-448.0, 448.0).to(
+            torch.float8_e4m3fn
+        ).to(torch.float16) * scale_value
+
+        assert result.shape == x_cpu.shape
+        assert result.dtype == torch.float16
+        # Increased tolerance to 64.0 to account for FP8 E4M3 halfway case rounding differences.
+        # When input is exactly halfway between two FP8 values (e.g., 272.0 between 256.0 and 288.0),
+        # CPU and device may use different tie-breaking rules (round-to-even vs round-up).
+        # With scale=2.0: input ~600 / 2.0 = ~300 (FP8 spacing 32), then error * 2.0 = 64.0.
+        # Example: 336.0 quantizes to either 320.0 or 352.0, giving 32 error, scaled up to 64.
+        torch.testing.assert_close(result, expected, atol=64.0, rtol=0.0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):

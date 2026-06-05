@@ -140,6 +140,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
           - name: Inductor Normalization Scalars
             config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
+          - name: Inductor Ops FP8
+            config: torch_spyre_tests/inductor/test_inductor_ops_fp8_config.yaml
           - name: Inductor Ops Matmul
             config: torch_spyre_tests/inductor/test_inductor_ops_matmul_config.yaml
           - name: Inductor Ops Reductions Keepdim Multidim0
