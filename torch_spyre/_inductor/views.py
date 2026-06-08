@@ -677,10 +677,12 @@ def padded_stick_count(
                 ):
                     return device_size[i] - offset
                 break
-        if not found_adj and it_elems is not None and len(device_coords) == 2:
-            # 1D tensor: exactly one outer (stick-count) dim plus the
-            # within-stick dim.  Reshaped views have multiple outer dims, so
-            # len == 2 distinguishes a genuine 1D beyond-nearest-stick layout.
+        if not found_adj and it_elems is not None and stride_map[last] == 1:
+            # 1D beyond-nearest-stick: no adjacent outer dim and the
+            # within-stick host stride is 1 (contiguous allocation, not a
+            # slice).  Slices have stride_map[-1] == stick_size (e.g. 64),
+            # and reshaped views have multiple outer dims — both are handled
+            # by backGap in _create_sdsc_tensors instead.
             nearest = (it_elems + stride_map[i] - 1) // stride_map[i]
             remaining = device_size[i] - offset
             if remaining > nearest:
