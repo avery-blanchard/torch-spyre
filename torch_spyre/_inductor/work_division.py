@@ -234,8 +234,11 @@ def adjust_it_space_for_sticks(
             if td is output_td
             else None,
         )
-        if device_stick_count is not None:
-            adjusted_space[stick_var] = max(min_sticks, device_stick_count)
+        adjusted_space[stick_var] = (
+            max(min_sticks, device_stick_count)
+            if device_stick_count is not None
+            else min_sticks
+        )
 
     return adjusted_space, max_elems
 
