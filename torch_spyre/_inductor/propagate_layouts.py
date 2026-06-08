@@ -196,48 +196,30 @@ def _single_arg_op_layout(
                 list(range(len(c_size))),
             )
 
-        case spyreop.qfp8ch.default:
-            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) channel quantization.
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
-            outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
-            outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
-            last_dim = (
-                in_elems_per_stick
-                if unaligned > 0
-                else concretize_expr(output.size[-1])
+        case spyreop.qfp8ch.default | spyreop.qfp8wt.default:
+            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
+            # Propagate the input device layout and rescale for the dtype change,
+            # preserving any padding present in the input STL.
+            elem_arr = (
+                ElementArrangement.QFP8CH
+                if aten_op is spyreop.qfp8ch.default
+                else ElementArrangement.QFP8WT
             )
-            c_size = outer_sizes + [last_dim]
-            c_stride = outer_strides + [1]
+            in_eps = get_elem_in_stick(in_layout.dtype)
+            out_eps = get_elem_in_stick(output.dtype)
+            out_device_size = list(stl.device_size)
+            out_stride_map = list(stl.stride_map)
+            out_device_size[-1] = out_eps
+            for i, s in enumerate(stl.stride_map):
+                if s == in_eps:
+                    out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+                    out_stride_map[i] = out_eps
+                    break
             return SpyreTensorLayout(
-                c_size,
-                c_stride,
-                output.dtype,
-                list(range(len(c_size))),
-                ElementArrangement.QFP8CH,
-            )
-
-        case spyreop.qfp8wt.default:
-            # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
-            outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
-            outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
-            last_dim = (
-                in_elems_per_stick
-                if unaligned > 0
-                else concretize_expr(output.size[-1])
-            )
-            c_size = outer_sizes + [last_dim]
-            c_stride = outer_strides + [1]
-            return SpyreTensorLayout(
-                c_size,
-                c_stride,
-                output.dtype,
-                list(range(len(c_size))),
-                ElementArrangement.QFP8WT,
+                out_device_size,
+                out_stride_map,
+                get_device_dtype(output.dtype),
+                elem_arr,
             )
         case _:
             in_coords = host_coordinates(in_layout, dep)
