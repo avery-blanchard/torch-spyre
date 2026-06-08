@@ -654,35 +654,40 @@ def padded_stick_count(
     stride_map: list[int],
     stick_sym: sympy.Symbol,
     it_elems: int | None = None,
+    max_input_sticks: int | None = None,
 ) -> int | None:
-    """Return padded stick count if stick dim padding is beyond the
-    nearest multiple of the stick size.
+    """Return the stick count for a beyond-nearest-stick allocation, or None.
+
+    Multi-dim: detected via a stride gap between the stick-count dim and an
+    adjacent dim.  1D: detected by comparing device_size to the nearest-stick
+    ceiling of it_elems; only fires for outputs (it_elems provided) that are
+    not writes into a larger parent (device_size <= max_input_sticks).
     """
     last = len(stride_map) - 1
-    for i, coord in enumerate(device_coords[:-1]):
-        if stick_sym not in coord.free_symbols:
-            continue
-        offset = int(coord.as_coeff_Add()[0])
-        found_adj = False
-        for j in [i - 1, i + 1]:
-            if 0 <= j < last and stride_map[j] not in (-1, 1):
-                found_adj = True
-                if stride_map[j] > stride_map[i] and (
-                    device_size[i] * stride_map[i] != stride_map[j]
-                ):
-                    return device_size[i] - offset
-                break
-        if (
-            not found_adj
-            and it_elems is not None
-            and stride_map[last] == 1
-            and coord.free_symbols == {stick_sym}
-            and offset == 0
-        ):
-            # 1D beyond-nearest-stick: contiguous (stride[-1]==1), outer coord
-            # has only stick_sym, no offset into a larger buffer.
-            nearest = (it_elems + stride_map[i] - 1) // stride_map[i]
-            if device_size[i] > nearest:
-                return device_size[i]
-        break
+    # Find the device dim that contains stick_sym in its coordinate.
+    i = next(
+        (k for k, c in enumerate(device_coords[:-1]) if stick_sym in c.free_symbols),
+        None,
+    )
+    if i is None:
+        return None
+    offset = int(device_coords[i].as_coeff_Add()[0])
+    # Multi-dim: adjacent dim with a stride gap signals beyond-nearest-stick.
+    for j in [i - 1, i + 1]:
+        if 0 <= j < last and stride_map[j] not in (-1, 1):
+            if stride_map[j] > stride_map[i] and (
+                device_size[i] * stride_map[i] != stride_map[j]
+            ):
+                return device_size[i] - offset
+            return None
+    # 1D: contiguous, single-variable coord, no offset, output only, not a parent write.
+    if (
+        it_elems is not None
+        and stride_map[last] == 1
+        and device_coords[i].free_symbols == {stick_sym}
+        and offset == 0
+        and (max_input_sticks is None or device_size[i] <= max_input_sticks)
+        and device_size[i] > (it_elems + stride_map[i] - 1) // stride_map[i]
+    ):
+        return device_size[i]
     return None

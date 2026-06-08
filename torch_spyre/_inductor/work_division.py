@@ -189,16 +189,29 @@ def adjust_it_space_for_sticks(
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
     fewer cores assigned to the stick dimension).
 
-    output_td identifies the output tensor; it_elems is passed to
-    padded_stick_count only for outputs (input slices of larger parents are
-    indistinguishable from beyond-nearest-stick in the 1D path).
-
     The original it_space is not mutated.
     """
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
-    # (device_stick_count, elems_per_stick) keyed by stick variable.
-    device_stick_counts: dict[Symbol, list[tuple[int, int]]] = {}
+
+    # Max input stick count per stick variable — guards the 1D output path against
+    # mistaking a write into a larger parent for a beyond-nearest-stick allocation.
+    max_input_sticks: dict[Symbol, int] = {}
+    for td in tensor_deps:
+        if td is output_td:
+            continue
+        stick_expr = td.device_coords[-1]
+        if len(stick_expr.free_symbols) != 1:
+            continue
+        stick_var = next(iter(stick_expr.free_symbols))
+        for i, coord in enumerate(td.device_coords[:-1]):
+            if stick_var in coord.free_symbols:
+                max_input_sticks[stick_var] = max(
+                    max_input_sticks.get(stick_var, 0),
+                    td.layout.device_layout.device_size[i],
+                )
+                break
+
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -209,33 +222,20 @@ def adjust_it_space_for_sticks(
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
-        it_elems_arg = (
-            concretize_expr(adjusted_space[stick_var]) if td is output_td else None
-        )
+        it_elems = concretize_expr(adjusted_space[stick_var])
+        min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
         device_stick_count = padded_stick_count(
             td.device_coords,
             td.layout.device_layout.device_size,
             td.layout.device_layout.stride_map,
             stick_var,
-            it_elems=it_elems_arg,
+            it_elems=it_elems if td is output_td else None,
+            max_input_sticks=max_input_sticks.get(stick_var)
+            if td is output_td
+            else None,
         )
         if device_stick_count is not None:
-            device_stick_counts.setdefault(stick_var, []).append(
-                (device_stick_count, elems_per_stick)
-            )
-
-    for stick_var, elems_per_stick in max_elems.items():
-        it_elems = concretize_expr(adjusted_space[stick_var])
-        min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
-        # Pick the smallest allocation (in max_elems units) that covers min_sticks.
-        alloc_sticks = [
-            (dev_sticks * dev_elems_per_stick + elems_per_stick - 1) // elems_per_stick
-            for dev_sticks, dev_elems_per_stick in device_stick_counts.get(
-                stick_var, []
-            )
-        ]
-        result = min((s for s in alloc_sticks if s >= min_sticks), default=min_sticks)
-        adjusted_space[stick_var] = result
+            adjusted_space[stick_var] = max(min_sticks, device_stick_count)
 
     return adjusted_space, max_elems
 

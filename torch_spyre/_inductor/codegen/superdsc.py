@@ -260,63 +260,51 @@ def _get_padded_iteration_space(
     sdsc_iteration_space: dict,
     symbol_mapping: dict,
 ) -> dict:
-    """Extend sdsc_iteration_space to match each arg's device allocation.
+    """Extend sdsc_iteration_space to match each output arg's device allocation.
 
     Must run before _create_sdsc_tensors so backGap is computed against the
     final iteration space.  Returns a mapping of dim -> padding added.
     """
-    max_elems_per_stick: dict = {}
-    stick_dims: dict = {}
-    # (device_stick_count, elems_per_stick) keyed by stick symbol.
-    device_stick_counts: dict = {}
-    for op_spec_arg in op_spec_args:
-        elems_per_stick = op_spec_arg.device_dtype.elems_per_stick()
-        orig_syms = op_spec_arg.device_coordinates[-1].free_symbols
-        if len(orig_syms) != 1:
+    # Build max input stick count per stick symbol for the 1D parent-write guard.
+    max_input_sticks: dict = {}
+    for arg in op_spec_args:
+        if not arg.is_input or arg.stride_map is None:
             continue
-        stick_sym = next(iter(orig_syms))
+        syms = arg.device_coordinates[-1].free_symbols
+        if len(syms) != 1:
+            continue
+        stick_sym = next(iter(syms))
+        for i, coord in enumerate(arg.device_coordinates[:-1]):
+            if stick_sym in coord.free_symbols:
+                max_input_sticks[stick_sym] = max(
+                    max_input_sticks.get(stick_sym, 0), arg.device_size[i]
+                )
+                break
+
+    padding: dict = {}
+    for arg in op_spec_args:
+        if arg.is_input or arg.stride_map is None:
+            continue
+        syms = arg.device_coordinates[-1].free_symbols
+        if len(syms) != 1:
+            continue
+        stick_sym = next(iter(syms))
         stick_dim = symbol_mapping.get(stick_sym)
         if stick_dim is None or stick_dim not in sdsc_iteration_space:
             continue
-        if (
-            stick_sym not in max_elems_per_stick
-            or elems_per_stick > max_elems_per_stick[stick_sym]
-        ):
-            max_elems_per_stick[stick_sym] = elems_per_stick
-        stick_dims[stick_sym] = stick_dim
-        if op_spec_arg.stride_map is not None:
-            # Input slices of larger parents are indistinguishable from
-            # beyond-nearest-stick in the 1D path; pass it_elems for outputs only.
-            it_elems_arg = (
-                sdsc_iteration_space[stick_dim] if not op_spec_arg.is_input else None
-            )
-            device_stick_count = padded_stick_count(
-                op_spec_arg.device_coordinates,
-                op_spec_arg.device_size,
-                op_spec_arg.stride_map,
-                stick_sym,
-                it_elems=it_elems_arg,
-            )
-            if device_stick_count is not None:
-                device_stick_counts.setdefault(stick_sym, []).append(
-                    (device_stick_count, elems_per_stick)
-                )
-
-    padding: dict = {}
-    for stick_sym, elems_per_stick in max_elems_per_stick.items():
-        stick_dim = stick_dims[stick_sym]
+        elems_per_stick = arg.device_dtype.elems_per_stick()
         it_elems = sdsc_iteration_space[stick_dim]
-        min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
-        # Use the smallest device stick count that covers min_sticks, converting
-        # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
-        alloc_sticks = [
-            (dev_sticks * dev_elems_per_stick + elems_per_stick - 1) // elems_per_stick
-            for dev_sticks, dev_elems_per_stick in device_stick_counts.get(
-                stick_sym, []
-            )
-        ]
-        result = min((s for s in alloc_sticks if s >= min_sticks), default=min_sticks)
-        target = result * elems_per_stick
+        device_stick_count = padded_stick_count(
+            arg.device_coordinates,
+            arg.device_size,
+            arg.stride_map,
+            stick_sym,
+            it_elems=it_elems,
+            max_input_sticks=max_input_sticks.get(stick_sym),
+        )
+        if device_stick_count is None:
+            continue
+        target = device_stick_count * elems_per_stick
         if target > it_elems:
             padding[stick_dim] = target - it_elems
             sdsc_iteration_space[stick_dim] = target
