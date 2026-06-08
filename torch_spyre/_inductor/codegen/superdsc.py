@@ -304,15 +304,14 @@ def _get_padded_iteration_space(
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
         # Use the smallest device stick count that covers min_sticks, converting
         # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
-        result = None
-        for dev_sticks, dev_elems_per_stick in device_stick_counts.get(stick_sym, []):
-            in_max_units = (
-                dev_sticks * dev_elems_per_stick + elems_per_stick - 1
-            ) // elems_per_stick
-            if in_max_units >= min_sticks:
-                if result is None or in_max_units < result:
-                    result = in_max_units
-        target = (result if result is not None else min_sticks) * elems_per_stick
+        alloc_sticks = [
+            (dev_sticks * dev_elems_per_stick + elems_per_stick - 1) // elems_per_stick
+            for dev_sticks, dev_elems_per_stick in device_stick_counts.get(
+                stick_sym, []
+            )
+        ]
+        result = min((s for s in alloc_sticks if s >= min_sticks), default=min_sticks)
+        target = result * elems_per_stick
         if target > it_elems:
             padding[stick_dim] = target - it_elems
             sdsc_iteration_space[stick_dim] = target
@@ -560,7 +559,9 @@ def _extend_matmul_k_to_padded(
     )
     if k_stick_count_dim is not None and y_arg.stride_map is not None:
         k_min_sticks = (k_current + stick_size - 1) // stick_size
-        k_sym_var = next(iter(y_arg.device_coordinates[-1].free_symbols), None)
+        # Use the variable from the K outer coord, not the within-stick variable.
+        k_outer_syms = y_arg.device_coordinates[k_stick_count_dim].free_symbols
+        k_sym_var = next(iter(k_outer_syms), None)
         k_device_sticks = (
             padded_stick_count(
                 y_arg.device_coordinates,

@@ -677,12 +677,14 @@ def padded_stick_count(
                 ):
                     return device_size[i] - offset
                 break
-        if not found_adj and it_elems is not None and stride_map[last] == 1:
-            # 1D beyond-nearest-stick: no adjacent outer dim and the
-            # within-stick host stride is 1 (contiguous allocation, not a
-            # slice).  Slices have stride_map[-1] == stick_size (e.g. 64),
-            # and reshaped views have multiple outer dims — both are handled
-            # by backGap in _create_sdsc_tensors instead.
+        if (
+            not found_adj
+            and it_elems is not None
+            and stride_map[last] == 1
+            and coord.free_symbols == {stick_sym}
+        ):
+            # 1D beyond-nearest-stick: contiguous allocation (stride[-1]==1),
+            # outer coord has only stick_sym (multi-dim views have extra vars).
             nearest = (it_elems + stride_map[i] - 1) // stride_map[i]
             remaining = device_size[i] - offset
             if remaining > nearest:
