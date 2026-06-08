@@ -653,9 +653,15 @@ def padded_stick_count(
     device_size: list[int],
     stride_map: list[int],
     stick_sym: sympy.Symbol,
+    it_elems: int | None = None,
 ) -> int | None:
     """Return padded stick count if stick dim padding is beyond the
     nearest multiple of the stick size.
+
+    For tensors with adjacent outer dims, detects padding by comparing
+    the adjacent host stride against the expected product.  For 1D tensors
+    (no adjacent outer dim), it_elems is required; returns the allocated
+    stick count only when it exceeds ceil(it_elems / stride_map[i]).
     """
     last = len(stride_map) - 1
     for i, coord in enumerate(device_coords[:-1]):
@@ -671,9 +677,13 @@ def padded_stick_count(
                 ):
                     return device_size[i] - offset
                 break
-        if not found_adj:
-            # 1D case: stick-count dim has no adjacent outer dim.
-            # device_size[i] is the full allocated stick count.
-            return device_size[i] - offset
+        if not found_adj and it_elems is not None and len(device_coords) == 2:
+            # 1D tensor: exactly one outer (stick-count) dim plus the
+            # within-stick dim.  Reshaped views have multiple outer dims, so
+            # len == 2 distinguishes a genuine 1D beyond-nearest-stick layout.
+            nearest = (it_elems + stride_map[i] - 1) // stride_map[i]
+            remaining = device_size[i] - offset
+            if remaining > nearest:
+                return remaining
         break
     return None
