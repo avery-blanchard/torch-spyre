@@ -806,14 +806,17 @@ def simplify_op_spec(op_spec):
                 0, len(arg.device_coordinates) - len(old_stride_map)
             )
             old_sym_to_idx = {}
-            for j, coord in enumerate(old_coords):
+            for j, coord in enumerate(old_coords[:-1]):
                 for sym in coord.free_symbols:
                     old_sym_to_idx.setdefault(sym, j)
-            for d, coord in enumerate(arg.device_coordinates):
+            last = len(old_stride_map) - 1
+            for d, coord in enumerate(arg.device_coordinates[:-1]):
                 syms = coord.free_symbols
                 if not syms:
                     continue
                 j = old_sym_to_idx.get(next(iter(syms)))
-                if j is not None and j < len(old_stride_map):
+                if j is not None and j < last:
                     new_stride_map[d] = old_stride_map[j]
+            # Always preserve the within-stick stride from the original last entry.
+            new_stride_map[len(arg.device_coordinates) - 1] = old_stride_map[last]
             arg.stride_map = new_stride_map

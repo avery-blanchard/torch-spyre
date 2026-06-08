@@ -173,6 +173,7 @@ def multi_dim_iteration_space_split(
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
+    output_td: TensorDep | None = None,
 ) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
     """
     Return a copy of it_space with stick variables converted from elements to
@@ -187,6 +188,10 @@ def adjust_it_space_for_sticks(
     input and an int64 argmax output), the largest elems_per_stick is used
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
     fewer cores assigned to the stick dimension).
+
+    output_td identifies the output tensor; it_elems is passed to
+    padded_stick_count only for outputs (input slices of larger parents are
+    indistinguishable from beyond-nearest-stick in the 1D path).
 
     The original it_space is not mutated.
     """
@@ -204,11 +209,15 @@ def adjust_it_space_for_sticks(
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
+        it_elems_arg = (
+            concretize_expr(adjusted_space[stick_var]) if td is output_td else None
+        )
         device_stick_count = padded_stick_count(
             td.device_coords,
             td.layout.device_layout.device_size,
             td.layout.device_layout.stride_map,
             stick_var,
+            it_elems=it_elems_arg,
         )
         if device_stick_count is not None:
             device_stick_counts.setdefault(stick_var, []).append(
@@ -218,17 +227,15 @@ def adjust_it_space_for_sticks(
     for stick_var, elems_per_stick in max_elems.items():
         it_elems = concretize_expr(adjusted_space[stick_var])
         min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
-        # Use the smallest device stick count that covers min_sticks, converting
-        # to max_elems units to handle dtype mismatches (e.g. fp32 vs fp16).
-        result = None
-        for dev_sticks, dev_elems_per_stick in device_stick_counts.get(stick_var, []):
-            in_max_units = (
-                dev_sticks * dev_elems_per_stick + elems_per_stick - 1
-            ) // elems_per_stick
-            if in_max_units >= min_sticks:
-                if result is None or in_max_units < result:
-                    result = in_max_units
-        adjusted_space[stick_var] = result if result is not None else min_sticks
+        # Pick the smallest allocation (in max_elems units) that covers min_sticks.
+        alloc_sticks = [
+            (dev_sticks * dev_elems_per_stick + elems_per_stick - 1) // elems_per_stick
+            for dev_sticks, dev_elems_per_stick in device_stick_counts.get(
+                stick_var, []
+            )
+        ]
+        result = min((s for s in alloc_sticks if s >= min_sticks), default=min_sticks)
+        adjusted_space[stick_var] = result
 
     return adjusted_space, max_elems
 
@@ -534,7 +541,9 @@ def span_reduction_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, all_tds, output_td
+    )
     min_splits = must_split_vars(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores
     )
@@ -618,7 +627,7 @@ def work_distribution_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds, output_td)
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
@@ -947,7 +956,9 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     all_tds = input_tds + [output_td]
 
     it_space = iteration_space_from_op(op)
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, all_tds, output_td
+    )
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
     # runs before this pass, and work_distribution — which would overwrite it —

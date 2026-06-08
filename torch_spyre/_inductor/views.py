@@ -672,10 +672,17 @@ def padded_stick_count(
                 ):
                     return device_size[i] - offset
                 break
-        if not found_adj and it_elems is not None and stride_map[last] == 1:
+        if (
+            not found_adj
+            and it_elems is not None
+            and stride_map[last] == 1
+            and coord.free_symbols == {stick_sym}
+            and offset == 0
+        ):
+            # 1D beyond-nearest-stick: contiguous (stride[-1]==1), outer coord
+            # has only stick_sym, no offset into a larger buffer.
             nearest = (it_elems + stride_map[i] - 1) // stride_map[i]
-            remaining = device_size[i] - offset
-            if remaining > nearest:
-                return remaining
+            if device_size[i] > nearest:
+                return device_size[i]
         break
     return None
