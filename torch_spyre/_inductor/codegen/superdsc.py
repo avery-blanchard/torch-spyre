@@ -285,12 +285,17 @@ def _get_padded_iteration_space(
             max_elems_per_stick[stick_sym] = elems_per_stick
         stick_dims[stick_sym] = stick_dim
         if op_spec_arg.stride_map is not None:
+            # Input slices of larger parents are indistinguishable from
+            # beyond-nearest-stick in the 1D path; pass it_elems for outputs only.
+            it_elems_arg = (
+                sdsc_iteration_space[stick_dim] if not op_spec_arg.is_input else None
+            )
             device_stick_count = padded_stick_count(
                 op_spec_arg.device_coordinates,
                 op_spec_arg.device_size,
                 op_spec_arg.stride_map,
                 stick_sym,
-                it_elems=sdsc_iteration_space[stick_dim],
+                it_elems=it_elems_arg,
             )
             if device_stick_count is not None:
                 device_stick_counts.setdefault(stick_sym, []).append(
