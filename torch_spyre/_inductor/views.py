@@ -662,10 +662,16 @@ def padded_stick_count(
         if stick_sym not in coord.free_symbols:
             continue
         offset = int(coord.as_coeff_Add()[0])
+        found_adj = False
         for j in [i - 1, i + 1]:
             if 0 <= j < last and stride_map[j] not in (-1, 1):
+                found_adj = True
                 if device_size[i] * stride_map[i] != stride_map[j]:
                     return device_size[i] - offset
                 break
+        if not found_adj:
+            # 1D case: stick-count dim has no adjacent outer dim.
+            # device_size[i] is the full allocated stick count.
+            return device_size[i] - offset
         break
     return None
