@@ -209,7 +209,6 @@ def adjust_it_space_for_sticks(
             td.layout.device_layout.device_size,
             td.layout.device_layout.stride_map,
             stick_var,
-            it_elems=concretize_expr(adjusted_space[stick_var]),
         )
         if device_stick_count is not None:
             device_stick_counts.setdefault(stick_var, []).append(
