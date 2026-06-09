@@ -1132,7 +1132,7 @@ def lower_qfp8ch(x):
 
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
     x_loader = x.make_loader()
 
     def inner_fn(index):

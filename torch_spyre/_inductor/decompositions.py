@@ -787,11 +787,13 @@ def dequantize_fp8_with_scale_decomp(
 ) -> torch.Tensor:
     """
     Decompose dequantize_fp8_with_scale into:
-    1. FP8→FP16 conversion using .to() (triggers fp8todl16 via dtype_ops)
+    1. FP8→FP16 conversion via .to() (lowered to fp8todl16 by dtype_ops)
     2. Multiply by scale
 
+    The .to() call differs from the quantize path which uses explicit custom ops.
     This decomposition is executed during compilation and removes the custom op
-    from the graph before lowering.
+    from the graph before lowering. The .to(float16) call will route through
+    DtypeOpTable during lowering to emit the fp8todl16 operation.
     """
     x_fp16 = input.to(torch.float16)
     return x_fp16 * scale

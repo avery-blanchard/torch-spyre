@@ -200,6 +200,7 @@ def _single_arg_op_layout(
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
             # Propagate the input device layout and rescale for the dtype change,
             # preserving any padding present in the input STL.
+            # Multi-dimensional stick handling (for qfp8wt) is pushed to sdsc generation.
             elem_arr = (
                 ElementArrangement.QFP8CH
                 if aten_op is spyreop.qfp8ch.default
