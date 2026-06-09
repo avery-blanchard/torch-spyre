@@ -128,8 +128,8 @@ def _single_arg_op_layout(
 
     if isinstance(data, Reduction):
         # Propagate input stick to output if the dim survives, else put stick last.
-        x_dev_coords = device_coordinates(stl, dep)
-        out_coords = host_coordinates(output, output_dep)
+        x_dev_coords = device_coordinates(stl, dep, op)
+        out_coords = host_coordinates(output, output_dep, op)
         x_stick_expr = x_dev_coords[-1]
         out_stick_dim = matching_dim(out_coords, x_stick_expr)
         if out_stick_dim is None:
@@ -198,8 +198,8 @@ def _single_arg_op_layout(
             )
 
         case _:
-            in_coords = host_coordinates(in_layout, dep)
-            out_coords = host_coordinates(output, output_dep)
+            in_coords = host_coordinates(in_layout, dep, op)
+            out_coords = host_coordinates(output, output_dep, op)
             if (
                 in_coords == out_coords
                 and in_layout.size == output.size
@@ -219,7 +219,7 @@ def _single_arg_op_layout(
                 #       For now, use the default layout for a mostly row major dimension
                 #       ordering, adjusted to put the stick dimension last and move all
                 #       non-stick size one dimensions to the right to avoid tiling them.
-                in_device_coords = device_coordinates(stl, dep)
+                in_device_coords = device_coordinates(stl, dep, op)
                 stick_expr = in_device_coords[-1]
                 maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
@@ -257,8 +257,8 @@ def _exx2_layout(
         c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
     )
     reduction_var = _find_reduction_var(x.dep, output_dep, "exx2")
-    req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl])
+    req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x", op)
+    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
     return [out_stl]
 
 
@@ -278,9 +278,9 @@ def _layernormnorm_layout(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     reduction_var = _find_reduction_var(x.dep, output_dep, "layernormnorm")
     req_in_stl = find_stick_compatible_input_layout(
-        x, reduction_var, "layernormnorm", "x"
+        x, reduction_var, "layernormnorm", "x", op
     )
-    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl])
+    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
     return [out_stl]
 
 
@@ -323,6 +323,7 @@ def find_stick_compatible_input_layout(
     reduction_var: "sympy.Symbol",
     reduction_type: str,
     label: str,
+    op: "Operation | None",
 ) -> "SpyreTensorLayout":
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
@@ -330,7 +331,7 @@ def find_stick_compatible_input_layout(
     2. Else return the first layout that can be restickified to put reduction_var on the stick.
     3. Else raise Unsupported.
     """
-    arg_dev_coords = [device_coordinates(stl, arg.dep) for stl in arg.layouts]
+    arg_dev_coords = [device_coordinates(stl, arg.dep, op) for stl in arg.layouts]
 
     # Pass 1: already stick-compatible.
     # stick_compatible() checks cross-tensor compatibility; here we only need
@@ -341,7 +342,7 @@ def find_stick_compatible_input_layout(
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
     # and use it as target_stick_expr for compute_restickify_target_layout.
-    arg_host_coords = host_coordinates(arg.layout, arg.dep)
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, op)
     for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
         target_stick_expr = _dev_coord_for_var(
             dev_coords, arg_host_coords, reduction_var
@@ -374,7 +375,7 @@ def _matmul_layouts(
        3. Compute the output STL and construct the FixedInOutNode cost function
     """
     data = op.data
-    out_coords = host_coordinates(output, output_dep)
+    out_coords = host_coordinates(output, output_dep, op)
 
     x = args[0]
     y = args[1]
@@ -387,10 +388,10 @@ def _matmul_layouts(
     generated_var = _find_matmul_generated_var(y.dep, x.dep, output_dep)
 
     x_req_stl = find_stick_compatible_input_layout(
-        x, reduction_var, data.reduction_type, "x"
+        x, reduction_var, data.reduction_type, "x", op
     )
     y_req_stl = find_stick_compatible_input_layout(
-        y, generated_var, data.reduction_type, "y"
+        y, generated_var, data.reduction_type, "y", op
     )
 
     out_stick_dim = next(
@@ -413,7 +414,7 @@ def _matmul_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl]
+        [x, y], out_stl, [x_req_stl, y_req_stl], op
     )
     return [out_stl]
 
@@ -432,10 +433,10 @@ def _multi_arg_pointwise_layouts(
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
     stick_exprs = {
-        device_coordinates(stl, arg.dep)[-1]
+        device_coordinates(stl, arg.dep, op)[-1]
         for arg in args
         for stl in arg.layouts
-        if device_coordinates(stl, arg.dep)[-1] != 0
+        if device_coordinates(stl, arg.dep, op)[-1] != 0
     }
 
     if len(stick_exprs) > 1:
@@ -445,8 +446,8 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
-    out_coords = host_coordinates(output, output_dep)
+    in_coords = [host_coordinates(arg.layout, arg.dep, op) for arg in args]
+    out_coords = host_coordinates(output, output_dep, op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -493,7 +494,7 @@ def _multi_arg_pointwise_layouts(
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         results.append(stl)
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
     return results
 
 
@@ -504,8 +505,8 @@ def _topk_layouts(
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
     x = args[0]
-    x_coords = host_coordinates(x.layout, x.dep)
-    out_coords = host_coordinates(output, output_dep)
+    x_coords = host_coordinates(x.layout, x.dep, op)
+    out_coords = host_coordinates(output, output_dep, op)
 
     # Reduction var: in x's index but absent from output's.
     reduction_var = _find_reduction_var(x.dep, output_dep, "topk")
@@ -522,7 +523,7 @@ def _topk_layouts(
     # coord becomes a candidate.
     out_stick_dims: set[int | None] = set()
     for stl in x.layouts:
-        x_stick_expr = device_coordinates(stl, x.dep)[-1]
+        x_stick_expr = device_coordinates(stl, x.dep, op)[-1]
         if reduction_var in x_stick_expr.free_symbols:
             for c in surviving_coords:
                 out_stick_dims.add(matching_dim(out_coords, c))
@@ -543,7 +544,7 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
     return results
 
 
@@ -635,7 +636,7 @@ def compute_layouts(
         _single_arg_op_layout(op, output, output_dep, args[0].dep, args[0].layout, stl)
         for stl in args[0].layouts
     ]
-    op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep, op)
     return layouts
 
 
@@ -850,7 +851,7 @@ def propagate_spyre_tensor_layouts(
                 args = _get_prop_args(rw.reads)
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
-                    args, [target_stl], output_dep
+                    args, [target_stl], output_dep, op
                 )
                 continue
             op.decide_layout()
