@@ -59,6 +59,7 @@ from .pass_utils import (
     concretize_expr,
     host_coordinates,
     device_coordinates,
+    index_role_dep_names,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -432,11 +433,13 @@ def _multi_arg_pointwise_layouts(
        2. Compute an out STL for each
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
+    index_names = index_role_dep_names(op)
     stick_exprs = {
         device_coordinates(stl, arg.dep, op)[-1]
         for arg in args
         for stl in arg.layouts
-        if device_coordinates(stl, arg.dep, op)[-1] != 0
+        if arg.dep.name not in index_names
+        and device_coordinates(stl, arg.dep, op)[-1] != 0
     }
 
     if len(stick_exprs) > 1:
@@ -494,7 +497,7 @@ def _multi_arg_pointwise_layouts(
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         results.append(stl)
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op, index_names)
     return results
 
 
