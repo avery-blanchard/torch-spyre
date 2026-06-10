@@ -523,6 +523,14 @@ def generate_sdsc(
                                     "component_": "lx"
                                     if "lx" in tensor.allocation
                                     else "hbm",
+                                    "indirectAllocType_": tensor.indirect_type,
+                                    **(
+                                        {
+                                            "relatedIndirectAccessAlloc_": tensor.related_alloc_name
+                                        }
+                                        if tensor.related_alloc_name is not None
+                                        else {}
+                                    ),
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if use_symbols and "lx" not in tensor.allocation
@@ -574,32 +582,39 @@ def generate_sdsc(
                                         if tensor.backGap
                                         else {}
                                     ),
-                                    "coordinates_": {
-                                        "coordInfo": {
-                                            str(dim): gen_coord_info_value(
-                                                size=sdsc_spec.iteration_space[dim]
-                                                // sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                nsplits=sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                elems_per_stick=tensor.data_format.elems_per_stick(),
-                                                is_stick_dim=(
-                                                    sdsc_spec.layouts[tensor.layout][
-                                                        "stick_dim_order"
-                                                    ].has(dim)
-                                                ),
-                                                is_stick_reduction=(
-                                                    tensor.scales[dim] == -2
-                                                ),
-                                            )
-                                            for dim in sdsc_spec.layouts[tensor.layout][
-                                                "dim_order"
-                                            ]
-                                        },
-                                        "coreIdToWkSlice_": {},
-                                    },
+                                    "coordinates_": (
+                                        {
+                                            "coordInfo": {},
+                                            "coreIdToWkSlice_": {},
+                                        }
+                                        if tensor.is_index_tensor
+                                        else {
+                                            "coordInfo": {
+                                                str(dim): gen_coord_info_value(
+                                                    size=sdsc_spec.iteration_space[dim]
+                                                    // sdsc_spec.work_slices[dim]
+                                                    if (tensor.scales[dim] == 1)
+                                                    else 1,
+                                                    nsplits=sdsc_spec.work_slices[dim]
+                                                    if (tensor.scales[dim] == 1)
+                                                    else 1,
+                                                    elems_per_stick=tensor.data_format.elems_per_stick(),
+                                                    is_stick_dim=(
+                                                        sdsc_spec.layouts[
+                                                            tensor.layout
+                                                        ]["stick_dim_order"].has(dim)
+                                                    ),
+                                                    is_stick_reduction=(
+                                                        tensor.scales[dim] == -2
+                                                    ),
+                                                )
+                                                for dim in sdsc_spec.layouts[
+                                                    tensor.layout
+                                                ]["dim_order"]
+                                            },
+                                            "coreIdToWkSlice_": {},
+                                        }
+                                    ),
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],
@@ -646,6 +661,22 @@ def generate_sdsc(
                                     "outputLabeledDs": [
                                         f"Tensor{out_idx}-idx{out_idx}"
                                     ],
+                                    **(
+                                        {
+                                            "indirectAccessIndexLabeledDs": [
+                                                f"Tensor{i}-idx{i}"
+                                                for i, tensor in enumerate(
+                                                    sdsc_spec.args
+                                                )
+                                                if tensor.is_index_tensor
+                                            ]
+                                        }
+                                        if any(
+                                            tensor.is_index_tensor
+                                            for tensor in sdsc_spec.args
+                                        )
+                                        else {}
+                                    ),
                                 }
                             ],
                         }

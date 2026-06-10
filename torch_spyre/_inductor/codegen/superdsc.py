@@ -31,8 +31,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import OpSpec
-from torch_spyre._inductor.op_spec import TensorArg
+from torch_spyre._inductor.op_spec import OpSpec, TensorArg, IndexLoad
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import SymbolKind, generate_sdsc
@@ -53,6 +52,9 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     arg_index: int = -1
+    indirect_type: str = "no_indirection"
+    related_alloc_name: str | None = None
+    is_index_tensor: bool = False
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -60,8 +62,7 @@ class SDSCArgs:
         offsets = ", ".join(f"{k}={v}" for k, v in self.offsets.items())
         max_dim_sizes = ", ".join(f"{k}={v}" for k, v in self.max_dim_sizes.items())
         allocation = ", ".join(f"{k}={v}" for k, v in self.allocation.items())
-        return (
-            f"SDSCArgs(\n"
+        parts = [
             f"  layout={self.layout},\n"
             f"  dim_order={self.dim_order}, \n"
             f"  data_format={self.data_format.name},\n"
@@ -71,9 +72,15 @@ class SDSCArgs:
             f"  max_dim_sizes=[{max_dim_sizes}],\n"
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
-            f"  backGap={self.backGap}\n"
-            f")"
-        )
+            f"  backGap={self.backGap}",
+        ]
+        if self.indirect_type != "no_indirection":
+            parts.append(f"  indirect_type={self.indirect_type},")
+            if self.related_alloc_name:
+                parts.append(f"  related_alloc_name={self.related_alloc_name},")
+            if self.is_index_tensor:
+                parts.append(f"  is_index_tensor={self.is_index_tensor},")
+        return "SDSCArgs(\n" + "\n".join(parts) + "\n)"
 
 
 @dataclasses.dataclass
@@ -223,13 +230,28 @@ def _get_device_dim_order(
     stick_dim = free[0] if free else None
 
     dim_order: list[Symbol] = []
+    # Get valid loop variables from symbol_mapping
+    valid_loop_vars = set(symbol_mapping.values())
+
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
-        expr = arg.device_coordinates[i].subs(symbol_mapping)
+        coord = arg.device_coordinates[i]
+        expr = coord.subs(symbol_mapping)
+
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
-        for sym in expr.free_symbols:
-            if sym not in dim_order:
-                dim_order.append(sym)
+
+        # For IndexLoad, don't extract from index expression - just mark as seen
+        # The actual dimensions will be determined from the index tensor's layout
+        if isinstance(coord, IndexLoad):
+            # IndexLoad marks indirect access, but we don't add dimensions from it here
+            # The indirect dimensions come from the index tensor itself
+            continue
+        else:
+            # For normal coordinates, extract loop variables
+            for sym in expr.free_symbols:
+                if sym not in dim_order and sym in valid_loop_vars:
+                    dim_order.append(sym)
+
     return dim_order, stick_dim
 
 
@@ -239,6 +261,7 @@ def _get_layout_label(
     stick_dim_order: Symbol | None,
     stick_size: int,
     layout_labels: list[str],
+    is_index_tensor: bool,
 ) -> str:
     for label, layout in layouts.items():
         if (
@@ -247,7 +270,7 @@ def _get_layout_label(
             and layout["stick_size"] == stick_size
         ):
             return label
-    label = layout_labels[len(layouts)]
+    label = layout_labels[len(layouts)] if not is_index_tensor else "KERNEL_IDX"
     layouts[label] = {
         "dim_order": dim_order,
         "stick_dim_order": stick_dim_order,
@@ -330,57 +353,183 @@ def _create_sdsc_tensors(
     use_op_dims = not _is_matmul(op_spec.op)
 
     missing_dim = None
-    sdsc_args: list[SDSCArgs] = []
+
+    # Build indirect access mapping: {index_tensor_name: value_tensor_arg}
+    indirect_map: dict[str, TensorArg] = {}
+    gather_dims: dict = {}  # {value_tensor_name: gather_dim}
     for arg in op_spec.args:
+        for coord_idx, coord in enumerate(arg.device_coordinates):
+            if isinstance(coord, IndexLoad):
+                # arg is a value tensor indexed by IndexLoad
+                # IndexLoad.args[0] is a Symbol with the tensor name
+                index_tensor_name = str(coord.args[0])
+                indirect_map[index_tensor_name] = arg
+                # Track the gather dimension for this value tensor
+                # Will be filled in later with actual dimension symbol
+
+    # Helper to generate allocate node name
+    def get_alloc_name(idx: int, tensor_arg: TensorArg) -> str:
+        mem_type = "lx" if "lx" in tensor_arg.allocation else "hbm"
+        return f"allocate-Tensor{idx}_{mem_type}"
+
+    sdsc_args: list[SDSCArgs] = []
+    # Build mapping of index tensor name to its dim_order for later use (first pass)
+    index_tensor_dim_orders: dict = {}
+    # Track which coordinates have IndexLoad and from which index tensor
+    index_load_map: dict = {}  # {value_tensor_name: (index_tensor_name, coord_position)}
+
+    # First pass: collect all index tensor dim_orders and map indirect accesses
+    for arg in op_spec.args:
+        # Check if this tensor IS an index tensor (is its name in indirect_map keys?)
+        is_this_index_tensor = hasattr(arg, "name") and arg.name in indirect_map
+
+        if is_this_index_tensor:
+            dim_order, _ = _get_device_dim_order(arg, symbol_mapping)
+            # Filter dim_order to only include iteration_space dimensions
+            dim_order = [d for d in dim_order if d in iteration_space]
+            # Store for use with value tensors
+            if arg.name:
+                index_tensor_dim_orders[arg.name] = dim_order
+        else:
+            # Check if this is a value tensor with indirect access
+            for coord_idx, coord in enumerate(arg.device_coordinates):
+                if isinstance(coord, IndexLoad):
+                    index_tensor_name = str(coord.args[0])
+                    if arg.name:
+                        index_load_map[arg.name] = (index_tensor_name, coord_idx)
+                    break
+
+    # Second pass: process all tensors and build SDSC args
+    for arg_idx, arg in enumerate(op_spec.args):
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+
+        # Check if this tensor IS an index tensor (is its name in indirect_map keys?)
+        is_this_index_tensor = hasattr(arg, "name") and arg.name in indirect_map
+
+        # For index tensors, only include iteration_space dimensions and skip all other processing
+        if is_this_index_tensor:
+            dim_order = [d for d in dim_order if d in iteration_space]
+        else:
+            # For non-index tensors, apply normal processing
+            if len(dim_order) > len(arg.device_size):
+                # Reduce dim_order to match device_size
+                dim_order = dim_order[-len(arg.device_size) :]
+
+            # For value tensors with indirect access, merge in the index tensor's dimensions
+            if hasattr(arg, "name") and arg.name in index_load_map:
+                index_tensor_name, coord_idx = index_load_map[arg.name]
+                if index_tensor_name in index_tensor_dim_orders:
+                    index_dims = index_tensor_dim_orders[index_tensor_name]
+                    # Find where the IndexLoad coordinate maps to in dim_order
+                    gather_stride_idx = len(arg.device_coordinates) - coord_idx - 2
+                    if 0 <= gather_stride_idx < len(dim_order):
+                        # Replace the dimension at this position with index tensor's dimensions
+                        dim_order = (
+                            dim_order[:gather_stride_idx]
+                            + index_dims
+                            + dim_order[gather_stride_idx + 1 :]
+                        )
+
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
-            reduced_dims = [
-                d for d in op_dim_order if d not in dim_order and d is not mb_sym
-            ]
-            dim_order = dim_order + reduced_dims
+        # Check if this tensor has IndexLoad in its coordinates (it's a value tensor)
+        has_index_load = any(isinstance(c, IndexLoad) for c in arg.device_coordinates)
 
-        if op_stick_dim is None:
-            # No stick dim found in op - add one
-            stick_dim = next(d for d in dims if d not in op_dim_order)
-            dim_order = dim_order + [stick_dim]
-        if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
-            reduced_dims = [stick_dim]
+        # Index tensors skip all the complex dimension processing
+        if not is_this_index_tensor:
+            if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+                reduced_dims = [
+                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
+                ]
+                # Prevent reduced dimensions from appearing after stick dimension
+                if reduced_dims and stick_dim is not None and dim_order == [stick_dim]:
+                    dim_order = reduced_dims + [stick_dim]
+                else:
+                    dim_order = dim_order + reduced_dims
+
+            if op_stick_dim is None:
+                # No stick dim found in op - add one
+                stick_dim = next(d for d in dims if d not in op_dim_order)
+                dim_order = dim_order + [stick_dim]
+            if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
+                reduced_dims = [stick_dim]
+
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
-        for dim in dim_order:
-            stride_idx = stride_dim_order.index(dim)
-            if dim in reduced_dims and op_spec.op != "layernormscale":
-                scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
-            elif dim in reduced_dims and op_spec.op == "layernormscale":
-                scales[dim] = -2 if (dim is stick_dim) else -1
-            else:
+
+        # Check if this is a value tensor with indirect access
+        has_indirect = any(isinstance(c, IndexLoad) for c in arg.device_coordinates)
+
+        # For index tensors and value tensors with indirect access, skip complex calculations
+        if not is_this_index_tensor and not has_indirect:
+            for dim in dim_order:
+                stride_idx = stride_dim_order.index(dim)
+                if dim in reduced_dims and op_spec.op != "layernormscale":
+                    scales[dim] = (
+                        -2 if (stick_dim is None and dim is op_stick_dim) else -1
+                    )
+                elif dim in reduced_dims and op_spec.op == "layernormscale":
+                    scales[dim] = -2 if (dim is stick_dim) else -1
+                else:
+                    scales[dim] = 1
+                strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
+                offsets[dim] = 0
+                dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+
+                dev_dim_size = arg.device_size[-stride_idx - 2]
+                it_dim_size = iteration_space[dim]
+                if dim == stick_dim:
+                    stick_size = arg.device_dtype.elems_per_stick()
+                    dev_dim_size *= stick_size
+                    it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+
+                if dev_dim_size > it_dim_size:
+                    dim_coord = arg.device_coordinates[-stride_idx - 2]
+                    dim_offset = int(dim_coord.as_coeff_Add()[0])
+                    offsets[dim] = dim_offset * dim_device_stride
+                    backGap[dim] = dev_dim_size - it_dim_size
+                    strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+
+                # For indirectly addressed value tensors, use device_size (page size) for indirect dims
+                # For normal/index tensors, use -1 (unbounded)
+                max_dim_sizes[dim] = -1
+                if has_index_load:
+                    # Find which coordinate position corresponds to this stride_idx
+                    coord_dim_idx = len(arg.device_coordinates) - stride_idx - 2
+                    if 0 <= coord_dim_idx < len(arg.device_coordinates):
+                        coord = arg.device_coordinates[coord_dim_idx]
+                        if isinstance(coord, IndexLoad):
+                            # This is the indirect dimension - use page size
+                            max_dim_sizes[dim] = dev_dim_size
+                            # Track the gather dimension for this value tensor
+                            if arg.name:
+                                gather_dims[arg.name] = dim
+        else:
+            # Index tensor or value tensor with indirect: simple initialization
+            for dim in dim_order:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
-            offsets[dim] = 0
-            dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+                strides[dim] = 0
+                offsets[dim] = 0
+                max_dim_sizes[dim] = -1
 
-            dev_dim_size = arg.device_size[-stride_idx - 2]
-            it_dim_size = iteration_space[dim]
-            if dim == stick_dim:
-                stick_size = arg.device_dtype.elems_per_stick()
-                dev_dim_size *= stick_size
-                it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
-
-            if dev_dim_size > it_dim_size:
-                dim_coord = arg.device_coordinates[-stride_idx - 2]
-                dim_offset = int(dim_coord.as_coeff_Add()[0])
-                offsets[dim] = dim_offset * dim_device_stride
-                backGap[dim] = dev_dim_size - it_dim_size
-                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
-
-            max_dim_sizes[dim] = -1
+            # For value tensors with indirect access, set gather dimension's max_dim_sizes
+            if has_indirect and not is_this_index_tensor:
+                for coord_idx, coord in enumerate(arg.device_coordinates):
+                    if isinstance(coord, IndexLoad):
+                        # Map coordinate position to dimension
+                        stride_idx = len(arg.device_coordinates) - coord_idx - 2
+                        if 0 <= stride_idx < len(dim_order):
+                            gather_dim = dim_order[stride_idx]
+                            # For gather dimension, use iteration_space size, not device_size
+                            max_dim_sizes[gather_dim] = iteration_space[gather_dim]
+                            if arg.name:
+                                gather_dims[arg.name] = gather_dim
+                        break
 
         if mb_sym is not None:
             # Virtual dim with no physical device dimension; stride = full 1-D allocation size.
@@ -391,16 +540,54 @@ def _create_sdsc_tensors(
             max_dim_sizes[mb_sym] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        # Only index tensors get special handling; value tensors and outputs use normal layout
         label = _get_layout_label(
             layouts,
             dim_order,
             effective_stick,
             arg.device_dtype.elems_per_stick(),
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+            is_this_index_tensor,
         )
         # Change dataFormat_ value if needed.
         # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
         arg_data_format = _get_data_format(op_spec.op, arg.device_dtype)
+
+        # Determine indirect access type and related allocate node
+        indirect_type = "no_indirection"
+        related_alloc_name = None
+        is_index_tensor = False
+
+        # Check if this tensor has IndexLoad in its coordinates (it's a value tensor)
+        has_index_load = any(isinstance(c, IndexLoad) for c in arg.device_coordinates)
+        if has_index_load:
+            indirect_type = "value_tensor"
+            # Find the index tensor and get its allocate name
+            for coord in arg.device_coordinates:
+                if isinstance(coord, IndexLoad):
+                    # IndexLoad.args[0] is a Symbol with the tensor name
+                    index_tensor_name = str(coord.args[0])
+                    # Find which arg is the index tensor by name
+                    for idx, other_arg in enumerate(op_spec.args):
+                        if (
+                            hasattr(other_arg, "name")
+                            and other_arg.name == index_tensor_name
+                        ):
+                            related_alloc_name = get_alloc_name(idx, other_arg)
+                            break
+                    if related_alloc_name:
+                        break
+
+        # Check if this tensor IS an index tensor (its name appears in indirect_map keys)
+        if hasattr(arg, "name") and arg.name in indirect_map:
+            indirect_type = "index_tensor"
+            is_index_tensor = True
+            # Find which arg is the value tensor and get its allocate name
+            value_arg = indirect_map[arg.name]
+            for idx, other_arg in enumerate(op_spec.args):
+                if other_arg is value_arg:
+                    related_alloc_name = get_alloc_name(idx, other_arg)
+                    break
 
         sdsc_args.append(
             SDSCArgs(
@@ -419,8 +606,39 @@ def _create_sdsc_tensors(
                 else arg.allocation.get("hbm"),
                 backGap=backGap,
                 arg_index=arg.arg_index,
+                indirect_type=indirect_type,
+                related_alloc_name=related_alloc_name,
+                is_index_tensor=is_index_tensor,
             )
         )
+
+    # Post-process: For index tensors, update layout to make gather dim stick
+    for i, sdsc in enumerate(sdsc_args):
+        if sdsc.is_index_tensor:
+            # Find which value tensor uses this index tensor and get its gather dimension
+            for j, other_arg in enumerate(op_spec.args):
+                for coord in other_arg.device_coordinates:
+                    if (
+                        isinstance(coord, IndexLoad)
+                        and str(coord.args[0]) == op_spec.args[i].name
+                    ):
+                        # other_arg is the value tensor - check gather_dims
+                        if other_arg.name and other_arg.name in gather_dims:
+                            gather_dim = gather_dims[other_arg.name]
+                            # Reorder dim_order to put gather_dim at the end (stick position)
+                            if gather_dim in sdsc.dim_order:
+                                new_dim_order = [
+                                    d for d in sdsc.dim_order if d != gather_dim
+                                ] + [gather_dim]
+                                new_label = _get_layout_label(
+                                    layouts,
+                                    new_dim_order,
+                                    gather_dim,
+                                    sdsc.data_format.elems_per_stick(),
+                                    LAYOUT_LABELS,
+                                )
+                                sdsc.layout = new_label
+                        break
 
     return sdsc_args, layouts, missing_dim
 
