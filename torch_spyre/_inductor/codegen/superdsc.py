@@ -469,7 +469,7 @@ def _create_sdsc_tensors(
                     if 0 <= coord_dim_idx < len(arg.device_coordinates):
                         coord = arg.device_coordinates[coord_dim_idx]
                         if isinstance(coord, IndexLoad):
-                            max_dim_sizes[dim] = 1
+                            max_dim_sizes[dim] = iteration_space[dim]
                             if arg.name:
                                 gather_dims[arg.name] = dim
         else:
@@ -596,7 +596,7 @@ def _create_sdsc_tensors(
                                 sdsc.layout = new_label
                         break
 
-    sdsc_args[1].dim_order = sdsc_args[-1].dim_order
+    #sdsc_args[0].dim_order = sdsc_args[-1].dim_order
 
 
     return sdsc_args, layouts, missing_dim

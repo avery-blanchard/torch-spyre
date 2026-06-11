@@ -29,11 +29,11 @@ P = 3
 Q = 192
 
 x = torch.rand(M, N, dtype=torch.float16)
-i = torch.randint(0, 128, (P, Q), dtype=torch.int32)
+i = torch.randint(0, 128, (P,), dtype=torch.int32)
 
 # CPU reference
 def kernel(x, i):
-    return x[i].exp()
+    return x[i:,].exp()
 
 ref = kernel(x, i)
 

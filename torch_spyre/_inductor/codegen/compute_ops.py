@@ -536,11 +536,11 @@ def generate_sdsc(
                                         if use_symbols and "lx" not in tensor.allocation
                                         else {}
                                     ),
-                                    **(
-                                        {"indexTensorType_": "index"}                                                                                                                                          
-                                        if tensor.is_index_tensor                                                                                                                                              
-                                        else {}                                                                                                                                                                
-                                   ),                                                                                                                                                                                
+                                #     **(
+                                #         {"indexTensorType_": "index"}                                                                                                                                          
+                                #         if tensor.is_index_tensor                                                                                                                                              
+                                #         else {}                                                                                                                                                                
+                                #    ),                                                                                                                                                                                
                                     "layoutDimOrder_": [
                                         str(dim) for dim in tensor.dim_order
                                     ],
