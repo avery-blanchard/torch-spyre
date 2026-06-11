@@ -536,6 +536,11 @@ def generate_sdsc(
                                         if use_symbols and "lx" not in tensor.allocation
                                         else {}
                                     ),
+                                    **(
+                                        {"indexTensorType_": "index"}                                                                                                                                          
+                                        if tensor.is_index_tensor                                                                                                                                              
+                                        else {}                                                                                                                                                                
+                                   ),                                                                                                                                                                                
                                     "layoutDimOrder_": [
                                         str(dim) for dim in tensor.dim_order
                                     ],
@@ -631,12 +636,18 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
-                                    "memOrg_": {
-                                        "hbm": {"isPresent": 1},
-                                        "lx": {"isPresent": 1},
-                                    }
-                                    if "lx" not in tensor.allocation
-                                    else {"lx": {"isPresent": 1}},
+                                    "memOrg_": (
+                                        {"hbm": {"isPresent": 1}}
+                                        if tensor.is_index_tensor
+                                        else (
+                                            {
+                                                "hbm": {"isPresent": 1},
+                                                "lx": {"isPresent": 1},
+                                            }
+                                            if "lx" not in tensor.allocation
+                                            else {"lx": {"isPresent": 1}}
+                                        )
+                                    )
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],
@@ -657,6 +668,7 @@ def generate_sdsc(
                                     "inputLabeledDs": [
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
+                                        if not sdsc_spec.args[i].is_index_tensor
                                     ],
                                     "outputLabeledDs": [
                                         f"Tensor{out_idx}-idx{out_idx}"
