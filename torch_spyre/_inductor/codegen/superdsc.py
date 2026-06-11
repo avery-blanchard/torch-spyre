@@ -464,7 +464,7 @@ def _create_sdsc_tensors(
                     strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
                 max_dim_sizes[dim] = -1
-                if has_index_load:
+                if has_indirect:
                     coord_dim_idx = len(arg.device_coordinates) - stride_idx - 2
                     if 0 <= coord_dim_idx < len(arg.device_coordinates):
                         coord = arg.device_coordinates[coord_dim_idx]
@@ -505,7 +505,7 @@ def _create_sdsc_tensors(
             effective_stick,
             arg.device_dtype.elems_per_stick(),
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
-            is_this_index_tensor,
+            is_index,
         )
         # Change dataFormat_ value if needed.
         # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
@@ -516,9 +516,7 @@ def _create_sdsc_tensors(
         related_alloc_name = None
         is_index_tensor = False
 
-        # Check if this tensor has IndexLoad in its coordinates (it's a value tensor)
-        has_index_load = any(isinstance(c, IndexLoad) for c in arg.device_coordinates)
-        if has_index_load:
+        if has_indirect:
             indirect_type = "value_tensor"
             # Find the index tensor and get its allocate name
             for coord in arg.device_coordinates:
