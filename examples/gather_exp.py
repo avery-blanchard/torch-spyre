@@ -15,7 +15,6 @@
 """Minimal gather+exp: x[:, i].exp() to isolate index-select + unary fusion."""
 
 import torch
-from torch_spyre._inductor import config
 import torch_spyre._inductor.propagate_named_dims as pnd
 
 declare_tensor_dim = pnd.declare_tensor_dim
@@ -31,9 +30,11 @@ Q = 192
 x = torch.rand(M, N, dtype=torch.float16)
 i = torch.randint(0, 128, (P,), dtype=torch.int32)
 
+
 # CPU reference
 def kernel(x, i):
-    return x[i:,].exp()
+    return x[i, :].exp()
+
 
 ref = kernel(x, i)
 
@@ -55,7 +56,11 @@ diff = torch.abs(ref - result)
 print(f"max abs diff: {diff.amax().item()}")
 
 torch.testing.assert_close(
-    result, ref, equal_nan=True, atol=0.01, rtol=0.01,
+    result,
+    ref,
+    equal_nan=True,
+    atol=0.01,
+    rtol=0.01,
     msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
 )
 print("PASSED")
