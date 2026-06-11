@@ -272,7 +272,7 @@ def _get_layout_label(
             return label
     label = "OUTPUT" if not is_index_tensor else "KERNEL_IDX"
     layouts[label] = {
-        "dim_order": dim_order,
+        "dim_order": dim_order[::-1],
         "stick_dim_order": stick_dim_order,
         "stick_size": stick_size,
     }
@@ -469,7 +469,7 @@ def _create_sdsc_tensors(
                     if 0 <= coord_dim_idx < len(arg.device_coordinates):
                         coord = arg.device_coordinates[coord_dim_idx]
                         if isinstance(coord, IndexLoad):
-                            max_dim_sizes[dim] = iteration_space[dim]
+                            max_dim_sizes[dim] = 1 #iteration_space[dim]
                             if arg.name:
                                 gather_dims[arg.name] = dim
         else:
@@ -485,7 +485,7 @@ def _create_sdsc_tensors(
                         stride_idx = len(arg.device_coordinates) - coord_idx - 2
                         if 0 <= stride_idx < len(dim_order):
                             gather_dim = dim_order[stride_idx]
-                            max_dim_sizes[gather_dim] = iteration_space[gather_dim]
+                            max_dim_sizes[gather_dim] = 1 #iteration_space[gather_dim]
                             if arg.name and arg.name not in gather_dims:
                                 gather_dims[arg.name] = gather_dim
 
@@ -596,8 +596,10 @@ def _create_sdsc_tensors(
                                 sdsc.layout = new_label
                         break
 
-    #sdsc_args[0].dim_order = sdsc_args[-1].dim_order
-
+    # sdsc_args[0].dim_order = [Symbol('out'),Symbol('mb')]
+    sdsc_args[0].max_dim_sizes[Symbol('out')] = 1
+    sdsc_args[0].max_dim_sizes[Symbol('mb')] = 64
+    # sdsc_args[-1].dim_order = [Symbol('out'),Symbol('mb')]
 
     return sdsc_args, layouts, missing_dim
 
