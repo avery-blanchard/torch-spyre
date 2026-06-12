@@ -34,7 +34,6 @@ from torch_spyre._inductor.indirect_access import (
     collect_index_tensor_layouts,
     compute_indirect_max_dim_sizes,
     get_indirect_layout_label,
-    get_indirect_tensor_address,
     get_value_tensor_idx_for_index,
     is_index_tensor,
     is_indirect_value_tensor,
@@ -462,7 +461,7 @@ def _create_sdsc_tensors(
         if has_indirect_access:
             label = get_indirect_layout_label(
                 i,
-                op_spec,
+                arg,
                 index_tensor_indices,
                 has_indirect_access,
                 layouts,
@@ -490,15 +489,13 @@ def _create_sdsc_tensors(
             else _get_data_format(op_spec.op, arg.device_dtype)
         )
 
-        # For indirect access use SEGMENT_OFFSETS; otherwise read from allocation dict.
-        if has_indirect_access:
-            start_addr = get_indirect_tensor_address(arg, i, op_spec)
-        elif "pool" in arg.allocation:
-            start_addr = arg.allocation.get("pool")
-        elif "lx" in arg.allocation:
-            start_addr = arg.allocation.get("lx")
-        else:
-            start_addr = arg.allocation.get("hbm")
+        start_addr = (
+            arg.allocation.get("pool")
+            if "pool" in arg.allocation
+            else arg.allocation.get("lx")
+            if "lx" in arg.allocation
+            else arg.allocation.get("hbm")
+        )
 
         is_idx_tensor = has_indirect_access and i in index_tensor_indices
         related_val_idx = (

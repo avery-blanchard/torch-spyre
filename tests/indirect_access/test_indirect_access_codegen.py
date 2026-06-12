@@ -35,7 +35,6 @@ from torch_spyre._inductor.op_spec import IndexLoad, OpSpec, TensorArg
 from torch_spyre._inductor.indirect_access import (
     collect_index_tensor_layouts,
     compute_indirect_max_dim_sizes,
-    get_indirect_tensor_address,
     has_index_load,
     get_index_load_names,
     is_index_tensor,
@@ -175,31 +174,6 @@ class TestIndexLoadDetection:
         assert is_index_tensor(value_arg, op_spec) is False
 
 
-class TestAddressAssignment:
-    """Test SEGMENT_OFFSETS address assignment for indirect access tensors."""
-
-    def test_index_tensor_gets_segment_1(self):
-        from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-
-        op_spec, index_arg, _, _ = _make_identity_op_spec()
-        addr = get_indirect_tensor_address(index_arg, 0, op_spec)
-        assert addr == SEGMENT_OFFSETS[1]
-
-    def test_value_tensor_gets_segment_0(self):
-        from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-
-        op_spec, _, value_arg, _ = _make_identity_op_spec()
-        addr = get_indirect_tensor_address(value_arg, 1, op_spec)
-        assert addr == SEGMENT_OFFSETS[0]
-
-    def test_output_tensor_gets_segment_2(self):
-        from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-
-        op_spec, _, _, output_arg = _make_identity_op_spec()
-        addr = get_indirect_tensor_address(output_arg, 2, op_spec)
-        assert addr == SEGMENT_OFFSETS[2]
-
-
 class TestMaxDimSizesComputation:
     """Test maxDimSizes computation for indirect access tensors."""
 
@@ -286,26 +260,6 @@ class TestMaxDimSizesComputation:
             logger=mock_logger,
         )
         assert result == -1
-
-
-class TestLayoutLabelAssignment:
-    """Test layout label assignment for indirect access tensors."""
-
-    def test_index_tensor_is_detected_for_kernel_idx(self):
-        """Index tensors should be identified by is_index_tensor()."""
-        op_spec, index_arg, value_arg, output_arg = _make_identity_op_spec()
-        assert is_index_tensor(index_arg, op_spec) is True
-        assert is_index_tensor(value_arg, op_spec) is False
-        assert is_index_tensor(output_arg, op_spec) is False
-
-    def test_value_tensor_detected_for_input_label(self):
-        """Value tensors (with IndexLoad) should be detected as indirect value tensors."""
-        _, _, value_arg, _ = _make_identity_op_spec()
-        assert is_indirect_value_tensor(value_arg) is True
-
-    def test_output_tensor_not_value_tensor(self):
-        _, _, _, output_arg = _make_identity_op_spec()
-        assert is_indirect_value_tensor(output_arg) is False
 
 
 class TestDataFormatHandling:

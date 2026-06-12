@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Callable
+
 from sympy import Symbol
 
-from .constants import SEGMENT_OFFSETS
 from .op_spec import IndexLoad, OpSpec, TensorArg
 
 
@@ -80,27 +81,6 @@ def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
         if index_name in get_index_load_names(arg):
             return j
     return -1
-
-
-def get_indirect_tensor_address(
-    arg: TensorArg,
-    arg_idx: int,
-    op_spec: OpSpec,
-) -> int | None:
-    """Return the SEGMENT_OFFSETS address for a tensor in an indirect access operation.
-
-    Index tensor → SEGMENT_OFFSETS[1]
-    Value tensor (has IndexLoad in coords) → SEGMENT_OFFSETS[0]
-    Output tensor → SEGMENT_OFFSETS[2]
-    Otherwise → None (use allocation dict)
-    """
-    if is_index_tensor(arg, op_spec):
-        return SEGMENT_OFFSETS[1]
-    if is_indirect_value_tensor(arg):
-        return SEGMENT_OFFSETS[0]
-    if not arg.is_input:
-        return SEGMENT_OFFSETS[2]
-    return None
 
 
 def collect_index_tensor_layouts(
@@ -220,7 +200,7 @@ def get_indirect_access_layout_label(
 
 def get_indirect_layout_label(
     tensor_idx: int,
-    op_spec: OpSpec,
+    arg: TensorArg,
     index_tensor_indices: set[int],
     has_indirect_access: bool,
     layouts: dict,
@@ -228,7 +208,7 @@ def get_indirect_layout_label(
     effective_stick: object,
     stick_size: int,
     layout_labels: list[str],
-    get_layout_label_func: object,
+    get_layout_label_func: Callable,
     logger: object,
 ) -> str:
     """Get layout label for a tensor in an indirect access operation.
@@ -253,7 +233,6 @@ def get_indirect_layout_label(
         ensure_layout(label)
         return label
 
-    arg = op_spec.args[tensor_idx]
     is_value = is_indirect_value_tensor(arg)
     is_output = not arg.is_input
     indirect_label = get_indirect_access_layout_label(
@@ -268,10 +247,3 @@ def get_indirect_layout_label(
     return get_layout_label_func(
         layouts, dim_order, effective_stick, stick_size, layout_labels
     )
-
-
-def is_indirect_access_operation(op: object) -> bool:
-    """Return True if the operation uses indirect access (any arg has IndexLoad in coords)."""
-    if not hasattr(op, "data"):
-        return False
-    return any(has_index_load(arg) for arg in op.data.args)
