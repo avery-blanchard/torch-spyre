@@ -1,0 +1,4 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/indirect_access/test_spyre_kernel_indirect_store.py
+      unlisted_test_mode: mandatory_success

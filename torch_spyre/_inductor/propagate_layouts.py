@@ -59,6 +59,8 @@ from .pass_utils import (
     concretize_expr,
     host_coordinates,
     device_coordinates,
+    indirect_index_dep_names,
+    indirect_load_subs_from_op,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -166,7 +168,7 @@ def _single_arg_op_layout(
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
+            unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
 
             if unaligned > 0:
                 outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
@@ -258,7 +260,7 @@ def _exx2_layout(
     )
     reduction_var = _find_reduction_var(x.dep, output_dep, "exx2")
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl])
+    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
     return [out_stl]
 
 
@@ -280,7 +282,7 @@ def _layernormnorm_layout(
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
-    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl])
+    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
     return [out_stl]
 
 
@@ -413,7 +415,7 @@ def _matmul_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl]
+        [x, y], out_stl, [x_req_stl, y_req_stl], op
     )
     return [out_stl]
 
@@ -431,11 +433,13 @@ def _multi_arg_pointwise_layouts(
        2. Compute an out STL for each
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
+    indirect_index_names = indirect_index_dep_names(op)
     stick_exprs = {
         device_coordinates(stl, arg.dep)[-1]
         for arg in args
         for stl in arg.layouts
-        if device_coordinates(stl, arg.dep)[-1] != 0
+        if arg.dep.name not in indirect_index_names
+        and device_coordinates(stl, arg.dep)[-1] != 0
     }
 
     if len(stick_exprs) > 1:
@@ -493,7 +497,7 @@ def _multi_arg_pointwise_layouts(
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         results.append(stl)
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
     return results
 
 
@@ -543,7 +547,7 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
     return results
 
 
@@ -558,6 +562,64 @@ def compute_layouts(
     1. Compute candidate output STLs given a set of STLs for each input arg.
     2. Attach a restick cost function based on the type of op.
     """
+    if logger.isEnabledFor(10):  # DEBUG
+        op_name = op.get_name() if hasattr(op, "get_name") else str(op)
+        aten_ops = (
+            [str(n.target) for n in op.data.origins]
+            if hasattr(op, "data") and hasattr(op.data, "origins")
+            else []
+        )
+        logger.debug(f"--- compute_layouts: op={op_name} aten={aten_ops}")
+        try:
+            indirect_load_subs = indirect_load_subs_from_op(op)
+        except Exception:
+            indirect_load_subs = {}
+        indirect_index_names = indirect_index_dep_names(op)
+
+        def _fmt_arg(label, dep, layout, layouts):
+            h_coords = host_coordinates(layout, dep)
+            lines = (
+                f"  {label} name={dep.name}\n"
+                f"    index={dep.index}  ranges={dict(dep.ranges)}\n"
+                f"    host_size={[concretize_expr(s) for s in layout.size]}\n"
+                f"    host_stride={[concretize_expr(s) for s in layout.stride]}\n"
+                f"    host_coordinates={h_coords}\n"
+            )
+            dep_indirect_load_subs = (
+                indirect_load_subs if dep.name not in indirect_index_names else {}
+            )
+            for j, stl in enumerate(layouts):
+                try:
+                    dc_raw = device_coordinates(stl, dep)
+                    dc_sub = (
+                        device_coordinates(stl, dep, dep_indirect_load_subs)
+                        if dep_indirect_load_subs
+                        else None
+                    )
+                except Exception as e:
+                    dc_raw = f"<error: {e}>"
+                    dc_sub = None
+                dc_str = f"{dc_raw}" + (f"  ->  {dc_sub}" if dc_sub is not None else "")
+                lines += (
+                    f"    STL[{j}]:\n"
+                    f"      device_size={list(stl.device_size)}\n"
+                    f"      stride_map={list(stl.stride_map)}\n"
+                    f"      device_coordinates={dc_str}\n"
+                )
+            return lines
+
+        for i, arg in enumerate(args):
+            logger.debug(_fmt_arg(f"input[{i}]", arg.dep, arg.layout, arg.layouts))
+
+        out_h_coords = host_coordinates(output, output_dep)
+        logger.debug(
+            f"  output name={output_dep.name}\n"
+            f"    index={output_dep.index}  ranges={dict(output_dep.ranges)}\n"
+            f"    host_size={[concretize_expr(s) for s in output.size]}\n"
+            f"    host_stride={[concretize_expr(s) for s in output.stride]}\n"
+            f"    host_coordinates={out_h_coords}\n"
+        )
+
     data = op.data
 
     if len(args) > 1 and isinstance(data, Pointwise):
@@ -603,7 +665,7 @@ def compute_layouts(
         _single_arg_op_layout(op, output, output_dep, args[0].dep, args[0].layout, stl)
         for stl in args[0].layouts
     ]
-    op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep)
+    op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep, op)
     return layouts
 
 
@@ -818,7 +880,7 @@ def propagate_spyre_tensor_layouts(
                 args = _get_prop_args(rw.reads)
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
-                    args, [target_stl], output_dep
+                    args, [target_stl], output_dep, op
                 )
                 continue
             op.decide_layout()

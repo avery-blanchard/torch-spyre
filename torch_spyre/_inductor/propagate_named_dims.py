@@ -133,7 +133,8 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     for i, coord in enumerate(coords):
         if coord.free_symbols:
             sym = _lone_sym(coord)
-            result.setdefault(sym, []).append(buf_named_dims[i])
+            if sym in dep.ranges:
+                result.setdefault(sym, []).append(buf_named_dims[i])
     for sym, names in result.items():
         actual_range = int(dep.ranges[sym])
         product = 1
@@ -244,7 +245,7 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep) -> None:
+def _log_dep_debug(label: str, dep: MemoryDep, op: "ComputedBuffer | None") -> None:
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -379,10 +380,10 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
             if logger.isEnabledFor(logging.DEBUG):
                 for dep in inputs:
-                    _log_dep_debug("input", dep)
+                    _log_dep_debug("input", dep, op)
                 for dep in rw.writes:
                     if isinstance(dep, MemoryDep):
-                        _log_dep_debug("output", dep)
+                        _log_dep_debug("output", dep, op)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:
