@@ -231,7 +231,7 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
 
 
 def _get_device_dim_order(
-    arg: TensorArg, symbol_mapping: dict
+    arg: TensorArg, symbol_mapping: dict, op_spec: OpSpec | None = None
 ) -> tuple[list[Symbol], Symbol | None]:
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution."""
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
@@ -241,9 +241,17 @@ def _get_device_dim_order(
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
         coord = arg.device_coordinates[i]
-        # Skip coordinates containing IndexLoad — they are resolved at runtime
-        # by loading from an index tensor, not by an iteration-space symbol.
+        # Handle coordinates containing IndexLoad — extract symbols from index tensor.
         if hasattr(coord, "has") and coord.has(IndexLoad):
+            if op_spec is not None and is_indirect_value_tensor(arg):
+                index_arg = get_index_tensor_for_value(op_spec, arg)
+                if index_arg is not None:
+                    indirect_dims = get_indirect_dim_symbols(
+                        arg, index_arg, symbol_mapping
+                    )
+                    for sym in indirect_dims:
+                        if sym not in dim_order:
+                            dim_order.append(sym)
             continue
         expr = coord.subs(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
@@ -375,7 +383,7 @@ def _create_sdsc_tensors(
         if has_indirect_access and i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
-            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec)
 
         scales: dict = {}
         strides: dict = {}
@@ -468,7 +476,7 @@ def _create_sdsc_tensors(
             if index_arg is not None:
                 indirect_stride_idx = get_indirect_stride_idx(arg)
                 if indirect_stride_idx is not None:
-                    indirect_dev_dim_size = arg.device_size[-indirect_stride_idx - 2]
+                    indirect_dev_dim_size = arg.device_size[-(indirect_stride_idx + 1)]
                     indirect_dims = get_indirect_dim_symbols(
                         arg, index_arg, symbol_mapping
                     )
