@@ -714,6 +714,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
+            # Swap args to ensure the value tensor is assigned to address 0.
+            args[0], args[1] = args[1], args[0]
             op_spec = self.create_op_spec(op, False, args, op_info)
             self.op_specs.append(op_spec)
         else:
@@ -809,6 +811,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
+        # Swap actuals to ensure the value tensor is assigned to address 0.
+        actuals[0], actuals[1] = actuals[1], actuals[0]
         pool_size = getattr(V.graph, "pool_size", 0)
         has_pool_allocations = pool_size > 0
 
@@ -836,7 +840,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             call_args.append("_pool")
 
         # Add remaining kernel arguments
-        call_args.extend(self.args.python_argdefs()[1])
+        actuals = self.args.python_argdefs()[1]
+        # Swap actuals to ensure the value tensor is assigned to address 0.
+        actuals[0], actuals[1] = actuals[1], actuals[0]
+        call_args.extend(actuals)
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
