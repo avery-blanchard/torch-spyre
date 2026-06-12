@@ -68,6 +68,37 @@ def get_index_tensor_for_value(
     return None
 
 
+def get_indirect_stride_idx(arg: TensorArg) -> int | None:
+    """Find the stride_idx (from right, 0-indexed) of the IndexLoad in this arg's coordinates.
+
+    Returns the position counting from the right (where 0 is the rightmost element).
+    """
+    for idx, coord in enumerate(reversed(arg.device_coordinates)):
+        if isinstance(coord, IndexLoad):
+            return idx
+    return None
+
+
+def get_indirect_dim_symbols(
+    value_arg: TensorArg, index_arg: TensorArg, symbol_mapping: dict
+) -> set[Symbol]:
+    """Extract symbols from the index tensor at the position where value tensor has IndexLoad.
+
+    Returns the set of symbols that should be in the value tensor's dim_order for the indirect dimension.
+    """
+    indirect_stride_idx = get_indirect_stride_idx(value_arg)
+    if indirect_stride_idx is None:
+        return set()
+
+    # Get the corresponding coordinate from the index tensor at the same position.
+    if indirect_stride_idx + 2 > len(index_arg.device_coordinates):
+        return set()
+
+    index_coord = index_arg.device_coordinates[-(indirect_stride_idx + 2)]
+    expr = index_coord.subs(symbol_mapping)
+    return expr.free_symbols
+
+
 def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
     """Return the position of the value tensor accessed by the given index tensor.
 

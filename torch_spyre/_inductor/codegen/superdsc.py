@@ -34,7 +34,10 @@ from torch_spyre._inductor.indirect_access import (
     collect_index_tensor_layouts,
     compute_indirect_backgap,
     compute_indirect_max_dim_sizes,
+    get_index_tensor_for_value,
+    get_indirect_dim_symbols,
     get_indirect_layout_label,
+    get_indirect_stride_idx,
     get_value_tensor_idx_for_index,
     is_index_tensor,
     is_indirect_value_tensor,
@@ -442,18 +445,41 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[dim] = -1
 
-            if dev_dim_size > it_dim_size:
-                dim_coord = arg.device_coordinates[-stride_idx - 2]
-                if isinstance(dim_coord, IndexLoad):
-                    # For indirect dimensions, backGap = dev_dim_size - max_dim_size.
+            dim_coord = arg.device_coordinates[-stride_idx - 2]
+            if isinstance(dim_coord, IndexLoad):
+                # For indirect dimensions, find the correct dev_dim_size at the IndexLoad position.
+                indirect_stride_idx = get_indirect_stride_idx(arg)
+                if indirect_stride_idx is not None:
+                    indirect_dev_dim_size = arg.device_size[-indirect_stride_idx - 2]
                     backGap[dim] = compute_indirect_backgap(
-                        dev_dim_size, max_dim_sizes[dim]
+                        indirect_dev_dim_size, max_dim_sizes[dim]
                     )
                 else:
-                    dim_offset = int(dim_coord.as_coeff_Add()[0])
-                    offsets[dim] = dim_offset * dim_device_stride
-                    backGap[dim] = dev_dim_size - it_dim_size
-                    strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+                    backGap[dim] = 0
+            elif dev_dim_size > it_dim_size:
+                dim_offset = int(dim_coord.as_coeff_Add()[0])
+                offsets[dim] = dim_offset * dim_device_stride
+                backGap[dim] = dev_dim_size - it_dim_size
+                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+
+        # Compute backGap for indirect dimensions that weren't in dim_order.
+        if has_indirect_access and is_indirect_value_tensor(arg):
+            index_arg = get_index_tensor_for_value(op_spec, arg)
+            if index_arg is not None:
+                indirect_stride_idx = get_indirect_stride_idx(arg)
+                if indirect_stride_idx is not None:
+                    indirect_dev_dim_size = arg.device_size[-indirect_stride_idx - 2]
+                    indirect_dims = get_indirect_dim_symbols(
+                        arg, index_arg, symbol_mapping
+                    )
+                    for indirect_dim in indirect_dims:
+                        if (
+                            indirect_dim not in backGap
+                            and indirect_dim in max_dim_sizes
+                        ):
+                            backGap[indirect_dim] = compute_indirect_backgap(
+                                indirect_dev_dim_size, max_dim_sizes[indirect_dim]
+                            )
 
         if mb_sym is not None:
             dim_order = [mb_sym] + dim_order
