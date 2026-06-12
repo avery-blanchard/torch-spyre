@@ -35,7 +35,7 @@ def get_index_load_names(arg: TensorArg) -> set[str]:
         if not hasattr(coord, "atoms"):
             continue
         for node in coord.atoms(IndexLoad):
-            names.add(node.tensor_name)
+            names.add(str(node.args[0]))
     return names
 
 
@@ -66,6 +66,32 @@ def get_index_tensor_for_value(
         if getattr(arg, "name", "") in names:
             return arg
     return None
+
+
+def get_indirect_stride_idx(arg: TensorArg) -> int | None:
+    """Find the stride_idx (from right, 0-indexed) of the IndexLoad in this arg's coordinates.
+
+    Returns the position counting from the right (where 0 is the rightmost element).
+    """
+    for idx, coord in enumerate(reversed(arg.device_coordinates)):
+        if isinstance(coord, IndexLoad):
+            return idx
+    return None
+
+
+def get_indirect_dim_symbols(
+    value_arg: TensorArg, index_arg: TensorArg, symbol_mapping: dict
+) -> set[Symbol]:
+    """Extract symbols from the index tensor at the position where value tensor has IndexLoad.
+
+    Returns the set of symbols that should be in the value tensor's dim_order for the indirect dimension.
+    """
+    all_symbols: set[Symbol] = set()
+    for coord in index_arg.device_coordinates:
+        if hasattr(coord, "free_symbols"):
+            expr = coord.subs(symbol_mapping)
+            all_symbols.update(expr.free_symbols)
+    return all_symbols
 
 
 def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
@@ -146,7 +172,7 @@ def compute_indirect_max_dim_sizes(
       - dimension in index tensor, index smaller → 1 (indirect dimension)
 
     Index tensor:
-      - -1 for active (non-stick) dims, 0 for stick dim
+      - always -1
 
     Output tensor:
       - always -1
@@ -159,6 +185,9 @@ def compute_indirect_max_dim_sizes(
         index_arg = get_index_tensor_for_value(op_spec, arg)
         if index_arg is None:
             return -1
+        indirect_dims = get_indirect_dim_symbols(arg, index_arg, symbol_mapping)
+        if dim not in indirect_dims:
+            return -1
         idx_size = _get_index_tensor_device_size_at(index_arg, stride_idx)
         if idx_size is None:
             return -1
@@ -167,13 +196,21 @@ def compute_indirect_max_dim_sizes(
         return -1
 
     elif tensor_idx in index_tensor_indices:
-        active = index_active_dims.get(tensor_idx, set())
-        if dim in active:
-            return -1
-        return 0
+        return -1
 
     # Output tensor
     return -1
+
+
+def compute_indirect_backgap(
+    dev_dim_size: int,
+    max_dim_size: int,
+) -> int:
+    """Compute backGap for an indirect dimension.
+
+    backGap = dev_dim_size - max_dim_size.
+    """
+    return max(0, dev_dim_size - max_dim_size)
 
 
 def should_use_kernel_idx_layout(
