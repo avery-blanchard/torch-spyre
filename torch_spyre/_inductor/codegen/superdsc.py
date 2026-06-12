@@ -32,6 +32,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.indirect_access import (
     collect_index_tensor_layouts,
+    compute_indirect_backgap,
     compute_indirect_max_dim_sizes,
     get_indirect_layout_label,
     get_value_tensor_idx_for_index,
@@ -425,13 +426,6 @@ def _create_sdsc_tensors(
                 dev_dim_size *= stick_size
                 it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
-            if dev_dim_size > it_dim_size:
-                dim_coord = arg.device_coordinates[-stride_idx - 2]
-                dim_offset = int(dim_coord.as_coeff_Add()[0])
-                offsets[dim] = dim_offset * dim_device_stride
-                backGap[dim] = dev_dim_size - it_dim_size
-                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
-
             if has_indirect_access:
                 max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
                     i,
@@ -447,6 +441,19 @@ def _create_sdsc_tensors(
                 )
             else:
                 max_dim_sizes[dim] = -1
+
+            if dev_dim_size > it_dim_size:
+                dim_coord = arg.device_coordinates[-stride_idx - 2]
+                if isinstance(dim_coord, IndexLoad):
+                    # For indirect dimensions, backGap = dev_dim_size - max_dim_size.
+                    backGap[dim] = compute_indirect_backgap(
+                        dev_dim_size, max_dim_sizes[dim]
+                    )
+                else:
+                    dim_offset = int(dim_coord.as_coeff_Add()[0])
+                    offsets[dim] = dim_offset * dim_device_stride
+                    backGap[dim] = dev_dim_size - it_dim_size
+                    strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         if mb_sym is not None:
             dim_order = [mb_sym] + dim_order
