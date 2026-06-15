@@ -134,6 +134,9 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    is_fp8_stick: bool = False,
+    is_2d_stick: bool = False,
+    other_stick_size: int = 1,
 ):
     return (
         {
@@ -189,6 +192,39 @@ def gen_coord_info_value(
             },
         }
         if not is_stick_dim
+        else {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 3,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {"Affine": {"alpha_": size, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {
+                        "Affine": {
+                            "alpha_": (other_stick_size if is_2d_stick else 64),
+                            "beta_": 0,
+                        }
+                    },
+                    {"Affine": {"alpha_": 8, "beta_": 0}},
+                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": nsplits, "label_": "core_fold"},
+                    {"factor_": 1, "label_": "corelet_fold"},
+                    {"factor_": 1, "label_": "row_fold"},
+                    {
+                        "factor_": (other_stick_size if is_2d_stick else (size // 64)),
+                        "label_": "elem_arr_2",
+                    },
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 8, "label_": "elem_arr_0"},
+                ],
+            },
+        }
+        if is_fp8_stick
         else {
             "spatial": 3,
             "temporal": 0,
@@ -253,6 +289,73 @@ def gen_coord_info_value(
                 ],
             },
         }
+    )
+
+
+def _gen_coord_for_dim(tensor, dim, sdsc_spec):
+    """Generate coordinate info for a single dimension.
+
+    For QFP8WT tensors, SIZE is computed from the expanded device layout
+    to properly reflect the multi-dimensional stick structure.
+    """
+    is_stick_dim = dim in sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
+    stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
+    has_2d_stick = False
+
+    # # For QFP8WT (2D stick), SIZE computation depends on whether this is an is_fp8_stick dim
+    # if has_2d_stick and is_stick_dim:
+    #     stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
+    #     outer_stick = stick_size_list[0]
+    #     inner_stick = stick_size_list[1]
+
+    #     # Check if this is an is_fp8_stick dimension (stick_size >= 64)
+    #     this_stick_size = stick_size_list[stick_idx]
+    #     is_this_fp8_stick = this_stick_size >= 64
+
+    #     iter_space = sdsc_spec.iteration_space[dim]
+    #     base_size = (
+    #         iter_space // sdsc_spec.work_slices[dim]
+    #         if (tensor.scales[dim] == 1)
+    #         else 1
+    #     )
+
+    #     # For is_fp8_stick dimensions, SIZE is divided by inner_stick
+    #     # For regular stick dimensions, SIZE remains full iteration_space
+    #     if is_this_fp8_stick:
+    #         size = base_size // inner_stick
+    #     else:
+    #         size = base_size
+
+    #     other_stick_idx = 1 - stick_idx
+    #     other_stick_size = stick_size_list[other_stick_idx]
+    # else:
+    size = (
+        sdsc_spec.iteration_space[dim] // sdsc_spec.work_slices[dim]
+        if (tensor.scales[dim] == 1)
+        else 1
+    )
+    other_stick_size = 1
+
+    nsplits = sdsc_spec.work_slices[dim] if (tensor.scales[dim] == 1) else 1
+
+    if is_stick_dim:
+        stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
+        elems_per_stick = stick_size_list[stick_idx]
+    else:
+        elems_per_stick = tensor.data_format.elems_per_stick()
+
+    is_fp8_stick = False
+    is_stick_reduction = tensor.scales[dim] == -2
+
+    return gen_coord_info_value(
+        size=size,
+        nsplits=nsplits,
+        elems_per_stick=tensor.data_format.elems_per_stick(),
+        is_stick_dim=is_stick_dim,
+        is_stick_reduction=is_stick_reduction,
+        is_fp8_stick=is_fp8_stick,
+        is_2d_stick=has_2d_stick,
+        other_stick_size=other_stick_size if is_stick_dim else 1,
     )
 
 
@@ -505,9 +608,10 @@ def generate_sdsc(
                                         str(dim) for dim in layout_info["dim_order"]
                                     ],
                                     "stickDimOrder_": [
-                                        str(layout_info["stick_dim_order"])
+                                        str(dim)
+                                        for dim in layout_info["stick_dim_order"]
                                     ],
-                                    "stickSize_": [layout_info["stick_size"]],
+                                    "stickSize_": layout_info["stick_size"],
                                 }
                                 for label, layout_info in sdsc_spec.layouts.items()
                             },
@@ -573,23 +677,10 @@ def generate_sdsc(
                                     ),
                                     "coordinates_": {
                                         "coordInfo": {
-                                            str(dim): gen_coord_info_value(
-                                                size=sdsc_spec.iteration_space[dim]
-                                                // sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                nsplits=sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                elems_per_stick=tensor.data_format.elems_per_stick(),
-                                                is_stick_dim=(
-                                                    sdsc_spec.layouts[tensor.layout][
-                                                        "stick_dim_order"
-                                                    ].has(dim)
-                                                ),
-                                                is_stick_reduction=(
-                                                    tensor.scales[dim] == -2
-                                                ),
+                                            str(dim): _gen_coord_for_dim(
+                                                tensor,
+                                                dim,
+                                                sdsc_spec,
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
                                                 "dim_order"

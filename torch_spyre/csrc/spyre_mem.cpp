@@ -426,11 +426,70 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // Reverse PyTorch ordering
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   std::reverse(dev_shape.begin(), dev_shape.end());
-  dci.dcsi_ = get_device_stride_infos(t_sizes, t_dev_strides, cpu_offset, stl,
-                                      host2device, t_cpu_strides);
+
+  // FP8 multi-dim stick layout uses specialized DCI generation
+  if (stl.element_arrangement == ElementArrangement::QFP8WT) {
+    const int64_t eps = stl.elems_per_stick();
+    const int64_t si = 2;
+    const int64_t so = eps / si;
+    const int64_t K = cpu_shape[0];
+    const int64_t N = cpu_shape[1];
+
+    // Expanded device shape: [si, so, K/si, N/so]
+    const int64_t dim2 = K / si;
+    const int64_t dim3 = N / so;
+
+    // Host strides for the expanded layout
+    // stride_map[0] = K stride in host elements
+    const int64_t K_stride_host = stl.stride_map[0];
+
+    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    const int64_t dst2 = si * so;     // = eps = 128
+    const int64_t dst3 = dim2 * eps;  // = dim2 * si * so
+
+    DataConversionStrideInfo dcsi;
+    dcsi.size_ = {si, so, dim2, dim3};
+    // stride_src: [si_stride, so_stride, dim2_stride, dim3_stride]
+    // so_stride should be K (the full K dimension when stepping through so
+    // blocks)
+    dcsi.stride_src_ = {1, K, si, dst3};
+    dcsi.stride_dst_ = {1, si, dst2, dst3};
+    dcsi.offset_src_ = host2device ? cpu_offset : 0;
+    dcsi.offset_dst_ = 0;
+    dci.dcsi_ = {dcsi};
+    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
+
+    // output_dimwise_ea_: one entry per host dimension (outermost-first).
+    const int64_t cum_offset_n = dim2 * eps;
+
+    // K dimension (outermost host dim):
+    perdim_element_arrangement ea_K;
+    ea_K.dimShape_ = K;
+    ea_K.subElems_ = {K};
+    ea_K.subStride_ = {1};
+    ea_K.cumElemsBefore_ = {1, si};
+    ea_K.cumOffset_ = {1, dst2};
+
+    // N dimension (innermost host dim):
+    perdim_element_arrangement ea_N;
+    ea_N.dimShape_ = N;
+    ea_N.subElems_ = {so, si, N / eps};
+    ea_N.subStride_ = {si, 1, dst2};
+    ea_N.cumElemsBefore_ = {1, so};
+    ea_N.cumOffset_ = {si, cum_offset_n};
+
+    if (host2device) {
+      dci.output_dimwise_ea_ = {ea_K, ea_N};
+    } else {
+      dci.input_dimwise_ea_ = {ea_K, ea_N};
+    }
+  } else {
+    dci.dcsi_ = get_device_stride_infos(t_sizes, t_dev_strides, cpu_offset, stl,
+                                        host2device, t_cpu_strides);
+    dci.output_shape_ = host2device ? dev_shape : cpu_shape;
+  }
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
-  dci.output_shape_ = host2device ? dev_shape : cpu_shape;
   if (g_debug_info_enabled) {
     std::stringstream s;
     dci.exportJson(s);

@@ -19,7 +19,7 @@ from collections import Counter
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -236,8 +236,8 @@ def _get_device_dim_order(
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
-    stick_dim_order: Symbol | None,
-    stick_size: int,
+    stick_dim_order: list,
+    stick_size: list,
     layout_labels: list[str],
 ) -> str:
     for label, layout in layouts.items():
@@ -379,14 +379,27 @@ def _create_sdsc_tensors(
 
             max_dim_sizes[dim] = -1
 
-        effective_stick = op_stick_dim if stick_dim is None else stick_dim
-        label = _get_layout_label(
-            layouts,
-            dim_order,
-            effective_stick,
-            arg.device_dtype.elems_per_stick(),
-            MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
-        )
+        effective_stick = [op_stick_dim] if stick_dim is None else [stick_dim]
+        if (
+            arg.element_arrangement == ElementArrangement.QFP8WT
+            and op_spec.op != "fp8todl16"
+        ):
+            outer_stick_dim = next(d for d in dim_order if d is not stick_dim)
+            label = _get_layout_label(
+                layouts,
+                dim_order,
+                [outer_stick_dim, stick_dim],
+                [2, arg.device_dtype.elems_per_stick() // 2],
+                MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+            )
+        else:
+            label = _get_layout_label(
+                layouts,
+                dim_order,
+                effective_stick,
+                [arg.device_dtype.elems_per_stick()],
+                MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+            )
         # Change dataFormat_ value if needed.
         # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
         arg_data_format = _get_data_format(op_spec.op, arg.device_dtype)

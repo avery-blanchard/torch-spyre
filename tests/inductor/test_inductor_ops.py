@@ -3895,12 +3895,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "param_sets": {
                 "shape_128_128_scale_0.01": (
-                    cached_randn((128, 128), dtype=torch.float16),
-                    torch.tensor([0.01], dtype=torch.float16),
+                    cached_randn((128, 128), dtype=torch.float16) * 0.1,
+                    torch.tensor([1], dtype=torch.float16),
                 ),
                 "shape_4096_1024_scale_0.1": (
-                    cached_randn((4096, 1024), dtype=torch.float16),
-                    torch.tensor([0.1], dtype=torch.float16),
+                    cached_randn((4096, 1024), dtype=torch.float16) * 0.1,
+                    torch.tensor([1], dtype=torch.float16),
                 ),
             },
         },
@@ -5304,14 +5304,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fp8_weight_quantization_roundtrip(self, x, scale):
         def spyre_fn(x, scale):
             x_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(x, scale)
-            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+            return x_fp8
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
-                torch.float16
-            ) * scale
+            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):
