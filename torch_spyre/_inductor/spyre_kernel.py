@@ -658,6 +658,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(value)
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
+            from torch_spyre._inductor.indirect_access import is_indirect_value_tensor
+
             args: list[TensorArg] = []
             indirect_syms = _indirect_syms_used(value, self.indirect_vars)
             if indirect_syms:
@@ -673,10 +675,23 @@ class SpyreKernel(Kernel[CSEVariable]):
                 ]
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
-                    args.append(self.create_tensor_arg(True, input.name, input))
+                    arg = self.create_tensor_arg(True, input.name, input)
+                    args.append(arg)
+                    # Track if this is an indirect value tensor
+                    if is_indirect_value_tensor(arg):
+                        indirect_value_arg = arg
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
-            args.append(self.create_tensor_arg(False, real_dst_name, dst))
+
+            output_arg = self.create_tensor_arg(False, real_dst_name, dst)
+
+            # For indirect access operations, use input value tensor's layout for output
+            if indirect_value_arg is not None:
+                output_arg.device_size = indirect_value_arg.device_size
+                output_arg.device_coordinates = indirect_value_arg.device_coordinates
+                output_arg.stride_map = indirect_value_arg.stride_map
+
+            args.append(output_arg)
             op_info.update(value.op_info)
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):

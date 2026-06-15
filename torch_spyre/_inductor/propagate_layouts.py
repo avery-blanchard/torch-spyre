@@ -807,6 +807,13 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         producer_layouts = getattr(producer, "layouts", None)
         if not producer_layouts or target_stl not in producer_layouts:
             continue
+        # Skip copy-back optimization for QFP8WT/QFP8CH — their multi-dimensional
+        # stick layouts are not compatible with standard copy-back operations
+        if target_stl.element_arrangement in (
+            ElementArrangement.QFP8WT,
+            ElementArrangement.QFP8CH,
+        ):
+            continue
 
         producer.layout = copy_op.layout
         producer.layouts = [target_stl]
