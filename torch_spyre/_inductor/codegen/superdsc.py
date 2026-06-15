@@ -32,7 +32,6 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.indirect_access import (
     collect_index_tensor_layouts,
-    compute_indirect_backgap,
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
     get_indirect_dim_symbols,
@@ -470,14 +469,6 @@ def _create_sdsc_tensors(
                     indirect_dims = get_indirect_dim_symbols(
                         arg, index_arg, symbol_mapping
                     )
-                    for indirect_dim in indirect_dims:
-                        if (
-                            indirect_dim not in backGap
-                            and indirect_dim in max_dim_sizes
-                        ):
-                            backGap[indirect_dim] = compute_indirect_backgap(
-                                indirect_dev_dim_size, max_dim_sizes[indirect_dim]
-                            )
 
         if mb_sym is not None:
             dim_order = [mb_sym] + dim_order

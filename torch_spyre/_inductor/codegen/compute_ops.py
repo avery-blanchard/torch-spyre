@@ -605,6 +605,11 @@ def generate_sdsc(
                                             "dim_order"
                                         ]
                                     ],
+                                    **(
+                                        {"indexTensorType_": "index"}
+                                        if tensor.is_index_tensor
+                                        else {}
+                                    ),
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
                                     ),
