@@ -182,11 +182,9 @@ POINTWISE_TEST_FAILURES = [
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_2",
     "test_transpose_4d_contiguous_dim_1_3",
-<<<<<<< HEAD
     "test_restickify_add_transpose_10x20_add_transpose",
     "test_restickify_add_transpose_7x13_add_transpose",
     "test_restickify_add_transpose_64x129_add_transpose",
-=======
     # unfold: lx_planning cannot handle multi-variable stick expressions produced
     # by unfold's overlapping/strided access patterns (e.g. d0+d1, 4*d0+d1).
     # Tracked by issue #2346.
@@ -210,7 +208,6 @@ POINTWISE_TEST_FAILURES = [
     "test_unfold_edge_pow2_64",
     "test_unfold_edge_window_1",
     "test_unfold_edge_single_window",
->>>>>>> main
     "test_conv2d_1x3x32_ksize3_no_pad",
     "test_tril_3d",
     "test_triu_3d",
@@ -403,11 +400,9 @@ REDUCTION_TEST_FAILURES = [
     "test_transpose_3d_contiguous_dim_0_2",
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_3",
-<<<<<<< HEAD
     "test_restickify_add_transpose_10x20_add_transpose",
     "test_restickify_add_transpose_7x13_add_transpose",
     "test_restickify_add_transpose_64x129_add_transpose",
-=======
     # unfold: same as POINTWISE — multi-variable stick expressions. Issue #2346.
     "test_unfold_1d_large",
     "test_unfold_1d_no_overlap",
@@ -429,7 +424,6 @@ REDUCTION_TEST_FAILURES = [
     "test_unfold_edge_pow2_64",
     "test_unfold_edge_window_1",
     "test_unfold_edge_single_window",
->>>>>>> main
     "test_conv2d_1x3x32_ksize3_no_pad",
     "test_where_self_out_where_fp16_2d",
     "test_scalar_comparison",
