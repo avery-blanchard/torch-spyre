@@ -16,7 +16,6 @@
 import dataclasses
 
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.logging_utils import _get_env_bool
 from sympy import Symbol
 
 
@@ -329,11 +328,7 @@ def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
         fields["relatedIndirectAccessAlloc_"] = related_alloc
 
     if tensor.is_index_tensor:
-        fields["indexTensorType_"] = (
-            "address"
-            if _get_env_bool("SPYRE_INDUCTOR_ENABLE_ADD_INDEX_TO_ADDRESS", False)
-            else "index"
-        )
+        fields["indexTensorType_"] = "index"
 
     return fields
 
