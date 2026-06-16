@@ -3760,14 +3760,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_fp8_scaled_mm", "test_fp8_scaled_mm_cpu"): {
             "param_sets": {
                 "128x128x128": (
-                    cached_xavier((128, 128)),
-                    cached_xavier((128, 128)),
+                    torch.rand((128, 128), dtype=torch.float16),
+                    torch.rand((128, 128), dtype=torch.float16),
                     torch.tensor([1.0], dtype=torch.float16),
                     torch.tensor([1.0], dtype=torch.float16),
                 ),
                 "128x256x128": (
-                    cached_xavier((128, 256)),
-                    cached_xavier((256, 128)),
+                    torch.rand((128, 256), dtype=torch.float16),
+                    torch.rand((256, 128), dtype=torch.float16),
                     torch.tensor([1.0], dtype=torch.float16),
                     torch.tensor([1.0], dtype=torch.float16),
                 ),
@@ -5239,9 +5239,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         from torch_spyre._C import ElementArrangement, DataFormats, SpyreTensorLayout
 
         # Test case: 128×256 × 256×128
-        m, k, n = 128, 256, 128
-        a = torch.randn((m, k), dtype=torch.float16, device="cpu")
-        b = torch.randn((k, n), dtype=torch.float16, device="cpu")
+        m, k, n = 128, 128, 128
+        a = torch.ones((m, k), dtype=torch.float16, device="cpu") 
+        b = torch.ones((k, n), dtype=torch.float16, device="cpu")
         scale_a = torch.tensor([1.0], dtype=torch.float16)
         scale_b = torch.tensor([1.0], dtype=torch.float16)
 
@@ -5253,11 +5253,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         stl_b = SpyreTensorLayout(
             list(q_b_fp8.size()),
             list(q_b_fp8.stride()),
-            DataFormats.SEN143_FP8,
+            q_b_fp8.dtype,
             list(range(len(q_b_fp8.shape))),
-            ElementArrangement.QFP8WT,
+            element_arrangement=ElementArrangement.QFP8WT,
         )
-        q_b_dev = q_b_fp8.to(device_layout=stl_b)
+        q_b_dev = q_b_fp8.to("spyre", device_layout=stl_b)
 
         def scaled_mm(a, q_b_dev, scale_a, scale_b):
             q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
@@ -5271,8 +5271,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         q_b_ref = q_b_fp8
         expected = (q_a_ref @ q_b_ref).to(torch.float16) * (scale_a * scale_b)
 
-        result = scaled_mm(a_dev, q_b_dev, scale_a, scale_b)
-        torch.testing.assert_close(result.to("cpu"), expected, atol=1e-2, rtol=0.13)
+        compiled_fn = torch.compile(                                                                                                                                                                          
+                scaled_mm, backend="inductor", dynamic=False                                                                                                                                                      
+            )                                                                                                                                                                                                     
+
+                                                                                                                                                                            
+        result = compiled_fn(a_dev, q_b_dev, scale_a.to("spyre"), scale_b.to("spyre"))                                                                                                                                                
+        torch.set_printoptions(profile="full")
+        print("spyre:", result)
+        print("cpu:", expected)
+        result_cpu = result.to("cpu")
+        torch.save(result_cpu, "mm_fp8_spyre_out.pt")
+        torch.save(expected, "mm_fp8_cpu_out.pt")
+        torch.testing.assert_close(result_cpu, expected, atol=1e-2, rtol=0.13)
 
 
 if __name__ == "__main__":

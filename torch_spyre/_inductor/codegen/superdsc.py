@@ -393,9 +393,7 @@ def _create_sdsc_tensors(
                 # reduction for the output but the KERNEL itself iterates
                 # over all of K spatially — treat it as scale=1.
                 scales[dim] = (
-                    1
-                    if (is_2d_stick_kernel and dim is not stick_dim)
-                    else (-2 if (stick_dim is None and dim is op_stick_dim) else -1)
+                    -2 if (stick_dim is None and dim is op_stick_dim) else -1
                 )
             elif dim in reduced_dims and op_spec.op == "layernormscale":
                 scales[dim] = -2 if (dim is stick_dim) else -1
@@ -428,11 +426,12 @@ def _create_sdsc_tensors(
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
-                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
-            if is_fp8_matmul and len(sdsc_args) == 0 and dim is not stick_dim:
-                scales[dim] = -1
-            if is_fp8_quant and dim is not stick_dim and len(sdsc_args) == 0:
-                scales[dim] = -1
+                if not is_2d_stick_kernel: 
+                    strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+            # if is_fp8_matmul and len(sdsc_args) == 0 and dim is not stick_dim:
+            #     scales[dim] = -1
+            # if is_fp8_quant and dim is not stick_dim and len(sdsc_args) == 0:
+            #     scales[dim] = -1
             max_dim_sizes[dim] = -1
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]

@@ -86,6 +86,7 @@ def gen_coord_info_value(
     is_fp8_stick: bool = False,
     is_2d_stick: bool = False,
     other_stick_size: int = 1,
+    stick_idx: int = -1,
 ):
     return (
         {
@@ -140,7 +141,7 @@ def gen_coord_info_value(
                 ],
             },
         }
-        if not is_stick_dim
+        if not is_fp8_stick  and not is_stick_dim
         else {
             "spatial": 3,
             "temporal": 0,
@@ -154,10 +155,16 @@ def gen_coord_info_value(
                     {
                         "Affine": {
                             "alpha_": (other_stick_size if is_2d_stick else 64),
+                            # "alpha_": size,
                             "beta_": 0,
                         }
                     },
-                    {"Affine": {"alpha_": 8, "beta_": 0}},
+                    {
+                        "Affine": {
+                            "alpha_": (size // other_stick_size if is_2d_stick else 8),
+                            "beta_": 0,
+                        }
+                    },
                     {"Affine": {"alpha_": 1, "beta_": 0}},
                 ],
                 "dim_prop_attr": [
@@ -165,15 +172,18 @@ def gen_coord_info_value(
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
                     {
-                        "factor_": (other_stick_size if is_2d_stick else (size // 64)),
+                        "factor_": (64 if is_2d_stick else (size // 64)),
                         "label_": "elem_arr_2",
                     },
-                    {"factor_": 8, "label_": "elem_arr_1"},
-                    {"factor_": 8, "label_": "elem_arr_0"},
+                    {
+                        "factor_": (other_stick_size if is_2d_stick else 8),
+                        "label_": "elem_arr_1",
+                    },
+                    {"factor_": 1 if is_2d_stick else 8, "label_": "elem_arr_0"},
                 ],
             },
         }
-        if is_fp8_stick
+        if is_stick_dim and is_fp8_stick and not (is_2d_stick and stick_idx == 0)
         else {
             "spatial": 3,
             "temporal": 0,
@@ -251,15 +261,23 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
     has_2d_stick = len(stick_size_list) > 1
 
+ 
+    # # For 2D stick, only apply 2D logic to outer_stick dimension, not inner_stick
+    # if has_2d_stick and is_stick_dim:
+    #     stick_dim_order = sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
+    #     stick_idx = stick_dim_order.index(dim)
+    #     # Only use 2D stick coords for outer_stick (first in stick_dim_order)
+    #     has_2d_stick = (stick_idx == 0)
     # For QFP8WT (2D stick), SIZE computation depends on whether this is an is_fp8_stick dim
     if has_2d_stick and is_stick_dim:
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         outer_stick = stick_size_list[0]
         inner_stick = stick_size_list[1]
 
+
         # Check if this is an is_fp8_stick dimension (stick_size >= 64)
         this_stick_size = stick_size_list[stick_idx]
-        is_this_fp8_stick = this_stick_size >= 64
+        is_this_fp8_stick = this_stick_size == 64
 
         iter_space = sdsc_spec.iteration_space[dim]
         base_size = (
@@ -268,12 +286,7 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
             else 1
         )
 
-        # For is_fp8_stick dimensions, SIZE is divided by inner_stick
-        # For regular stick dimensions, SIZE remains full iteration_space
-        if is_this_fp8_stick:
-            size = base_size // inner_stick
-        else:
-            size = base_size
+        size = base_size
 
         other_stick_idx = 1 - stick_idx
         other_stick_size = stick_size_list[other_stick_idx]
@@ -300,10 +313,7 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     is_fp8_stick = (
         is_stick_dim
         and tensor.data_format == DataFormats.SEN143_FP8
-        and stick_size_list[
-            sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
-        ]
-        >= 64
+        and len(stick_size_list) > 1
     )
     is_stick_reduction = tensor.scales[dim] == -2
 
@@ -316,6 +326,7 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
         is_fp8_stick=is_fp8_stick,
         is_2d_stick=has_2d_stick,
         other_stick_size=other_stick_size if is_stick_dim else 1,
+        stick_idx=stick_idx if is_stick_dim else -1,
     )
 
 
