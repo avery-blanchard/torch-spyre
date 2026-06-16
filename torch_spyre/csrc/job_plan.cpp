@@ -42,17 +42,65 @@ void JobPlanStepH2D::write(std::ostream& os) const {
      << "\n";
 }
 
+// TODO(jni): move to flex
+// convert CompositeAddress to dmva
+static int64_t composite_address_to_dmva(
+    const flex::CompositeAddress& composite_address) {
+  size_t num_chunks = composite_address.chunks().size();
+  TORCH_CHECK(num_chunks == 1, "Interleaved not supported yet");
+
+  const auto& addr = composite_address.chunks()[0].addr;
+  auto& allocator = SpyreAllocator::instance();
+  auto seg_id = allocator.segmentForRegion(addr.region_id);
+  auto address = flex::SegmentByteOffset_todmva(seg_id, addr.offset);
+  return address;
+}
+
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepD2H::construct(
-    LaunchContext&) const {
-  auto op = std::make_unique<flex::RuntimeOperationD2H>(&device_address_,
-                                                        host_address_);
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+    LaunchContext& ctx) const {
+  if (device_address_.has_value()) {
+    auto op = std::make_unique<flex::RuntimeOperationD2H>(
+        &device_address_.value(), host_address_);
+    op->setPipelineBarrier(pipeline_barrier_);
+    return op;
+  } else {
+    // supports copying inputs from device to host
+    if (bind_io_addresses_) {
+      TORCH_CHECK(flex::SegmentOffset(dmva_) != 0,
+                  "D2H device address is different from IO tensors");
+      auto segment_id = flex::SegmentId(dmva_);
+      const auto& tensor = ctx.inputs_outputs.at(segment_id);
+      auto op = std::make_unique<flex::RuntimeOperationD2H>(
+          &(static_cast<SharedOwnerCtx*>(
+                tensor.storage().data_ptr().get_context())
+                ->composite_addr),
+          host_address_);
+      op->setPipelineBarrier(pipeline_barrier_);
+      return op;
+    } else {
+      for (const auto& tensor : ctx.inputs_outputs) {
+        auto tensor_ctx = static_cast<SharedOwnerCtx*>(
+            tensor.storage().data_ptr().get_context());
+        auto dmva = composite_address_to_dmva(tensor_ctx->composite_addr);
+        if (dmva == dmva_) {
+          auto op = std::make_unique<flex::RuntimeOperationD2H>(
+              &(tensor_ctx->composite_addr), host_address_);
+          op->setPipelineBarrier(pipeline_barrier_);
+          return op;
+        }
+      }
+      TORCH_CHECK(false, "D2H device address is different from IO tensors");
+    }
+  }
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
   os << "  D2H (Device-to-Host)\n";
-  os << "    Device address: " << device_address_ << "\n";
+  if (device_address_.has_value()) {
+    os << "    Device address: " << *device_address_ << "\n";
+  } else {
+    os << "    Device hmva: " << dmva_ << "\n";
+  }
   os << "    Host address: " << host_address_ << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
@@ -83,20 +131,6 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
-}
-
-// TODO(jni): move to flex
-// convert CompositeAddress to dmva
-static int64_t composite_address_to_dmva(
-    const flex::CompositeAddress& composite_address) {
-  size_t num_chunks = composite_address.chunks().size();
-  TORCH_CHECK(num_chunks == 1, "Interleaved not supported yet");
-
-  const auto& addr = composite_address.chunks()[0].addr;
-  auto& allocator = SpyreAllocator::instance();
-  auto seg_id = allocator.segmentForRegion(addr.region_id);
-  auto address = flex::SegmentByteOffset_todmva(seg_id, addr.offset);
-  return address;
 }
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
@@ -152,10 +186,14 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   os << "Total steps: " << plan.steps.size() << "\n";
 
   // Job allocation
-  if (!plan.job_allocation.chunks().empty()) {
-    os << "Job allocation: " << plan.job_allocation << "\n";
-  } else {
-    os << "Job allocation: <none>\n";
+  size_t addr_idx = 0;
+  for (const auto& addr : plan.job_allocation) {
+    if (addr_idx == 0) {
+      os << "Job allocation: " << addr << "\n";
+    } else {
+      os << "Program " << addr_idx - 1 << ": " << addr << "\n";
+    }
+    ++addr_idx;
   }
 
   // Expected input shapes

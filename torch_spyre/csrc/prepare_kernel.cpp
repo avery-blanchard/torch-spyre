@@ -201,9 +201,9 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
                                       std::nullopt, flex::MemoryType::Program);
   c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
 
-  job_allocation_ =
+  job_allocation_.emplace_back(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
-                    ->composite_addr);
+                    ->composite_addr));
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -224,7 +224,7 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string binary_file = init_props["init_bin_file"].get<std::string>();
   std::filesystem::path binary_path = spyrecode_dir_ / binary_file;
 
-  std::string binary_data = read_file_to_string(binary_path);
+  inits_.emplace_back(read_file_to_string(binary_path));
 
   TORCH_CHECK(init_props.contains("dev_ptr"),
               "InitTransfer command missing 'dev_ptr' property");
@@ -238,12 +238,12 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string init_size_str = init_props["size"].get<std::string>();
   size_t init_size = std::stoull(init_size_str);
 
-  auto device_addr =
-      compute_offset_address(job_allocation_.value(), dev_ptr, init_size);
+  job_allocation_.emplace_back(
+      compute_offset_address(job_allocation_.at(0), dev_ptr, init_size));
 
   stream_.copyProgramAsync(
-      const_cast<void*>(static_cast<const void*>(binary_data.data())),
-      &device_addr);
+      const_cast<void*>(static_cast<const void*>(inits_.back().data())),
+      &job_allocation_.back());
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -259,7 +259,6 @@ void JobPlanBuilder::executeJobPreparationPlan() {
   for (size_t i = 1; i < job_prep_plan.size(); ++i) {
     executeInitTransfer(job_prep_plan[i]);
   }
-  stream_.synchronize();
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
@@ -271,7 +270,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
 
   auto job_bin_addr =
-      compute_offset_address(job_allocation_.value(), job_bin_ptr);
+      compute_offset_address(job_allocation_.at(0), job_bin_ptr);
 
   // Verify the resulting binary address is populated
   TORCH_CHECK(job_bin_addr.total_size() > 0,
@@ -380,7 +379,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 
       // Compute CompositeAddress with offset
       flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.value(), device_ptr, transfer_size);
+          job_allocation_.at(0), device_ptr, transfer_size);
 
       return std::make_unique<JobPlanStepH2D>(host_addr, std::move(comp_addr));
     }
@@ -412,11 +411,19 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       pinned_buffer_map_[host_handle_str] = HostBuffer(transfer_size);
       void* host_addr = pinned_buffer_map_[host_handle_str].data();
 
-      // Compute CompositeAddress with offset from device_addr
-      flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.value(), device_ptr, transfer_size);
-
-      return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr);
+      // If device_ptr is in segment 7, calculate CompositeAddress and store it
+      // in JobPlanStepH2D. If device_ptr is in tensor segments, store
+      // device_ptr
+      if (flex::SegmentId(device_ptr) == flex::PROG_SEGMENT) {
+        // Compute CompositeAddress with offset from device_addr
+        flex::CompositeAddress comp_addr = compute_offset_address(
+            job_allocation_.at(0), device_ptr, transfer_size);
+        return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr,
+                                                device_ptr, bind_io_addresses_);
+      } else {
+        return std::make_unique<JobPlanStepD2H>(std::nullopt, host_addr,
+                                                device_ptr, bind_io_addresses_);
+      }
     }
 
     case TransferDirection::Unknown:
@@ -488,12 +495,12 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // Create and return the JobPlan
   // Use brace initialization to construct JobPlan with moved members
-  return std::make_unique<JobPlan>(JobPlan{
-      std::move(steps),                    // steps
-      std::move(job_allocation_.value()),  // job_allocation
-      {},                                  // expected_input_shapes
-      std::move(pinned_buffers)            // pinned_buffers
-  });
+  return std::make_unique<JobPlan>(
+      JobPlan{std::move(steps),            // steps
+              std::move(job_allocation_),  // job_allocation
+              {},                          // expected_input_shapes
+              std::move(pinned_buffers),   // pinned_buffers
+              std::move(inits_)});
 }
 
 JobPlanBuilder::ValidationResult JobPlanBuilder::validate(

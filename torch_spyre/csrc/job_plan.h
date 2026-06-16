@@ -313,12 +313,17 @@ class JobPlanStepD2H final : public JobPlanStep {
   /**
    * @brief Construct D2H step
    *
-   * @param device_address Device memory address
+   * @param device_address Device memory address (optional)
    * @param host_address Host memory address (caller manages lifetime)
+   * @param dmva Device memory virtual address
+   * @param bind_io_addresses Whether to bind I/O addresses
    */
-  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address)
+  JobPlanStepD2H(std::optional<flex::CompositeAddress> device_address,
+                 void* host_address, uint64_t dmva, bool bind_io_addresses)
       : device_address_(std::move(device_address)),
-        host_address_(host_address) {}
+        host_address_(host_address),
+        dmva_(dmva),
+        bind_io_addresses_(bind_io_addresses) {}
 
   std::unique_ptr<flex::RuntimeOperation> construct(
       LaunchContext& ctx) const override;
@@ -326,8 +331,10 @@ class JobPlanStepD2H final : public JobPlanStep {
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress device_address_;
+  std::optional<flex::CompositeAddress> device_address_;
   void* host_address_;
+  uint64_t dmva_;
+  bool bind_io_addresses_;
 };
 
 /**
@@ -451,8 +458,10 @@ struct JobPlan {
   std::vector<std::unique_ptr<JobPlanStep>> steps;
 
   /**
-   * @brief Owning CompositeAddress of the program binary, and conditionally
-   * program correction data and spillover tensor data
+   * @brief vector of CompositeAddress with the first being the owning
+   * CompositeAddress of the program binary, and conditionally program
+   * correction data and spillover tensor data, and the rest being the
+   * non-owning CompositeAddress of each program.
    *
    * The JobPlan owns this address and is responsible for its lifetime. When the
    * JobPlan is destroyed, the memory is freed.
@@ -461,7 +470,7 @@ struct JobPlan {
    * DMA JobPlans (e.g., tensor .to(device)) that don't involve compute
    * operations.
    */
-  flex::CompositeAddress job_allocation;
+  std::vector<flex::CompositeAddress> job_allocation;
 
   /**
    * @brief Compiled tile dimensions from SpyreCode
@@ -482,6 +491,13 @@ struct JobPlan {
    */
   // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
   std::vector<HostBuffer> pinned_buffers;
+
+  /**
+   * @brief Compiled programs
+   *
+   * One entry per program.
+   */
+  std::vector<std::string> inits;
 };
 
 /**
