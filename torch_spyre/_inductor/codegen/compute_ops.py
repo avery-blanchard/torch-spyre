@@ -74,11 +74,6 @@ def core_idx_to_slice_offset(
     work_slices: dict,
 ) -> int:
     offset = sum(arg.offsets.values())
-    # Indirect-access value tensor: shared across all cores at one fixed base.
-    # Every core may gather any row at runtime, so its base must not advance with
-    # the work-division slice — keep it at address 0 (sum of static offsets).
-    if getattr(arg, "shared_base", False):
-        return offset
     for dim, stride in arg.strides.items():
         if str(dim) in wk_slice and arg.scales[dim] > 0:
             offset += wk_slice[str(dim)] * stride // work_slices[dim]
