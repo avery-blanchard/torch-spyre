@@ -685,6 +685,24 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Gather/scatter: create_tensor_arg applies indirect_access_subs automatically
                 # (via compute_coordinates) so all args come out with correct coordinates.
                 # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
+                # First create the value arg to check which indirect indices it uses
+                value_arg = self.create_tensor_arg(True, value.name, value)
+                # Find which index tensor names appear in the value's device_coordinates
+                used_index_names: set[str] = set()
+                for coord in value_arg.device_coordinates:
+                    if hasattr(coord, "atoms"):
+                        for ia in coord.atoms(IndirectAccess):
+                            for arg in ia.args:
+                                if hasattr(arg, "name"):
+                                    used_index_names.add(arg.name)
+                # For now, only support tensors with a single index tensor
+                if len(used_index_names) > 1:
+                    raise Unsupported(
+                        f"Tensor {value.name} uses multiple index tensors "
+                        f"{used_index_names}; multidimensional indirect indexing "
+                        "not yet supported"
+                    )
+                # Add only the index tensors that are actually used by this value tensor
                 args = [
                     self.create_tensor_arg(
                         True,
@@ -696,9 +714,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                         self.indirect_vars.values(),
                         key=lambda t: t.name,
                     )
+                    if idx_tensor.name in used_index_names
                 ]
                 args += [
-                    self.create_tensor_arg(True, value.name, value),
+                    value_arg,
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
             else:
