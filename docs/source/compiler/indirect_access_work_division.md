@@ -80,7 +80,7 @@ Validated on hardware (`x : [128, 64, 512]`, `i : [256]`, `SENCORES=32`):
 
 ## The proposed fix
 
-Four changes, in order of importance.
+Three changes, in order of importance.
 
 ### 1. Forbid splitting the value-data dims — the correctness fix
 
@@ -94,18 +94,7 @@ When the index dim cannot absorb all the cores, the gather falls back to fewer
 cores rather than splitting a value-data dim. **Correct-but-serial is the
 intended trade-off; silent corruption is not.**
 
-### 2. Shared-base value addressing
-
-`SDSCArgs.shared_base` ([codegen/superdsc.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py))
-marks the value tensor. In `core_idx_to_slice_offset`
-([codegen/compute_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/compute_ops.py))
-a `shared_base` tensor keeps its per-core base at the static offset (address 0)
-instead of advancing with the work-division slice. The gather row comes from the
-runtime `IndirectAccess`; the index and output tensors keep the normal per-core base
-advance. This makes the shared-table addressing correct by construction rather
-than relying on the backend to tolerate a stale per-core base.
-
-### 3. Value-table span guard (defensive)
+### 2. Value-table span guard (defensive)
 
 `collect_indirect_value_tds` rebuilds the value `TensorDep` with
 `IndirectAccess`-aware coordinates so the value table is visible to the per-core
@@ -139,8 +128,8 @@ stickifies to `256 / 32 = 8` sticks on `d0`.
 |---|---|---|
 | Largest dim | `K = 64` | (forbidden) |
 | Split | `K`, 32 cores | `d0` (index), 8 cores |
-| Value tensor | per-core column base diverges | shared at base 0 |
-| Result | wrong (every core reads column 0) | correct |
+| Value tensor | per-core base advances along K (wrong) | per-core base advances along d0 (correct) |
+| Result | wrong | correct |
 
 Parallelism with the fix is set by the index size in sticks:
 `cores = min(Q / 32, 32)` for a 1-D index (`Q = 256 → 8`, `Q = 1024 → 32`), or a
@@ -173,16 +162,11 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicor
   wide embedding lookups at small batch — get few cores (often 1–2). They are
   **correct**, but not maximally parallel.
 
-- **Next phase (parallelising the value-data dims) is deferred.** A prototype
-  let the planner split a value-data dim and advanced the value tensor's per-core
-  base along it. On hardware the per-core base of a `value_tensor` allocation is
-  interpreted as an absolute offset into the table *where the gather happens*, so
-  advancing it shifts the gathered **row**, not the **column** — there is no
-  per-core base value that expresses "different columns per core" for a value
-  tensor. Making the data-dim split correct requires carrying the per-core column
-  offset in the coordinate folds and/or a backend change to how `value_tensor`
-  bases are interpreted. This needs the DeepTools/backend team and is out of
-  scope for current proposal.
+- **Next phase (parallelising the value-data dims) is deferred.** The current
+  implementation only splits the index-entry dimension. Workloads with a small,
+  fixed index but wide rows — MoE expert gathers, paged-attention KV reads, wide
+  embedding lookups at small batch — are correct but limited to few cores. Splitting
+  value-data dims requires additional work and is left for future work.
 
 - **Scatter is not addressed.** For a scatter (`out[i] = src`), the `IndirectAccess`
   is on the output, so splitting index-entry dims gives data-dependent
@@ -194,8 +178,6 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicor
 | File | Change |
 |---|---|
 | `_inductor/work_division.py` | `indirect_value_data_syms`, `collect_indirect_value_tds`, `IndirectAccess` span guard, `forbidden_split_syms` in `_default_split`, `_first_non_indirect_read_index` |
-| `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for the value tensor |
-| `_inductor/codegen/compute_ops.py` | `core_idx_to_slice_offset` honours `shared_base` |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
 | `examples/gather_multicore_exp.py` | three-scenario validation example |
 

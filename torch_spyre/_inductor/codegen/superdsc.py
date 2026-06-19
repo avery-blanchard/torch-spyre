@@ -64,7 +64,6 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
-    shared_base: bool = False
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -555,7 +554,6 @@ def _create_sdsc_tensors(
                 arg_index=arg.arg_index,
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
-                shared_base=has_indirect_access and is_indirect_value_tensor(arg),
             )
         )
 
