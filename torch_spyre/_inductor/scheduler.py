@@ -375,6 +375,7 @@ class SuperDSCScheduling(BaseScheduling):
         kernel = SpyreKernel()
         with kernel:
             for node in node_schedule:
+                kernel.indirect_vars.clear()
                 var_ranges = iteration_space(node)
                 vars = list(var_ranges.keys())
                 index_vars = [
@@ -428,6 +429,7 @@ class SuperDSCScheduling(BaseScheduling):
                     sched = self.generate_node_schedule([inner])
                     all_schedule_nodes.extend(sched)
                     for snode in sched:
+                        kernel.indirect_vars.clear()
                         var_ranges = iteration_space(snode)
                         vs = list(var_ranges.keys())
                         index_vars = [
