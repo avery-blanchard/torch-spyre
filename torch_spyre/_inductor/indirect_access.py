@@ -132,11 +132,7 @@ def _get_index_active_dims_for_value(
     index_arg: "TensorArg",
     symbol_mapping: dict,
 ) -> list[Symbol]:
-    """Return the ordered list of free symbols (active dims) in index_arg's coords.
-
-    The last active dim is the innermost (fastest-varying) index dimension; all
-    preceding dims are the 'page' dimensions for a multidimensional index tensor.
-    """
+    """Return the ordered list of free symbols (active dims) in index_arg's coords."""
     seen: set[Symbol] = set()
     active: list[Symbol] = []
     for coord in index_arg.device_coordinates:
@@ -166,8 +162,9 @@ def compute_indirect_max_dim_sizes(
     Value tensor:
       - stick dim → -1 (always dynamic)
       - dimension not in index tensor → -1 (data dimension, full range)
-      - dimension in index tensor, same size as value → -1 (dynamic)
-      - dimension in index tensor, index smaller → 1 (indirect dimension)
+      - dimension in index tensor, multi-dim index, not the last active dim →
+        idx_size (bounded by the index tensor's size along that axis)
+      - dimension in index tensor, last (or only) active dim → 1 (indirect)
 
     Index tensor:
       - always -1
