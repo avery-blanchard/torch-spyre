@@ -128,6 +128,27 @@ def _get_index_tensor_device_size_at(
     return None
 
 
+def _get_index_active_dims_for_value(
+    index_arg: "TensorArg",
+    symbol_mapping: dict,
+) -> list[Symbol]:
+    """Return the ordered list of free symbols (active dims) in index_arg's coords.
+
+    The last active dim is the innermost (fastest-varying) index dimension; all
+    preceding dims are the 'page' dimensions for a multidimensional index tensor.
+    """
+    seen: set[Symbol] = set()
+    active: list[Symbol] = []
+    for coord in index_arg.device_coordinates:
+        if not hasattr(coord, "free_symbols"):
+            continue
+        for sym in coord.subs(symbol_mapping).free_symbols:
+            if sym not in seen:
+                seen.add(sym)
+                active.append(sym)
+    return active
+
+
 def compute_indirect_max_dim_sizes(
     tensor_idx: int,
     dim: Symbol,
@@ -168,9 +189,10 @@ def compute_indirect_max_dim_sizes(
         idx_size = _get_index_tensor_device_size_at(index_arg, stride_idx)
         if idx_size is None:
             return -1
-        if idx_size < original_dev_dim_size:
-            return 1
-        return -1
+        active_dims = _get_index_active_dims_for_value(index_arg, symbol_mapping)
+        if len(active_dims) > 1 and dim != active_dims[-1]:
+            return idx_size
+        return 1
 
     elif tensor_idx in index_tensor_indices:
         return -1
