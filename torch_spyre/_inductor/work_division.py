@@ -39,6 +39,10 @@ from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
     _finite_upper_or_none,
+    _get_core_to_slice_mapping,
+    _is_matmul_op,
+    _k_fast_core_to_slice_mapping,
+    _should_use_k_fast_mapping,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -623,10 +627,23 @@ def apply_splits(
 ) -> None:
     """Commit splits to op.
 
-    Does nothing when the product of splits is 1 (no parallelism).
+    Always stores ``op.op_core_to_slice_mapping`` (including the single-core
+    case where the product of splits is 1).  ``op.op_it_space_splits`` is only
+    set when more than one core is used.
     """
-    cores_used = math.prod(splits.values())
-    if cores_used <= 1:
+    it_space = iteration_space_from_op(op)
+    is_matmul = _is_matmul_op(op)
+    num_cores = math.prod(splits.values())
+    if _should_use_k_fast_mapping(is_matmul, it_space, splits):
+        op.op_core_to_slice_mapping = _k_fast_core_to_slice_mapping(
+            it_space, splits, num_cores
+        )
+    else:
+        op.op_core_to_slice_mapping = _get_core_to_slice_mapping(
+            it_space, splits, num_cores
+        )
+
+    if num_cores <= 1:
         return
 
     rw = op.get_read_writes()

@@ -78,6 +78,10 @@ class OpSpec:
             Empty for ops that are not inside a LoopSpec.  The runtime computes the
             per-iteration tensor base offset for symbol ``s`` as
             ``loop_var * iteration_space[s].range``.
+        core_to_slice_mapping: Mapping from dimension name strings to sympy Exprs
+            that describe which slice of the iteration space each core ID handles.
+            Keyed by the original iteration-space symbol names (before SDSC renaming).
+            Set by the work division stage; None when the op bypasses work division.
     """
 
     op: str
@@ -86,6 +90,7 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[Symbol] = dataclasses.field(default_factory=list)
+    core_to_slice_mapping: dict[str, Any] | None = dataclasses.field(default=None)
 
 
 @dataclasses.dataclass

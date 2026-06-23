@@ -29,6 +29,10 @@ from torch._inductor.ir import (
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
+    _get_core_to_slice_mapping,
+    _is_matmul_op,
+    _k_fast_core_to_slice_mapping,
+    _should_use_k_fast_mapping,
     apply_splits_from_index_coeff,
     concretize_expr,
     iteration_space_from_op,
@@ -342,6 +346,25 @@ class DefaultAllocator(ScratchpadAllocator):
 DEFAULT_VARIANT_CAP = 6
 
 
+def _recompute_core_to_slice(
+    op: ComputedBuffer, coeff_splits: tuple[dict, dict]
+) -> dict[str, Any]:
+    """Recompute op_core_to_slice_mapping for a given op_it_space_splits value."""
+    rw = op.get_read_writes()
+    write_index = next(iter(rw.writes)).index
+    first_read = next(iter(rw.reads), None)
+    read_index = first_read.index if first_read is not None else write_index
+    it_space = iteration_space_from_op(op)
+    per_sym = apply_splits_from_index_coeff(
+        coeff_splits, write_index, read_index, it_space
+    )
+    num_cores = math.prod(per_sym.values())
+    is_matmul = _is_matmul_op(op)
+    if _should_use_k_fast_mapping(is_matmul, it_space, per_sym):
+        return _k_fast_core_to_slice_mapping(it_space, per_sym, num_cores)
+    return _get_core_to_slice_mapping(it_space, per_sym, num_cores)
+
+
 def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
     """Generate split options based on the seed (current committed
     split) by flipping the split factor onto a different output dim.
@@ -428,6 +451,8 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             chosen = options[opt_idx]
             if chosen != getattr(op, "op_it_space_splits", ({}, {})):
                 op.op_it_space_splits = chosen
+                if isinstance(op, ComputedBuffer):
+                    op.op_core_to_slice_mapping = _recompute_core_to_slice(op, chosen)
 
         # try insert clone again, as what was incompatible could be compatible now
         # TODO simplify the previous pre-opt (at the beginning of this func), we will
@@ -482,16 +507,18 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             op = ops[op_idx]
             options = options_per_op[op_idx]
 
-            # Mutate-and-undo: stash and restore op.op_it_space_splits.
-            # If the op originally lacked the attribute, restore it as
-            # ({}, {}) — equivalent to "unset" for all readers (which use
-            # getattr(..., ({}, {})) or hasattr+empty-dict default).
+            # Mutate-and-undo: stash and restore op.op_it_space_splits and
+            # op.op_core_to_slice_mapping together so they stay in sync.
             prev_split: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+            prev_mapping = getattr(op, "op_core_to_slice_mapping", None)
             for opt_idx, option in enumerate(options):
                 op.op_it_space_splits = option
+                if isinstance(op, ComputedBuffer):
+                    op.op_core_to_slice_mapping = _recompute_core_to_slice(op, option)
                 chosen[op_idx] = opt_idx
                 recurse(op_idx + 1)
             op.op_it_space_splits = prev_split
+            op.op_core_to_slice_mapping = prev_mapping
 
         recurse(0)
         return best_chosen

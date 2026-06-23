@@ -549,6 +549,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 read_index,
                 it_space,
             )
+        core_to_slice = getattr(ir_node, "op_core_to_slice_mapping", None)
 
         it_space_extended = {
             k: (v, work_division.get(k, 1)) for k, v in it_space.items()
@@ -593,6 +594,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             args,
             op_info,
             tiled_symbols=tiled_syms,
+            core_to_slice_mapping=core_to_slice,
         )
 
     def remove_kernel_local_buffers(self) -> None:
