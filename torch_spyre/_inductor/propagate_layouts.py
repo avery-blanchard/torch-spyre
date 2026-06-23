@@ -66,7 +66,7 @@ from .pass_utils import (
     device_coordinates,
     is_stick_expr_offset_free,
     indirect_index_dep_names,
-    indirect_access_subs_from_op,
+    indirect_info_from_op,
     indirect_sizes_from_op,
     iter_var_id,
 )
@@ -214,6 +214,7 @@ def _single_arg_op_layout(
     dep: MemoryDep,
     in_layout: FixedLayout,
     stl: SpyreTensorLayout,
+    indirect_sizes: "dict | None" = None,
 ) -> list[SpyreTensorLayout]:
     """
     Compute the output STL(s) for a single-arg op given one candidate input STL.
@@ -225,7 +226,7 @@ def _single_arg_op_layout(
     stick_size = get_elem_in_stick(output.dtype)
 
     if isinstance(data, Reduction):
-        x_dev_coords = device_coordinates(stl, dep)
+        x_dev_coords = device_coordinates(stl, dep, indirect_sizes=indirect_sizes)
         out_coords = host_coordinates(output, output_dep)
         x_stick_expr = x_dev_coords[-1]
 
@@ -237,7 +238,7 @@ def _single_arg_op_layout(
             return [out_stl]
 
         # Try alternative layouts when input layout is not supported
-        in_coords = host_coordinates(in_layout, dep)
+        in_coords = host_coordinates(in_layout, dep, indirect_sizes)
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
         )
@@ -274,7 +275,9 @@ def _single_arg_op_layout(
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
             # which becomes 64 FP32 elements when converted. We need to reflect this
             # in the output host size so the constructor creates the correct device layout.
-            in_stick_expr = device_coordinates(stl, dep)[-1]
+            in_stick_expr = device_coordinates(stl, dep, indirect_sizes=indirect_sizes)[
+                -1
+            ]
             if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
                 return []
 
@@ -296,7 +299,7 @@ def _single_arg_op_layout(
             )
             return [stl]
 
-    in_coords = host_coordinates(in_layout, dep)
+    in_coords = host_coordinates(in_layout, dep, indirect_sizes)
     out_coords = host_coordinates(output, output_dep)
     if (
         in_coords == out_coords
@@ -311,7 +314,7 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    in_device_coords = device_coordinates(stl, dep)
+    in_device_coords = device_coordinates(stl, dep, indirect_sizes=indirect_sizes)
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
@@ -400,6 +403,7 @@ def _exx2_layout(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    indirect_sizes: "dict | None" = None,
 ) -> list[SpyreTensorLayout]:
     """exx2 requires its input stick on the reduction dim (= last logical dim).
     Use FixedInOutNode to schedule a restickify if the input stick is elsewhere.
@@ -413,7 +417,9 @@ def _exx2_layout(
         c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
     )
     reduction_var = find_reduction_var(x.dep, output_dep)
-    req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
+    req_in_stl = find_stick_compatible_input_layout(
+        x, reduction_var, "exx2", "x", indirect_sizes
+    )
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
     return [out_stl]
 
@@ -423,6 +429,7 @@ def _layernormnorm_layout(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    indirect_sizes: "dict | None" = None,
 ) -> list[SpyreTensorLayout]:
     """layernormnorm requires x's stick to match mean/norm_mean (= last logical dim).
     Use FixedInOutNode to schedule a restickify if x's stick is elsewhere.
@@ -435,7 +442,7 @@ def _layernormnorm_layout(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     reduction_var = find_reduction_var(x.dep, output_dep)
     req_in_stl = find_stick_compatible_input_layout(
-        x, reduction_var, "layernormnorm", "x"
+        x, reduction_var, "layernormnorm", "x", indirect_sizes
     )
     op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
     return [out_stl]
@@ -454,6 +461,7 @@ def find_stick_compatible_input_layout(
     reduction_var: sympy.Symbol,
     reduction_type: str,
     label: str,
+    indirect_sizes: "dict | None" = None,
 ) -> SpyreTensorLayout:
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
@@ -461,7 +469,10 @@ def find_stick_compatible_input_layout(
     2. Else return the first layout that can be restickified to put reduction_var on the stick.
     3. Else raise Unsupported.
     """
-    arg_dev_coords = [device_coordinates(stl, arg.dep) for stl in arg.layouts]
+    arg_dev_coords = [
+        device_coordinates(stl, arg.dep, indirect_sizes=indirect_sizes)
+        for stl in arg.layouts
+    ]
 
     # Pass 1: already stick-compatible.
     # stick_compatible() checks cross-tensor compatibility; here we only need
@@ -472,7 +483,7 @@ def find_stick_compatible_input_layout(
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
     # and use it as target_stick_expr for compute_restickify_target_layout.
-    arg_host_coords = host_coordinates(arg.layout, arg.dep)
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, indirect_sizes)
     for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
         target_stick_expr = _dev_coord_for_var(
             dev_coords, arg_host_coords, reduction_var
@@ -495,6 +506,7 @@ def _matmul_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    indirect_sizes: "dict | None" = None,
 ) -> list[SpyreTensorLayout]:
     """
     Matmul has fixed in/out stick requirements so handled specially.
@@ -525,10 +537,10 @@ def _matmul_layouts(
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
 
     x_req_stl = find_stick_compatible_input_layout(
-        x, reduction_var, data.reduction_type, "x"
+        x, reduction_var, data.reduction_type, "x", indirect_sizes
     )
     y_req_stl = find_stick_compatible_input_layout(
-        y, generated_var, data.reduction_type, "y"
+        y, generated_var, data.reduction_type, "y", indirect_sizes
     )
 
     out_stick_dim = next(
@@ -561,6 +573,8 @@ def _multi_arg_pointwise_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    indirect_index_names: "set[str] | None" = None,
+    ind_sizes: "dict | None" = None,
 ) -> list[SpyreTensorLayout]:
     """
     Multi-arg pointwise is a join point so handled specially.
@@ -571,8 +585,10 @@ def _multi_arg_pointwise_layouts(
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
-    indirect_index_names = indirect_index_dep_names(op)
-    ind_sizes = indirect_sizes_from_op(op)
+    if indirect_index_names is None:
+        indirect_index_names = indirect_index_dep_names(op)
+    if ind_sizes is None:
+        ind_sizes = indirect_sizes_from_op(op)
     # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
         stick_expr
@@ -677,10 +693,11 @@ def _topk_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    indirect_sizes: "dict | None" = None,
 ) -> list[SpyreTensorLayout]:
     _check_supported_input_sticks(args, "topk")
     x = args[0]
-    x_coords = host_coordinates(x.layout, x.dep)
+    x_coords = host_coordinates(x.layout, x.dep, indirect_sizes)
     out_coords = host_coordinates(output, output_dep)
 
     # Reduction var: in x's index but absent from output's.
@@ -698,7 +715,7 @@ def _topk_layouts(
     # coord becomes a candidate.
     out_stick_dims: set[int | None] = set()
     for stl in x.layouts:
-        x_stick_expr = device_coordinates(stl, x.dep)[-1]
+        x_stick_expr = device_coordinates(stl, x.dep, indirect_sizes=indirect_sizes)[-1]
         if reduction_var in x_stick_expr.free_symbols:
             for c in surviving_coords:
                 out_stick_dims.add(matching_dim(out_coords, c))
@@ -736,45 +753,46 @@ def compute_layouts(
     """
     data = op.data
 
+    # Compute indirect access info once; re-used for logging and all dispatch paths.
+    indirect_index_names, indirect_subs, ind_sizes = indirect_info_from_op(op)
+
     # Log substituted device coordinates for indirect index args. Useful for
     # debugging gather/scatter layout propagation, and also the canonical
     # example of how to call device_coordinates() with indirect_access_subs
     # pre-scheduler (keeping indirect_access_subs_from_op exercised and visible).
-    if logger.isEnabledFor(logging.DEBUG):
-        indirect_index_names = indirect_index_dep_names(op)
-        if indirect_index_names:
-            indirect_subs = indirect_access_subs_from_op(op)
-            ind_sizes = indirect_sizes_from_op(op)
-            for arg in args:
-                if arg.dep.name in indirect_index_names:
-                    continue
-                for j, stl in enumerate(arg.layouts):
-                    d_coords_raw = device_coordinates(
-                        stl, arg.dep, indirect_sizes=ind_sizes
+    if logger.isEnabledFor(logging.DEBUG) and indirect_index_names:
+        for arg in args:
+            if arg.dep.name in indirect_index_names:
+                continue
+            for j, stl in enumerate(arg.layouts):
+                d_coords_raw = device_coordinates(
+                    stl, arg.dep, indirect_sizes=ind_sizes
+                )
+                try:
+                    d_coords_subs: object = device_coordinates(
+                        stl, arg.dep, indirect_subs, ind_sizes
                     )
-                    try:
-                        d_coords_subs: object = device_coordinates(
-                            stl, arg.dep, indirect_subs, ind_sizes
-                        )
-                    except Exception as e:
-                        d_coords_subs = f"<error: {e}>"
-                    logger.debug(
-                        f"  indirect value {arg.dep.name} STL[{j}]"
-                        f"\n    d_coords={d_coords_raw}"
-                        f"\n    d_coords (with IndirectAccess subs)={d_coords_subs}"
-                    )
+                except Exception as e:
+                    d_coords_subs = f"<error: {e}>"
+                logger.debug(
+                    f"  indirect value {arg.dep.name} STL[{j}]"
+                    f"\n    d_coords={d_coords_raw}"
+                    f"\n    d_coords (with IndirectAccess subs)={d_coords_subs}"
+                )
 
     if len(args) > 1 and isinstance(data, Pointwise):
-        return _multi_arg_pointwise_layouts(op, output, output_dep, args)
+        return _multi_arg_pointwise_layouts(
+            op, output, output_dep, args, indirect_index_names, ind_sizes
+        )
 
     if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
-        return _matmul_layouts(op, output, output_dep, args)
+        return _matmul_layouts(op, output, output_dep, args, ind_sizes)
 
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
-        return _exx2_layout(op, output, output_dep, args)
+        return _exx2_layout(op, output, output_dep, args, ind_sizes)
 
     if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
-        return _topk_layouts(op, output, output_dep, args)
+        return _topk_layouts(op, output, output_dep, args, ind_sizes)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:
@@ -786,7 +804,7 @@ def compute_layouts(
             raise Unsupported(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
-        return _layernormnorm_layout(op, output, output_dep, args)
+        return _layernormnorm_layout(op, output, output_dep, args, ind_sizes)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of
@@ -798,7 +816,7 @@ def compute_layouts(
     layouts = []
     for stl in args[0].layouts:
         result = _single_arg_op_layout(
-            op, output, output_dep, args[0].dep, args[0].layout, stl
+            op, output, output_dep, args[0].dep, args[0].layout, stl, ind_sizes
         )
         layouts.extend(result)
     if not layouts:
