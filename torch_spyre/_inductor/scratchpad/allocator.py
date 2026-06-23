@@ -358,11 +358,13 @@ def _recompute_core_to_slice(
     per_sym = apply_splits_from_index_coeff(
         coeff_splits, write_index, read_index, it_space
     )
-    num_cores = math.prod(per_sym.values())
+    # Ensure per_sym has entries for all dims (defaults to 1 for unsplit dims).
+    full_per_sym = {sym: per_sym.get(sym, 1) for sym in it_space}
+    num_cores = math.prod(full_per_sym.values())
     is_matmul = _is_matmul_op(op)
-    if _should_use_k_fast_mapping(is_matmul, it_space, per_sym):
-        return _k_fast_core_to_slice_mapping(it_space, per_sym, num_cores)
-    return _get_core_to_slice_mapping(it_space, per_sym, num_cores)
+    if _should_use_k_fast_mapping(is_matmul, it_space, full_per_sym):
+        return _k_fast_core_to_slice_mapping(it_space, full_per_sym, num_cores)
+    return _get_core_to_slice_mapping(it_space, full_per_sym, num_cores)
 
 
 def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:

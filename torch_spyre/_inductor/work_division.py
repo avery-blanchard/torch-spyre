@@ -631,16 +631,20 @@ def apply_splits(
     case where the product of splits is 1).  ``op.op_it_space_splits`` is only
     set when more than one core is used.
     """
+    # Ensure splits has entries for all dims (defaults to 1 for unsplit dims).
+    # This matches the structure guaranteed by multi_dim_iteration_space_split.
     it_space = iteration_space_from_op(op)
+    full_splits = {sym: splits.get(sym, 1) for sym in it_space}
+
     is_matmul = _is_matmul_op(op)
-    num_cores = math.prod(splits.values())
-    if _should_use_k_fast_mapping(is_matmul, it_space, splits):
+    num_cores = math.prod(full_splits.values())
+    if _should_use_k_fast_mapping(is_matmul, it_space, full_splits):
         op.op_core_to_slice_mapping = _k_fast_core_to_slice_mapping(
-            it_space, splits, num_cores
+            it_space, full_splits, num_cores
         )
     else:
         op.op_core_to_slice_mapping = _get_core_to_slice_mapping(
-            it_space, splits, num_cores
+            it_space, full_splits, num_cores
         )
 
     if num_cores <= 1:
