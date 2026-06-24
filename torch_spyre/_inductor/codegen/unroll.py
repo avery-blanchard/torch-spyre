@@ -36,6 +36,7 @@ innermost-first, yielding K×M flat copies with correct combined addresses.
 from __future__ import annotations
 
 import copy
+import math
 
 import sympy
 from sympy import Symbol
@@ -45,6 +46,16 @@ from torch_spyre._inductor.codegen.compute_ops import num_bytes
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("codegen.unroll")
+
+
+def compute_device_stride(dev_dim_idx: int, device_size: list[int]) -> int:
+    """Compute element stride for device dimension at backward index dev_dim_idx.
+
+    Uses backward indexing matching superdsc.py:
+    stride = product(device_size[-dev_dim_idx - 2:])
+    This is shared between loop unrolling and SDSC generation.
+    """
+    return math.prod(device_size[-dev_dim_idx - 2 :])
 
 
 def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> int:
@@ -63,22 +74,19 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
         all_syms |= expr.free_symbols
     sub_zero = {s: 0 for s in all_syms}
     sub_range = {**sub_zero, tiled_sym: tile_range}
-
-    # Compute strides from device_size: stride[d] = product(device_size[d+1:])
-    strides: list[int] = []
-    stride = 1
-    for i in range(len(arg.device_size) - 1, -1, -1):
-        strides.insert(0, stride)
-        stride *= arg.device_size[i]
-
     total_elem_stride = 0
+    # Use backward indexing to match device_coordinates ordering
+    num_coords = len(arg.device_coordinates)
     for d, coord_expr in enumerate(arg.device_coordinates):
         at_range = int(coord_expr.subs(sub_range))
         at_zero = int(coord_expr.subs(sub_zero))
         delta = at_range - at_zero
         if delta == 0:
             continue
-        total_elem_stride += delta * strides[d]
+        # Map forward index d to backward index for consistency with superdsc
+        dev_dim_idx = num_coords - d - 1
+        stride = compute_device_stride(dev_dim_idx, arg.device_size)
+        total_elem_stride += delta * stride
     return total_elem_stride * num_bytes(arg.device_dtype)
 
 
