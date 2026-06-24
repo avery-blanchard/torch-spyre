@@ -260,6 +260,12 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         assert isinstance(layout, FixedTiledLayout)
         layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
 
+        # Pool-allocated buffers have no Python-level variable in the generated
+        # wrapper (should_allocate() returns False for them).  Mark them removed
+        # so the scheduler does not emit `del bufN` for a name that was never
+        # assigned.
+        V.graph.removed_buffers.add(name)
+
         pending_frees.append((end, offset, size))
 
         logger.debug(
