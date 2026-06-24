@@ -479,7 +479,11 @@ def align_tensors(
     tensors: list[Dict[str, list[sympy.Expr]]],
     stride_maps: list[list[int]] | None = None,
 ) -> tuple[
-    (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]], list[list[int]] | None)
+    (
+        dict[sympy.Symbol, tuple[sympy.Expr, int]],
+        list[dict[str, list[sympy.Expr]]],
+        list[list[int]] | None,
+    )
 ]:
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
@@ -597,6 +601,8 @@ def align_tensors(
     for j, terms in enumerate(all_terms):
         size = []
         coordinates = []
+        old_stride_map = stride_maps[j] if stride_maps else None
+        old_coords = [t["coordinates"] for t in tensors][j]
         for num, den, var, mod, dim_size, offset in [
             astuple(term) for term in terms[:-1]
         ]:
@@ -643,11 +649,26 @@ def align_tensors(
         coordinates.append(
             (var % dim_size if var is not None else sympy.S.Zero) + offset
         )
-        # Compute stride_map from the new size: stride[d] = product(size[d+1:])
-        # Always compute it for consistency
-        import math
-        new_stride_map = [math.prod(size[i + 1:]) if i + 1 < len(size) else 1
-                         for i in range(len(size))]
+        # Remap stride_map based on which old coordinate appears at each new position
+        # stride_map maps host strides; when we reorder device_coordinates, we reorder how
+        # we index the same host memory, so we need to permute the stride values accordingly.
+        if old_stride_map is not None:
+            new_stride_map = []
+            for new_pos, new_coord in enumerate(coordinates):
+                stride_val = 1  # default fallback
+                # Find which old position had this coordinate
+                for old_pos, old_coord in enumerate(old_coords):
+                    if old_pos < len(old_stride_map):
+                        # Try equality check; if it fails, assume they're different
+                        try:
+                            if old_coord == new_coord:
+                                stride_val = old_stride_map[old_pos]
+                                break
+                        except (TypeError, ValueError):
+                            pass
+                new_stride_map.append(stride_val)
+        else:
+            new_stride_map = None
         new_stride_maps.append(new_stride_map)
 
         new_tensors.append({"size": size, "coordinates": coordinates})
