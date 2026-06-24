@@ -52,20 +52,25 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
 
     Computes the byte advance using:
         delta[d] = coord_d(sym=tile_range, others=0) - coord_d(sym=0, others=0)
-        byte_stride = dot(delta, stride_map) * bytes_per_elem
+        byte_stride = dot(delta, strides_from_device_size) * bytes_per_elem
 
+    Strides are derived from device_size: stride[d] = product of all dims after d.
     This correctly handles non-linear device coordinates such as the stick
     layout's ``floor(c/64)`` and ``Mod(c, 64)`` expressions.
     """
-    assert arg.stride_map is not None, (
-        "_byte_stride_for_arg: TensorArg has no stride_map — "
-        "all TensorArgs reaching the unroller must be constructed with stride_map"
-    )
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
     sub_zero = {s: 0 for s in all_syms}
     sub_range = {**sub_zero, tiled_sym: tile_range}
+
+    # Compute strides from device_size: stride[d] = product(device_size[d+1:])
+    strides: list[int] = []
+    stride = 1
+    for i in range(len(arg.device_size) - 1, -1, -1):
+        strides.insert(0, stride)
+        stride *= arg.device_size[i]
+
     total_elem_stride = 0
     for d, coord_expr in enumerate(arg.device_coordinates):
         at_range = int(coord_expr.subs(sub_range))
@@ -73,7 +78,7 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
         delta = at_range - at_zero
         if delta == 0:
             continue
-        total_elem_stride += delta * arg.stride_map[d]
+        total_elem_stride += delta * strides[d]
     return total_elem_stride * num_bytes(arg.device_dtype)
 
 
@@ -96,10 +101,6 @@ def _tile_device_size(
     column symbol appears in both the sticks-per-row coordinate and the
     within-stick coordinate, so it is excluded from this update.
     """
-    assert arg.stride_map is not None, (
-        "_tile_device_size: TensorArg has no stride_map — "
-        "all TensorArgs reaching the unroller must be constructed with stride_map"
-    )
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols

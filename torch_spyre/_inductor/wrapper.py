@@ -134,6 +134,14 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
 
+    def make_buffer_free(self, buffer):
+        layout = buffer.get_layout()
+        # Pool-allocated buffers are never assigned as Python variables — they
+        # live inside _pool.  Emitting `del bufN` would raise UnboundLocalError.
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return ""
+        return super().make_buffer_free(buffer)
+
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
