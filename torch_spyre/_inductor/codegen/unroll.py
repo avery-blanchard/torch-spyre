@@ -69,24 +69,23 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
     This correctly handles non-linear device coordinates such as the stick
     layout's ``floor(c/64)`` and ``Mod(c, 64)`` expressions.
     """
+    assert arg.stride_map is not None, (
+        "_byte_stride_for_arg: TensorArg has no stride_map — "
+        "all TensorArgs reaching the unroller must be constructed with stride_map"
+    )
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
     sub_zero = {s: 0 for s in all_syms}
     sub_range = {**sub_zero, tiled_sym: tile_range}
     total_elem_stride = 0
-    # Use backward indexing to match device_coordinates ordering
-    num_coords = len(arg.device_coordinates)
     for d, coord_expr in enumerate(arg.device_coordinates):
         at_range = int(coord_expr.subs(sub_range))
         at_zero = int(coord_expr.subs(sub_zero))
         delta = at_range - at_zero
         if delta == 0:
             continue
-        # Map forward index d to backward index for consistency with superdsc
-        dev_dim_idx = num_coords - d - 1
-        stride = compute_device_stride(dev_dim_idx, arg.device_size)
-        total_elem_stride += delta * stride
+        total_elem_stride += delta * arg.stride_map[d]
     return total_elem_stride * num_bytes(arg.device_dtype)
 
 

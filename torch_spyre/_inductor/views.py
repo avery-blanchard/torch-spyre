@@ -477,11 +477,14 @@ def normalize_coordinates(
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
+    stride_maps: list[list[int]] | None = None,
 ) -> tuple[
-    (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
+    (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]], list[list[int]] | None)
 ]:
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
+
+    If stride_maps is provided, returns updated stride_maps aligned with reordered coordinates.
     """
 
     # Concretize range values for the algorithm: align_tensors performs
@@ -590,6 +593,7 @@ def align_tensors(
 
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
+    new_stride_maps = []
     for j, terms in enumerate(all_terms):
         size = []
         coordinates = []
@@ -639,6 +643,13 @@ def align_tensors(
         coordinates.append(
             (var % dim_size if var is not None else sympy.S.Zero) + offset
         )
+        # Compute stride_map from the new size: stride[d] = product(size[d+1:])
+        # Always compute it for consistency
+        import math
+        new_stride_map = [math.prod(size[i + 1:]) if i + 1 < len(size) else 1
+                         for i in range(len(size))]
+        new_stride_maps.append(new_stride_map)
+
         new_tensors.append({"size": size, "coordinates": coordinates})
 
     # decide desired rank for all tensors
@@ -688,4 +699,4 @@ def align_tensors(
         k: (v, new_op_it_space_splits[k]) for k, v in new_var_ranges.items()
     }
 
-    return new_iteration_space, new_tensors
+    return new_iteration_space, new_tensors, new_stride_maps

@@ -506,7 +506,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
-            stride_map=None,
+            stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             name=opspec_name,
         )
@@ -971,15 +971,17 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
 def simplify_op_spec(op_spec):
     it_space = op_spec.iteration_space
 
-    new_op_space_splits, new_tensors = align_tensors(
+    new_op_space_splits, new_tensors, new_stride_maps = align_tensors(
         it_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
             for arg in op_spec.args
         ],
+        [arg.stride_map for arg in op_spec.args],
     )
     op_spec.iteration_space = new_op_space_splits
 
-    for arg, t in zip(op_spec.args, new_tensors):
+    for arg, t, new_stride_map in zip(op_spec.args, new_tensors, new_stride_maps):
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
+        arg.stride_map = new_stride_map
