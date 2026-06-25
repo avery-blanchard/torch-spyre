@@ -19,7 +19,9 @@ from torch._inductor.codegen.wrapper import (
     BufferLike,
     PythonWrapperCodegen,
     SubgraphPythonWrapperCodegen,
+    FreeIfNotReusedLine,
 )
+from torch._inductor.utils import IndentedBuffer
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
@@ -29,12 +31,27 @@ from .ir import FixedTiledLayout
 from .constants import SEGMENT_SIZE
 
 
+def _patch_free_line_for_pool_buffers():
+    """Patch FreeIfNotReusedLine.codegen to skip pool-allocated buffers."""
+    _original_codegen = FreeIfNotReusedLine.codegen
+
+    def _patched_codegen(self, code: IndentedBuffer) -> None:
+        buf = self.node
+        layout = buf.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return
+        _original_codegen(self, code)
+
+    FreeIfNotReusedLine.codegen = _patched_codegen
+
+
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
     def __init__(self):
         super().__init__()
         V.graph.sizevars._simplify_loops_impl = noop_simplify_loops_impl.__get__(
             V.graph.sizevars, SizeVarAllocator
         )
+        _patch_free_line_for_pool_buffers()
 
     @staticmethod
     def create(
@@ -80,8 +97,6 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         pool_size = getattr(V.graph, "pool_size", 0)
         if pool_size > 0:
             wrapper_str = str(wrapper_value_with_linemap.value)
-
-            # Inject pool allocation before kernel calls and cleanup before return.
             lines = wrapper_str.split("\n")
 
             # Add `del _pool` before `return (` statement.
@@ -133,14 +148,6 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.writeline(
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
-
-    def _is_pool_buffer(self, buffer: BufferLike) -> bool:
-        layout = buffer.get_layout()
-        return isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation
-
-    def codegen_free_buffer(self, buffer: BufferLike) -> None:
-        if not self._is_pool_buffer(buffer):
-            super().codegen_free_buffer(buffer)
 
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
