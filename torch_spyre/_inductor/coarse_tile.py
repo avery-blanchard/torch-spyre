@@ -72,6 +72,7 @@ from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
 from .propagate_hints import get_op_hints
 from .pass_utils import op_out_coords
+from torch_spyre._C import SpyreTensorLayout
 
 logger = get_inductor_logger("coarse_tile")
 hints_logger = get_inductor_logger("assign_dim_hints")
@@ -1217,6 +1218,30 @@ def _stamp_group(
         )
 
 
+def _scale_device_layout(
+    orig_stl: "SpyreTensorLayout",
+    orig_host_strides: list[int],
+    tiled_host_dims: list[int],
+    divisors: list[int],
+) -> "SpyreTensorLayout":
+    """Return a per-tile SpyreTensorLayout by dividing device dims for tiled host dims.
+
+    For each tiled host dim, finds the device dim d where stride_map[d] equals
+    the original host stride for that dim, and divides device_size[d] by the
+    divisor.  stride_map is unchanged, preserving restickified layouts.
+    """
+    from torch_spyre._C import SpyreTensorLayout
+
+    new_device_size = list(orig_stl.device_size)
+    sm = list(orig_stl.stride_map)
+    for host_dim, divisor in zip(tiled_host_dims, divisors):
+        host_stride = orig_host_strides[host_dim]
+        dev_dim = next((d for d, s in enumerate(sm) if int(s) == host_stride), None)
+        if dev_dim is not None:
+            new_device_size[dev_dim] //= divisor
+    return SpyreTensorLayout(new_device_size, sm, orig_stl.device_dtype)
+
+
 def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
@@ -1234,8 +1259,9 @@ def _divide_ranges(
     Also updates ``op.layout.size``, ``op.layout.stride``, and
     ``op.layout.device_layout`` so the layout describes the smaller per-tile
     buffer, not the full tensor.  Contiguous host strides are recomputed from
-    the new size; the ``SpyreTensorLayout`` is rebuilt from the new host size
-    and strides, preserving the within-stick dimension from the original layout.
+    the new size; the ``SpyreTensorLayout`` is scaled by dividing the device
+    dimension whose stride_map entry matches each tiled host dimension, leaving
+    stride_map unchanged so restickified layouts are preserved.
     """
     data = op.data
     if not isinstance(data, (Pointwise, Reduction)):
@@ -1288,8 +1314,10 @@ def _divide_ranges(
         return
 
     new_size = list(layout.size)
+    orig_size_ints = [int(s) for s in layout.size]
     for i in tiled_dims:
         new_size[i] = ranges[i]
+    divisors = [int(orig_size_ints[i]) // int(ranges[i]) for i in tiled_dims]
     layout.size = new_size
 
     # Recompute contiguous strides for the smaller buffer.
@@ -1299,29 +1327,17 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
-    # Rebuild SpyreTensorLayout for the new host size, preserving the
-    # within-stick dimension.  stride_map[-1] is the element stride of the
-    # within-stick host dimension in the original layout; match it against the
-    # new contiguous strides to identify which host dim remains the stick dim.
+    # Scale the SpyreTensorLayout for the smaller per-tile buffer.  Match each
+    # tiled host dim to the device dim whose stride_map entry equals the original
+    # host stride, then divide that device_size entry.  stride_map is unchanged so
+    # restickified (non-contiguous) layouts are preserved exactly.
     if not isinstance(layout, FixedTiledLayout):
         return
-    orig_stl = layout.device_layout
-    sm_last = int(list(orig_stl.stride_map)[-1])
-    new_strides_ints = [int(s) for s in layout.stride]
-    new_size_ints = [int(s) for s in new_size]
-    within_stick_dim = next(
-        (i for i, s in enumerate(new_strides_ints) if s == sm_last), None
-    )
-    if within_stick_dim is None:
-        # Fall back to last dim (covers the common contiguous fp16 case where
-        # sm_last == 1 and the last stride is also 1).
-        within_stick_dim = len(new_size_ints) - 1
-    ndim = len(new_size_ints)
-    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [within_stick_dim]
-    from torch_spyre._C import SpyreTensorLayout
-
-    layout.device_layout = SpyreTensorLayout(
-        new_size_ints, new_strides_ints, layout.dtype, dim_order
+    orig_host_strides = [
+        int(s) for s in FlexibleLayout.contiguous_strides(orig_size_ints)
+    ]
+    layout.device_layout = _scale_device_layout(
+        layout.device_layout, orig_host_strides, tiled_dims, divisors
     )
 
 
