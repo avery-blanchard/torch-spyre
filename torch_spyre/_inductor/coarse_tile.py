@@ -978,7 +978,6 @@ def _propagate_tiled_reduction_op(
         FixedTiledLayout,
         SpyreConstantFallback,
     )  # deferred: avoids circular import
-    from torch_spyre._C import SpyreTensorLayout  # deferred: avoids circular import
 
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
@@ -1283,6 +1282,8 @@ def _divide_ranges(
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     from torch._inductor.ir import FixedLayout, FlexibleLayout
 
+    from torch_spyre._C import SpyreTensorLayout
+
     from .ir import FixedTiledLayout
 
     layout = getattr(op, "layout", None)
@@ -1315,22 +1316,38 @@ def _divide_ranges(
     orig_stl = layout.device_layout
     sm_last = int(list(orig_stl.stride_map)[-1])
     orig_stride_ints = [int(s) for s in orig_stride]
-    new_strides_ints = [int(s) for s in layout.stride]
+    new_stride_ints = [int(s) for s in layout.stride]
     new_size_ints = [int(s) for s in new_size]
-    within_stick_dim = next(
-        (i for i, s in enumerate(orig_stride_ints) if s == sm_last), None
-    )
-    if within_stick_dim is None:
-        # Fall back to last dim (covers the common contiguous fp16 case where
-        # sm_last == 1 and the last stride is also 1).
-        within_stick_dim = len(new_size_ints) - 1
-    ndim = len(new_size_ints)
-    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [within_stick_dim]
-    from torch_spyre._C import SpyreTensorLayout
+    stride_map_ints = [int(s) for s in orig_stl.stride_map]
 
-    layout.device_layout = SpyreTensorLayout(
-        new_size_ints, new_strides_ints, layout.dtype, dim_order
-    )
+    # Check if restickified: stride_map[-1] != 1 means stick is not on last host dim
+    is_restickified = sm_last != 1
+
+    if is_restickified:
+        # Preserve stride_map exactly and scale device_size only for tiled dims.
+        # For restickified buffers, the within-stick size (device_size[-1]) gets
+        # divided proportionally for each tiled host dimension.
+        new_device_size = list(orig_stl.device_size)
+        for host_dim in tiled_dims:
+            divisor = int(orig_size[host_dim]) // int(new_size[host_dim])
+            new_device_size[-1] //= divisor
+        layout.device_layout = SpyreTensorLayout(
+            new_device_size, stride_map_ints, layout.dtype
+        )
+    else:
+        # Standard layout (stick on last host dim): use 4-arg constructor
+        within_stick_dim = next(
+            (i for i, s in enumerate(orig_stride_ints) if s == sm_last), None
+        )
+        if within_stick_dim is None:
+            within_stick_dim = len(new_size_ints) - 1
+        ndim = len(new_size_ints)
+        dim_order = [i for i in range(ndim) if i != within_stick_dim] + [
+            within_stick_dim
+        ]
+        layout.device_layout = SpyreTensorLayout(
+            new_size_ints, new_stride_ints, layout.dtype, dim_order
+        )
 
 
 def _loop_var_to_reduction_ranges_pos(
