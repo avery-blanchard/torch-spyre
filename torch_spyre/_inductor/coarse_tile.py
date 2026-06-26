@@ -1197,7 +1197,9 @@ def _stamp_group(
                 opos = hint_id_to_ranges_pos.get(hint_id)
                 op_tiled_dims.append([opos] if opos is not None else [])
                 op_tiled_reduction_dims.append([])
-                _divide_ranges(op, count, [opos] if opos is not None else [])
+                # Only call _divide_ranges if the op actually tiles this dimension
+                if opos is not None:
+                    _divide_ranges(op, count, [opos])
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
@@ -1215,6 +1217,44 @@ def _stamp_group(
             op_tiled_dims,
             op_tiled_reduction_dims,
         )
+
+
+def _scale_device_layout(
+    orig_stl: "SpyreTensorLayout",
+    orig_host_strides: list[int],
+    tiled_host_dims: list[int],
+    divisors: list[int],
+) -> "SpyreTensorLayout":
+    """Return a per-tile SpyreTensorLayout by dividing device dims for tiled host dims.
+
+    For contiguous layouts (stride_map[-1] == 1): finds device dim d where
+    stride_map[d] equals the original host stride, then divides device_size[d].
+
+    For restickified layouts (stride_map[-1] != 1): the last entry indicates
+    the within-stick stride. Scale by position instead of stride matching.
+
+    stride_map is unchanged, preserving layout structure.
+    """
+    new_device_size = list(orig_stl.device_size)
+    sm = list(orig_stl.stride_map)
+    is_restickified = int(sm[-1]) != 1
+
+    if is_restickified:
+        # For restickified buffers, divide device_size entries by position,
+        # matching the tiled host dimension indices directly.
+        for tiled_dim, divisor in zip(tiled_host_dims, divisors):
+            if tiled_dim < len(new_device_size):
+                new_device_size[tiled_dim] //= divisor
+    else:
+        # For contiguous layouts, match by stride: find device dim where
+        # stride_map[d] equals the original host stride for this host dim.
+        for host_dim, divisor in zip(tiled_host_dims, divisors):
+            host_stride = orig_host_strides[host_dim]
+            dev_dim = next((d for d, s in enumerate(sm) if int(s) == host_stride), None)
+            if dev_dim is not None:
+                new_device_size[dev_dim] //= divisor
+
+    return SpyreTensorLayout(new_device_size, sm, orig_stl.device_dtype)
 
 
 def _divide_ranges(
@@ -1282,8 +1322,6 @@ def _divide_ranges(
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     from torch._inductor.ir import FixedLayout, FlexibleLayout
 
-    from torch_spyre._C import SpyreTensorLayout
-
     from .ir import FixedTiledLayout
 
     layout = getattr(op, "layout", None)
@@ -1292,11 +1330,12 @@ def _divide_ranges(
 
     # Preserve original size and strides before mutation for STL rebuild.
     orig_size = list(layout.size)
-    orig_stride = list(layout.stride)
+    orig_size_ints = [int(s) for s in layout.size]
 
     new_size = list(layout.size)
     for i in tiled_dims:
         new_size[i] = ranges[i]
+    divisors = [int(orig_size_ints[i]) // int(ranges[i]) for i in tiled_dims]
     layout.size = new_size
 
     # Recompute contiguous strides for the smaller buffer.
@@ -1306,48 +1345,18 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
-    # Rebuild SpyreTensorLayout for the new host size, preserving the
-    # within-stick dimension.  stride_map[-1] is the element stride of the
-    # within-stick host dimension in the original layout; match it against the
-    # original (pre-division) contiguous strides to identify which host dim
-    # remains the stick dim.
+    # Scale the SpyreTensorLayout for the smaller per-tile buffer. Match each
+    # tiled host dim to the device dim whose stride_map entry equals the original
+    # host stride, then divide that device_size entry. stride_map is unchanged so
+    # restickified (non-contiguous) layouts are preserved exactly.
     if not isinstance(layout, FixedTiledLayout):
         return
-    orig_stl = layout.device_layout
-    sm_last = int(list(orig_stl.stride_map)[-1])
-    orig_stride_ints = [int(s) for s in orig_stride]
-    new_stride_ints = [int(s) for s in layout.stride]
-    new_size_ints = [int(s) for s in new_size]
-    stride_map_ints = [int(s) for s in orig_stl.stride_map]
-
-    # Check if restickified: stride_map[-1] != 1 means stick is not on last host dim
-    is_restickified = sm_last != 1
-
-    if is_restickified:
-        # Preserve stride_map exactly and scale device_size only for tiled dims.
-        # For restickified buffers, the within-stick size (device_size[-1]) gets
-        # divided proportionally for each tiled host dimension.
-        new_device_size = list(orig_stl.device_size)
-        for host_dim in tiled_dims:
-            divisor = int(orig_size[host_dim]) // int(new_size[host_dim])
-            new_device_size[-1] //= divisor
-        layout.device_layout = SpyreTensorLayout(
-            new_device_size, stride_map_ints, layout.dtype
-        )
-    else:
-        # Standard layout (stick on last host dim): use 4-arg constructor
-        within_stick_dim = next(
-            (i for i, s in enumerate(orig_stride_ints) if s == sm_last), None
-        )
-        if within_stick_dim is None:
-            within_stick_dim = len(new_size_ints) - 1
-        ndim = len(new_size_ints)
-        dim_order = [i for i in range(ndim) if i != within_stick_dim] + [
-            within_stick_dim
-        ]
-        layout.device_layout = SpyreTensorLayout(
-            new_size_ints, new_stride_ints, layout.dtype, dim_order
-        )
+    orig_host_strides = [
+        int(s) for s in FlexibleLayout.contiguous_strides(orig_size_ints)
+    ]
+    layout.device_layout = _scale_device_layout(
+        layout.device_layout, orig_host_strides, tiled_dims, divisors
+    )
 
 
 def _loop_var_to_reduction_ranges_pos(
