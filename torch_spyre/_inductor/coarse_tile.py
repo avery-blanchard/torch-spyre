@@ -1179,10 +1179,16 @@ def _stamp_group(
         op_tiled_dims: list[list[int]] = []
         op_tiled_reduction_dims: list[list[int]] = []
         for hint_id, count, is_reduction_level in levels:
-            if is_reduction_level:
-                rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+            # For each op, determine if the hint_id's dimension is in output_ranges
+            # or reduction_ranges, regardless of the group-level is_reduction_level flag.
+            # This ensures each op makes its own decision based on its actual dimensions.
+            rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+            opos = hint_id_to_ranges_pos.get(hint_id)
+
+            if rpos is not None:
+                # Dimension is a reduction dimension for this op.
                 op_tiled_dims.append([])
-                op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+                op_tiled_reduction_dims.append([rpos])
                 if isinstance(op.data, Reduction):
                     # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                     # before _validate_reduction_tiling runs in the later
@@ -1190,16 +1196,16 @@ def _stamp_group(
                     # stick-dim tiling, Stage 2), the mutated ranges are never
                     # observed: the RuntimeError propagates uncaught through the
                     # pass runner and aborts compilation.
-                    _divide_reduction_ranges(
-                        op, count, [rpos] if rpos is not None else []
-                    )
-            else:
-                opos = hint_id_to_ranges_pos.get(hint_id)
-                op_tiled_dims.append([opos] if opos is not None else [])
+                    _divide_reduction_ranges(op, count, [rpos])
+            elif opos is not None:
+                # Dimension is an output dimension for this op.
+                op_tiled_dims.append([opos])
                 op_tiled_reduction_dims.append([])
-                # Only call _divide_ranges if the op actually tiles this dimension
-                if opos is not None:
-                    _divide_ranges(op, count, [opos])
+                _divide_ranges(op, count, [opos])
+            else:
+                # Dimension is loop-invariant for this op.
+                op_tiled_dims.append([])
+                op_tiled_reduction_dims.append([])
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
@@ -1225,39 +1231,45 @@ def _scale_device_layout(
     tiled_host_dims: list[int],
     divisors: list[int],
 ) -> "SpyreTensorLayout":
-    """Return a per-tile SpyreTensorLayout by dividing the device dim for each tiled host dim.
+    """Return a per-tile SpyreTensorLayout by dividing device dims for tiled host dims.
 
-    Uses stride-matching: for each tiled host dim, locate the corresponding device
-    dim by matching its original host stride against stride_map entries.
-
-    When the tiled host dim IS the current stick dim (host_stride == stride_map[-1]),
-    the contiguous data is spread across two device dims: within-stick (stride_map[-1],
-    size=elems_per_stick) and outer-sticks (stride = stride_map[-1] * elems_per_stick).
-    Tiling shrinks the outer-sticks dim, so we match the outer-stick stride instead.
-    This handles both contiguous layouts (stride_map[-1]==1) and restickified layouts
-    (stride_map[-1]!=1) uniformly.
-
-    stride_map is unchanged, preserving layout structure.
+    For each tiled host dim, finds the device dim d where stride_map[d] equals
+    the original host stride for that dim, and divides device_size[d] by the
+    divisor.  stride_map is unchanged, preserving restickified layouts.
     """
     new_device_size = list(orig_stl.device_size)
     sm = list(orig_stl.stride_map)
-    stick_within_stride = int(sm[-1])
-    elems_per_stick = orig_stl.elems_per_stick()
+
+    logger.debug(
+        "_scale_device_layout: input device_size=%s, stride_map=%s, "
+        "orig_host_strides=%s, tiled_host_dims=%s, divisors=%s",
+        new_device_size, sm, orig_host_strides, tiled_host_dims, divisors
+    )
 
     for host_dim, divisor in zip(tiled_host_dims, divisors):
         host_stride = orig_host_strides[host_dim]
-        # When the tiled dim is the stick dim (host stride matches the within-stick
-        # stride_map entry), scale the outer-sticks device dim instead.
-        if host_stride == stick_within_stride:
-            lookup_stride = stick_within_stride * elems_per_stick
-        else:
-            lookup_stride = host_stride
+        # Skip sentinel stride values like -1 (collapsed/broadcast dims)
         dev_dim = next(
-            (d for d, s in enumerate(sm) if int(s) == lookup_stride), None
+            (d for d, s in enumerate(sm) if int(s) > 0 and int(s) == host_stride),
+            None
         )
-        if dev_dim is not None:
-            new_device_size[dev_dim] //= divisor
 
+        logger.debug(
+            "_scale_device_layout: host_dim=%s, host_stride=%s, found dev_dim=%s",
+            host_dim, host_stride, dev_dim
+        )
+
+        if dev_dim is not None:
+            old_size = new_device_size[dev_dim]
+            new_device_size[dev_dim] //= divisor
+            logger.debug(
+                "_scale_device_layout: divided device_size[%s] from %s to %s (divisor=%s)",
+                dev_dim, old_size, new_device_size[dev_dim], divisor
+            )
+
+    logger.debug(
+        "_scale_device_layout: output device_size=%s", new_device_size
+    )
     return SpyreTensorLayout(new_device_size, sm, orig_stl.device_dtype)
 
 
@@ -1340,6 +1352,17 @@ def _divide_ranges(
     for i in tiled_dims:
         new_size[i] = ranges[i]
     divisors = [int(orig_size_ints[i]) // int(ranges[i]) for i in tiled_dims]
+
+    logger.debug(
+        "_divide_ranges: op=%s, loop_count=%s, tiled_dims=%s, "
+        "orig_size=%s, new_size=%s, divisors=%s, "
+        "device_layout before: device_size=%s, stride_map=%s",
+        op.get_name(), loop_count, tiled_dims,
+        orig_size_ints, [int(r) for r in new_size], divisors,
+        list(layout.device_layout.device_size) if isinstance(layout, FixedTiledLayout) else "N/A",
+        list(layout.device_layout.stride_map) if isinstance(layout, FixedTiledLayout) else "N/A"
+    )
+
     layout.size = new_size
 
     # Recompute contiguous strides for the smaller buffer.
@@ -1353,13 +1376,60 @@ def _divide_ranges(
     # tiled host dim to the device dim whose stride_map entry equals the original
     # host stride, then divide that device_size entry. stride_map is unchanged so
     # restickified (non-contiguous) layouts are preserved exactly.
+    #
+    # For Reduction ops, only scale device dims for output ranges (non-reduction dims).
+    # Reduction dims are handled separately by _divide_reduction_ranges and should not
+    # affect the device layout of the output buffer.
     if not isinstance(layout, FixedTiledLayout):
         return
+
+    if isinstance(data, Reduction):
+        # For reductions, only scale dims that are in ranges (output dims), not reduction_ranges.
+        # Get the output ranges to identify which host dims are outputs.
+        rw = op.get_read_writes()
+        out_dep = next(iter(rw.writes))
+        out_syms = out_dep.index.free_symbols
+        in_dep = next(d for d in rw.reads if hasattr(d, "index"))
+        reduction_syms = set(s for s in in_dep.ranges if s not in out_syms)
+
+        # Filter tiled_dims to only include output dims
+        output_tiled_dims = []
+        output_divisors = []
+        for tdim, div in zip(tiled_dims, divisors):
+            # Get the symbol for this dimension
+            if tdim < len(out_dep.ranges):
+                sym = list(out_dep.ranges.keys())[tdim] if hasattr(out_dep.ranges, 'keys') else None
+                # Only include if it's an output dim (not in reduction_syms)
+                if sym is None or sym not in reduction_syms:
+                    output_tiled_dims.append(tdim)
+                    output_divisors.append(div)
+        tiled_dims = output_tiled_dims
+        divisors = output_divisors
+
+        logger.debug(
+            "_divide_ranges: reduction op, filtered tiled_dims=%s (output dims only)", tiled_dims
+        )
+
+    if not tiled_dims:
+        # No output dims to scale
+        return
+
     orig_host_strides = [
         int(s) for s in FlexibleLayout.contiguous_strides(orig_size_ints)
     ]
+
+    logger.debug(
+        "_divide_ranges: calling _scale_device_layout with orig_host_strides=%s",
+        orig_host_strides
+    )
+
     layout.device_layout = _scale_device_layout(
         layout.device_layout, orig_host_strides, tiled_dims, divisors
+    )
+
+    logger.debug(
+        "_divide_ranges: device_layout after: device_size=%s, stride_map=%s",
+        list(layout.device_layout.device_size), list(layout.device_layout.stride_map)
     )
 
 
