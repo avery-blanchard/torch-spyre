@@ -1225,34 +1225,38 @@ def _scale_device_layout(
     tiled_host_dims: list[int],
     divisors: list[int],
 ) -> "SpyreTensorLayout":
-    """Return a per-tile SpyreTensorLayout by dividing device dims for tiled host dims.
+    """Return a per-tile SpyreTensorLayout by dividing the device dim for each tiled host dim.
 
-    For contiguous layouts (stride_map[-1] == 1): finds device dim d where
-    stride_map[d] equals the original host stride, then divides device_size[d].
+    Uses stride-matching: for each tiled host dim, locate the corresponding device
+    dim by matching its original host stride against stride_map entries.
 
-    For restickified layouts (stride_map[-1] != 1): the last entry indicates
-    the within-stick stride. Scale by position instead of stride matching.
+    When the tiled host dim IS the current stick dim (host_stride == stride_map[-1]),
+    the contiguous data is spread across two device dims: within-stick (stride_map[-1],
+    size=elems_per_stick) and outer-sticks (stride = stride_map[-1] * elems_per_stick).
+    Tiling shrinks the outer-sticks dim, so we match the outer-stick stride instead.
+    This handles both contiguous layouts (stride_map[-1]==1) and restickified layouts
+    (stride_map[-1]!=1) uniformly.
 
     stride_map is unchanged, preserving layout structure.
     """
     new_device_size = list(orig_stl.device_size)
     sm = list(orig_stl.stride_map)
-    is_restickified = int(sm[-1]) != 1
+    stick_within_stride = int(sm[-1])
+    elems_per_stick = orig_stl.elems_per_stick()
 
-    if is_restickified:
-        # For restickified buffers, divide device_size entries by position,
-        # matching the tiled host dimension indices directly.
-        for tiled_dim, divisor in zip(tiled_host_dims, divisors):
-            if tiled_dim < len(new_device_size):
-                new_device_size[tiled_dim] //= divisor
-    else:
-        # For contiguous layouts, match by stride: find device dim where
-        # stride_map[d] equals the original host stride for this host dim.
-        for host_dim, divisor in zip(tiled_host_dims, divisors):
-            host_stride = orig_host_strides[host_dim]
-            dev_dim = next((d for d, s in enumerate(sm) if int(s) == host_stride), None)
-            if dev_dim is not None:
-                new_device_size[dev_dim] //= divisor
+    for host_dim, divisor in zip(tiled_host_dims, divisors):
+        host_stride = orig_host_strides[host_dim]
+        # When the tiled dim is the stick dim (host stride matches the within-stick
+        # stride_map entry), scale the outer-sticks device dim instead.
+        if host_stride == stick_within_stride:
+            lookup_stride = stick_within_stride * elems_per_stick
+        else:
+            lookup_stride = host_stride
+        dev_dim = next(
+            (d for d, s in enumerate(sm) if int(s) == lookup_stride), None
+        )
+        if dev_dim is not None:
+            new_device_size[dev_dim] //= divisor
 
     return SpyreTensorLayout(new_device_size, sm, orig_stl.device_dtype)
 
