@@ -1286,7 +1286,8 @@ def _scale_device_layout(
         # Also skip device dims we've already divided to avoid double-dividing.
         dev_dim = next(
             (d for d, s in enumerate(new_stride_map)
-             if int(s) > 0 and int(s) == orig_host_stride and d not in divided_dev_dims),
+            if d != len(new_stride_map) - 1  # Skip within-stick dimension
+            and int(s) > 0 and int(s) == orig_host_stride and d not in divided_dev_dims),
             None
         )
 
