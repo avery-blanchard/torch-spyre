@@ -1157,21 +1157,23 @@ def _stamp_group(
 
         op_out = op_out_coords(op)
 
-        # Build lookup: hint_id → output-ranges position (non-reduction dims).
+        # Build lookup: hint_id → output-ranges position.
+        # Don't filter by h.is_reduction - try all hints to find output positions.
         hint_id_to_ranges_pos: dict[int, int] = {
             h.hint_id: pos
             for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None and not h.is_reduction
+            if h.loop_var is not None
             if (pos := _loop_var_to_ranges_pos(op_out, h.loop_var)) is not None
         }
 
-        # Build lookup: hint_id → reduction_ranges position (reduction dims).
+        # Build lookup: hint_id → reduction_ranges position for Reduction ops.
+        # Don't filter by h.is_reduction - try all hints to find reduction positions.
         hint_id_to_reduction_ranges_pos: dict[int, int] = {}
         if isinstance(op.data, Reduction):
             hint_id_to_reduction_ranges_pos = {
                 h.hint_id: pos
                 for h in getattr(op, "dim_hints", [])
-                if h.loop_var is not None and h.is_reduction
+                if h.loop_var is not None
                 if (pos := _loop_var_to_reduction_ranges_pos(op, h.loop_var))
                 is not None
             }
@@ -1179,11 +1181,15 @@ def _stamp_group(
         op_tiled_dims: list[list[int]] = []
         op_tiled_reduction_dims: list[list[int]] = []
         for hint_id, count, is_reduction_level in levels:
-            # For each op, determine if the hint_id's dimension is in output_ranges
-            # or reduction_ranges, regardless of the group-level is_reduction_level flag.
-            # This ensures each op makes its own decision based on its actual dimensions.
-            rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
             opos = hint_id_to_ranges_pos.get(hint_id)
+            rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+
+            # For Reduction ops, if symbol matching fails (rpos is None) but the
+            # dimension is not in output ranges (opos is None), and is_reduction_level
+            # suggests this should be a reduction dimension, assume it is.
+            if (isinstance(op.data, Reduction) and opos is None and rpos is None and
+                is_reduction_level and len(op.data.reduction_ranges) > 0):
+                rpos = 0  # Assume first reduction dimension
 
             if rpos is not None:
                 # Dimension is a reduction dimension for this op.
