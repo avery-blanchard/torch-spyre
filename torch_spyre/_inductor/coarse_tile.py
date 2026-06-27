@@ -1197,8 +1197,12 @@ def _stamp_group(
             # For Reduction ops, if symbol matching fails for both output and reduction
             # dimensions, assume it's a reduction dimension. This handles the case where
             # hints use symbols from a different op's namespace that don't match this op's symbols.
-            if (isinstance(op.data, Reduction) and opos is None and rpos is None and
-                len(op.data.reduction_ranges) > 0):
+            if (
+                isinstance(op.data, Reduction)
+                and opos is None
+                and rpos is None
+                and len(op.data.reduction_ranges) > 0
+            ):
                 rpos = 0  # Assume first reduction dimension
 
             if rpos is not None:
@@ -1267,8 +1271,14 @@ def _scale_device_layout(
     logger.debug(
         "_scale_device_layout: input device_size=%s, stride_map=%s, "
         "orig_size=%s, new_size=%s, orig_host_strides=%s, new_host_strides=%s, tiled_host_dims=%s, divisors=%s",
-        new_device_size, new_stride_map, orig_size_ints, [int(s) for s in new_size],
-        orig_host_strides, new_host_strides, tiled_host_dims, divisors
+        new_device_size,
+        new_stride_map,
+        orig_size_ints,
+        [int(s) for s in new_size],
+        orig_host_strides,
+        new_host_strides,
+        tiled_host_dims,
+        divisors,
     )
 
     # Track which device dims we've already divided to avoid double-dividing
@@ -1289,7 +1299,10 @@ def _scale_device_layout(
 
         logger.debug(
             "_scale_device_layout: host_dim=%s, orig_host_stride=%s, new_host_stride=%s, found dev_dim=%s",
-            host_dim, orig_host_stride, new_host_stride, dev_dim
+            host_dim,
+            orig_host_stride,
+            new_host_stride,
+            dev_dim,
         )
 
         if dev_dim is not None:
@@ -1301,14 +1314,20 @@ def _scale_device_layout(
             logger.info(
                 "_scale_device_layout: host_dim=%s (orig_stride=%s→new_stride=%s), dev_dim=%s "
                 "device_size %s→%s, stride_map %s→%s",
-                host_dim, orig_host_stride, new_host_stride,
-                dev_dim, old_size, new_device_size[dev_dim],
-                old_stride, new_stride_map[dev_dim]
+                host_dim,
+                orig_host_stride,
+                new_host_stride,
+                dev_dim,
+                old_size,
+                new_device_size[dev_dim],
+                old_stride,
+                new_stride_map[dev_dim],
             )
 
     logger.debug(
         "_scale_device_layout: output device_size=%s, stride_map=%s",
-        new_device_size, new_stride_map
+        new_device_size,
+        new_stride_map,
     )
     return SpyreTensorLayout(new_device_size, new_stride_map, orig_stl.device_dtype)
 
@@ -1397,10 +1416,18 @@ def _divide_ranges(
         "_divide_ranges: op=%s, loop_count=%s, tiled_dims=%s, "
         "orig_size=%s, new_size=%s, divisors=%s, "
         "device_layout before: device_size=%s, stride_map=%s",
-        op.get_name(), loop_count, tiled_dims,
-        orig_size_ints, [int(r) for r in new_size], divisors,
-        list(layout.device_layout.device_size) if isinstance(layout, FixedTiledLayout) else "N/A",
-        list(layout.device_layout.stride_map) if isinstance(layout, FixedTiledLayout) else "N/A"
+        op.get_name(),
+        loop_count,
+        tiled_dims,
+        orig_size_ints,
+        [int(r) for r in new_size],
+        divisors,
+        list(layout.device_layout.device_size)
+        if isinstance(layout, FixedTiledLayout)
+        else "N/A",
+        list(layout.device_layout.stride_map)
+        if isinstance(layout, FixedTiledLayout)
+        else "N/A",
     )
 
     layout.size = new_size
@@ -1438,7 +1465,11 @@ def _divide_ranges(
         for tdim, div in zip(tiled_dims, divisors):
             # Get the symbol for this dimension
             if tdim < len(out_dep.ranges):
-                sym = list(out_dep.ranges.keys())[tdim] if hasattr(out_dep.ranges, 'keys') else None
+                sym = (
+                    list(out_dep.ranges.keys())[tdim]
+                    if hasattr(out_dep.ranges, "keys")
+                    else None
+                )
                 # Only include if it's an output dim (not in reduction_syms)
                 if sym is None or sym not in reduction_syms:
                     output_tiled_dims.append(tdim)
@@ -1447,7 +1478,8 @@ def _divide_ranges(
         divisors = output_divisors
 
         logger.debug(
-            "_divide_ranges: reduction op, filtered tiled_dims=%s (output dims only)", tiled_dims
+            "_divide_ranges: reduction op, filtered tiled_dims=%s (output dims only)",
+            tiled_dims,
         )
 
     if not tiled_dims:
@@ -1461,26 +1493,36 @@ def _divide_ranges(
 
     logger.debug(
         "_divide_ranges: calling _scale_device_layout with orig_host_strides=%s, new_host_strides=%s",
-        orig_host_strides, new_host_strides
+        orig_host_strides,
+        new_host_strides,
     )
 
     logger.debug(
         "_divide_ranges: FixedTiledLayout before scaling: "
         "size=%s, stride=%s, device_layout.device_size=%s, device_layout.stride_map=%s",
-        list(layout.size), list(layout.stride),
-        list(layout.device_layout.device_size), list(layout.device_layout.stride_map)
+        list(layout.size),
+        list(layout.stride),
+        list(layout.device_layout.device_size),
+        list(layout.device_layout.stride_map),
     )
 
     layout.device_layout = _scale_device_layout(
-        layout.device_layout, orig_size_ints, orig_host_strides,
-        new_size, new_host_strides, tiled_dims, divisors
+        layout.device_layout,
+        orig_size_ints,
+        orig_host_strides,
+        new_size,
+        new_host_strides,
+        tiled_dims,
+        divisors,
     )
 
     logger.debug(
         "_divide_ranges: FixedTiledLayout after scaling: "
         "size=%s, stride=%s, device_layout.device_size=%s, device_layout.stride_map=%s",
-        list(layout.size), list(layout.stride),
-        list(layout.device_layout.device_size), list(layout.device_layout.stride_map)
+        list(layout.size),
+        list(layout.stride),
+        list(layout.device_layout.device_size),
+        list(layout.device_layout.stride_map),
     )
 
 
