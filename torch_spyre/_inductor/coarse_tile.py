@@ -153,13 +153,12 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
         if not isinstance(op, ComputedBuffer):
             continue
 
-        # Get hint IDs, filtering to only hints where loop_var is not None
-        # (exclude loop-invariant hints from grouping).
+        # Get all hint IDs regardless of loop_var status (include loop-invariant hints).
+        # All ops in a scope should be grouped together even if some hints are
+        # loop-invariant for certain ops.
         op_hints = getattr(op, "dim_hints", [])
-        active_hint_ids = frozenset(
-            h.hint_id for h in op_hints if h.loop_var is not None
-        )
-        key = active_hint_ids or None
+        all_hint_ids = frozenset(h.hint_id for h in op_hints)
+        key = all_hint_ids or None
 
         if key is not None and key == current_key:
             current_ops.append(op)
@@ -1220,12 +1219,9 @@ def _stamp_group(
                 op_tiled_reduction_dims.append([])
                 _divide_ranges(op, count, [opos])
             else:
-                # Dimension is loop-invariant for this op: no range division, but
-                # still call _divide_ranges with empty tiled_dims so layouts stay
-                # in sync across all ops in the group for work_division planning.
+                # Dimension is loop-invariant for this op: no range division.
                 op_tiled_dims.append([])
                 op_tiled_reduction_dims.append([])
-                _divide_ranges(op, count, [])
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
