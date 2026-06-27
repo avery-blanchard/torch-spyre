@@ -99,19 +99,20 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
 def _hints_levels(ops: list[Operation]) -> list[tuple]:
     """Build (hint_id, K, is_reduction) level triples from the first hinted op.
 
-    All ops in the group share the same hint IDs and split counts.  Any op
-    with a non-None loop_var is representative.  Each op reads its own
-    loop_var from dim_hints in _stamp_group.
+    All ops in the group share the same hint IDs and split counts.  Each op
+    reads its own loop_var from dim_hints in _stamp_group.  A hint with
+    loop_var=None means the op is loop-invariant at that tiling level.
 
     Returns a list of (hint_id, count, is_reduction_level) triples, outermost
-    first.  Previously this skipped is_reduction hints; it now includes them so
-    that _stamp_group can divide reduction_ranges for reduction-dim tiling.
+    first.  Includes all hints regardless of loop_var (None indicates
+    loop-invariance for that op), so that all ops in a group have the same
+    tiling structure; _stamp_group will skip tiling dimensions that don't exist
+    on individual ops.
     """
     for op in ops:
         levels = [
             (h.hint_id, sympy.Integer(h.split_count), h.is_reduction)
             for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None
         ]
         if levels:
             return levels
@@ -126,6 +127,9 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     operations in topological order and collect consecutive ops that carry
     identical hints into one group, breaking whenever the hint changes or an
     op has no hint at all.
+
+    Ops with loop_var=None (loop-invariant at a hinted dimension) are excluded
+    from groups to avoid layout mismatch with tiled ops.
     """
 
     def _flush(groups, current_ops, current_key):
@@ -148,7 +152,14 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        key = frozenset(h.hint_id for h in getattr(op, "dim_hints", [])) or None
+
+        # Get hint IDs, filtering to only hints where loop_var is not None
+        # (exclude loop-invariant hints from grouping).
+        op_hints = getattr(op, "dim_hints", [])
+        active_hint_ids = frozenset(
+            h.hint_id for h in op_hints if h.loop_var is not None
+        )
+        key = active_hint_ids or None
 
         if key is not None and key == current_key:
             current_ops.append(op)
@@ -1184,11 +1195,11 @@ def _stamp_group(
             opos = hint_id_to_ranges_pos.get(hint_id)
             rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
 
-            # For Reduction ops, if symbol matching fails (rpos is None) but the
-            # dimension is not in output ranges (opos is None), and is_reduction_level
-            # suggests this should be a reduction dimension, assume it is.
+            # For Reduction ops, if symbol matching fails for both output and reduction
+            # dimensions, assume it's a reduction dimension. This handles the case where
+            # hints use symbols from a different op's namespace that don't match this op's symbols.
             if (isinstance(op.data, Reduction) and opos is None and rpos is None and
-                is_reduction_level and len(op.data.reduction_ranges) > 0):
+                len(op.data.reduction_ranges) > 0):
                 rpos = 0  # Assume first reduction dimension
 
             if rpos is not None:
@@ -1209,9 +1220,12 @@ def _stamp_group(
                 op_tiled_reduction_dims.append([])
                 _divide_ranges(op, count, [opos])
             else:
-                # Dimension is loop-invariant for this op.
+                # Dimension is loop-invariant for this op: no range division, but
+                # still call _divide_ranges with empty tiled_dims so layouts stay
+                # in sync across all ops in the group for work_division planning.
                 op_tiled_dims.append([])
                 op_tiled_reduction_dims.append([])
+                _divide_ranges(op, count, [])
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
@@ -1233,50 +1247,73 @@ def _stamp_group(
 
 def _scale_device_layout(
     orig_stl: "SpyreTensorLayout",
+    orig_size_ints: list[int],
     orig_host_strides: list[int],
+    new_size: list,
+    new_host_strides: list[int],
     tiled_host_dims: list[int],
     divisors: list[int],
 ) -> "SpyreTensorLayout":
     """Return a per-tile SpyreTensorLayout by dividing device dims for tiled host dims.
 
     For each tiled host dim, finds the device dim d where stride_map[d] equals
-    the original host stride for that dim, and divides device_size[d] by the
-    divisor.  stride_map is unchanged, preserving restickified layouts.
+    the original host stride for that dim, divides device_size[d] by the
+    divisor, and updates stride_map[d] to the new host stride for the tiled layout.
+
+    When multiple tiled_host_dims have the same stride value (e.g., in broadcasts
+    or restickified layouts), this function divides the corresponding device dims
+    in order, skipping device dims that have already been divided to avoid
+    double-dividing the same dimension.
     """
     new_device_size = list(orig_stl.device_size)
-    sm = list(orig_stl.stride_map)
+    new_stride_map = list(orig_stl.stride_map)
 
     logger.debug(
         "_scale_device_layout: input device_size=%s, stride_map=%s, "
-        "orig_host_strides=%s, tiled_host_dims=%s, divisors=%s",
-        new_device_size, sm, orig_host_strides, tiled_host_dims, divisors
+        "orig_size=%s, new_size=%s, orig_host_strides=%s, new_host_strides=%s, tiled_host_dims=%s, divisors=%s",
+        new_device_size, new_stride_map, orig_size_ints, [int(s) for s in new_size],
+        orig_host_strides, new_host_strides, tiled_host_dims, divisors
     )
 
+    # Track which device dims we've already divided to avoid double-dividing
+    # when stride_map has duplicate values.
+    divided_dev_dims: set[int] = set()
+
     for host_dim, divisor in zip(tiled_host_dims, divisors):
-        host_stride = orig_host_strides[host_dim]
+        orig_host_stride = orig_host_strides[host_dim]
+        new_host_stride = new_host_strides[host_dim]
         # Skip sentinel stride values like -1 (collapsed/broadcast dims)
+        # Also skip device dims we've already divided to avoid double-dividing.
         dev_dim = next(
-            (d for d, s in enumerate(sm) if int(s) > 0 and int(s) == host_stride),
+            (d for d, s in enumerate(new_stride_map)
+             if int(s) > 0 and int(s) == orig_host_stride and d not in divided_dev_dims),
             None
         )
 
         logger.debug(
-            "_scale_device_layout: host_dim=%s, host_stride=%s, found dev_dim=%s",
-            host_dim, host_stride, dev_dim
+            "_scale_device_layout: host_dim=%s, orig_host_stride=%s, new_host_stride=%s, found dev_dim=%s",
+            host_dim, orig_host_stride, new_host_stride, dev_dim
         )
 
         if dev_dim is not None:
             old_size = new_device_size[dev_dim]
+            old_stride = new_stride_map[dev_dim]
             new_device_size[dev_dim] //= divisor
-            logger.debug(
-                "_scale_device_layout: divided device_size[%s] from %s to %s (divisor=%s)",
-                dev_dim, old_size, new_device_size[dev_dim], divisor
+            new_stride_map[dev_dim] = new_host_stride
+            divided_dev_dims.add(dev_dim)
+            logger.info(
+                "_scale_device_layout: host_dim=%s (orig_stride=%s→new_stride=%s), dev_dim=%s "
+                "device_size %s→%s, stride_map %s→%s",
+                host_dim, orig_host_stride, new_host_stride,
+                dev_dim, old_size, new_device_size[dev_dim],
+                old_stride, new_stride_map[dev_dim]
             )
 
     logger.debug(
-        "_scale_device_layout: output device_size=%s", new_device_size
+        "_scale_device_layout: output device_size=%s, stride_map=%s",
+        new_device_size, new_stride_map
     )
-    return SpyreTensorLayout(new_device_size, sm, orig_stl.device_dtype)
+    return SpyreTensorLayout(new_device_size, new_stride_map, orig_stl.device_dtype)
 
 
 def _divide_ranges(
@@ -1423,18 +1460,29 @@ def _divide_ranges(
     orig_host_strides = [
         int(s) for s in FlexibleLayout.contiguous_strides(orig_size_ints)
     ]
+    new_host_strides = [int(s) for s in layout.stride]
 
     logger.debug(
-        "_divide_ranges: calling _scale_device_layout with orig_host_strides=%s",
-        orig_host_strides
+        "_divide_ranges: calling _scale_device_layout with orig_host_strides=%s, new_host_strides=%s",
+        orig_host_strides, new_host_strides
+    )
+
+    logger.debug(
+        "_divide_ranges: FixedTiledLayout before scaling: "
+        "size=%s, stride=%s, device_layout.device_size=%s, device_layout.stride_map=%s",
+        list(layout.size), list(layout.stride),
+        list(layout.device_layout.device_size), list(layout.device_layout.stride_map)
     )
 
     layout.device_layout = _scale_device_layout(
-        layout.device_layout, orig_host_strides, tiled_dims, divisors
+        layout.device_layout, orig_size_ints, orig_host_strides,
+        new_size, new_host_strides, tiled_dims, divisors
     )
 
     logger.debug(
-        "_divide_ranges: device_layout after: device_size=%s, stride_map=%s",
+        "_divide_ranges: FixedTiledLayout after scaling: "
+        "size=%s, stride=%s, device_layout.device_size=%s, device_layout.stride_map=%s",
+        list(layout.size), list(layout.stride),
         list(layout.device_layout.device_size), list(layout.device_layout.stride_map)
     )
 
