@@ -292,7 +292,15 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
 
     operations = graph.operations
     for op in operations:
-        key = _hint_key(op)
+        if not isinstance(op, ComputedBuffer):
+            continue
+
+        # Get all hint IDs regardless of loop_var status (include loop-invariant hints).
+        # All ops in a scope should be grouped together even if some hints are
+        # loop-invariant for certain ops.
+        op_hints = getattr(op, "dim_hints", [])
+        all_hint_ids = frozenset(h.hint_id for h in op_hints)
+        key = all_hint_ids or None
 
         if key is not None and key == current_key:
             current_ops.append(op)
