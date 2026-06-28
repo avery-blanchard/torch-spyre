@@ -431,7 +431,15 @@ def _make_intermediate_bufs(
             # Constants that feed _OPS_WITH_CONSTANT_ARGS ops (clamp, softplus,
             # layernormscale) must remain as Python scalars — do not materialize.
             if final_op_name in _OPS_WITH_CONSTANT_ARGS:
+                logger.debug(
+                    "skipping constant materialization (final op '%s' is in _OPS_WITH_CONSTANT_ARGS)",
+                    final_op_name,
+                )
                 continue
+            logger.debug(
+                "materializing constant for final op '%s' (not in _OPS_WITH_CONSTANT_ARGS)",
+                final_op_name,
+            )
             # All other constants: lower as SpyreConstantFallback via the registered
             # torch.ops.spyre.constant lowering so they can be loaded from a buffer.
             fill_value = float(kwargs["fill_value"])
@@ -446,8 +454,15 @@ def _make_intermediate_bufs(
             new_node.meta["val"] = torch.tensor(
                 fill_value, dtype=out_dtype, device="meta"
             )
-            new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-            object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+            # Lower the FX node; run_node registers in gl.operations.
+            tb = gl.run_node(new_node)
+            new_buf = tb.data.data
+            # Set origins before moving (same as insert_restickify line 136).
+            new_buf.origins = OrderedSet([new_node])
+            # Move from auto-registered position to our desired index.
+            gl.operations.remove(new_buf)
+            operations.insert(insert_idx, new_buf)
+            gl.name_to_buffer[new_buf.get_name()] = new_buf
             vid_to_bufname[vid] = new_buf.get_name()
             bufs.append(new_buf)
             insert_idx += 1
@@ -471,8 +486,10 @@ def _make_intermediate_bufs(
         elif "val" in orig_node.meta:
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
+        # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-        object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+        # Set origins on the buffer.
+        new_buf.origins = OrderedSet([new_node])
         vid_to_bufname[vid] = new_buf.get_name()
         bufs.append(new_buf)
         insert_idx += 1
@@ -673,6 +690,14 @@ def split_multi_ops(graph: GraphLowering):
 
         intermediate_ops = compute_ops[:-1]
         final_op_name = compute_ops[-1][0]
+
+        logger.debug(
+            "split_multi_ops: '%s' has %d compute ops: [%s] -> final: %s",
+            op.get_name(),
+            len(compute_ops),
+            ", ".join(op_name for op_name, *_ in intermediate_ops),
+            final_op_name,
+        )
 
         # Snapshot the original load-buffer names before _make_intermediate_bufs
         # updates bufname_map.  This lets _patch_original_buf build the redirect
