@@ -447,7 +447,7 @@ def _make_intermediate_bufs(
                 fill_value, dtype=out_dtype, device="meta"
             )
             new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-            new_buf.origins = OrderedSet([new_node])
+            object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
             vid_to_bufname[vid] = new_buf.get_name()
             bufs.append(new_buf)
             insert_idx += 1
@@ -472,7 +472,7 @@ def _make_intermediate_bufs(
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-        new_buf.origins = OrderedSet([new_node])
+        object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         vid_to_bufname[vid] = new_buf.get_name()
         bufs.append(new_buf)
         insert_idx += 1
