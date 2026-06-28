@@ -51,7 +51,7 @@ _OP_TARGET_TABLE = {
 
 
 class _SplitOpsHandler(WrapperHandler):
-    """Intercept load() calls to redirect them to split intermediate buffers.
+    """Intercept load() and constant() calls to redirect to split intermediate buffers.
 
     Used by split_multi_ops to wrap the original inner_fn after intermediate buffers have
     been materialized.  Only buffer names are redirected; index expressions are left intact
@@ -62,14 +62,63 @@ class _SplitOpsHandler(WrapperHandler):
     scalars so SpyreOpFuncs can read them out of the RValue tree and place them in op_info.
 
     name_map: old_buf_name → new_intermediate_buf_name
+    constant_map: (fill_value, dtype) → materialized_const_buf_name (for constants that
+                  feed non-_OPS_WITH_CONSTANT_ARGS ops and were materialized as buffers)
     """
 
-    def __init__(self, inner, name_map: dict[str, str]):
+    def __init__(
+        self,
+        inner,
+        name_map: dict[str, str],
+        constant_map: dict[tuple, str] | None = None,
+    ):
         super().__init__(inner)
         self._name_map = name_map
+        self._constant_map = constant_map or {}
 
     def load(self, name, index):
         return super().load(self._name_map.get(name, name), index)
+
+    def constant(self, fill_value, dtype):
+        key = (fill_value, dtype)
+        if key in self._constant_map:
+            # Load from the materialized constant buffer at index 0 (0-dim tensor)
+            return super().load(self._constant_map[key], sympy.Integer(0))
+        return super().constant(fill_value, dtype)
+
+
+class _IntermediateOpHandler(WrapperHandler):
+    """Intercept inlined intermediate compute ops and replace with buffer loads.
+
+    Sits on top of _SplitOpsHandler in the handler stack.  When an intermediate
+    op (e.g. to_dtype) was materialized into its own buffer by _make_intermediate_bufs,
+    this handler intercepts that op call and emits load(buf_name, last_index) instead
+    of executing the op inline — exactly as if the result had been a separately loaded
+    buffer all along.
+
+    _last_index is updated on every load() call.  For pointwise fused ops all loads
+    in the same loop iteration share the same flat index, and an intermediate op always
+    follows the load of its input, so _last_index is always current when the intercept fires.
+
+    op_queue: op_name → ordered list of buf_names (consumed front-to-back to handle
+              multiple intermediates of the same op type in call order).
+    """
+
+    def __init__(self, inner, op_queue: dict[str, list]):
+        super().__init__(inner)
+        self._op_queue = op_queue
+        self._last_index = sympy.Integer(0)
+
+    def load(self, name, index):
+        self._last_index = index
+        return super().load(name, index)
+
+    def _default(self, name, args, kwargs):
+        queue = self._op_queue.get(name)
+        if queue:
+            buf_name = queue.pop(0)
+            return super().load(buf_name, self._last_index)
+        return super()._default(name, args, kwargs)
 
 
 class _Val:
@@ -397,7 +446,7 @@ def _make_intermediate_bufs(
     gl,
     orig_node,
     final_op_name="",
-) -> None:
+) -> tuple[dict[tuple, str], dict[str, list]]:
     """Create intermediate buffers for operations.
 
     For each intermediate operation in a fused computation, this creates:
@@ -422,8 +471,13 @@ def _make_intermediate_bufs(
         orig_node: Original FX node being split
         final_op_name: Name of the final (consumer) op, used to skip constant
             materialization for _OPS_WITH_CONSTANT_ARGS.
+
+    Returns:
+        constant_map: Mapping from (fill_value, dtype) to materialized constant buffer name
     """
     bufs = []
+    constant_map = {}
+    op_queue: dict[str, list] = {}
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
 
@@ -431,15 +485,7 @@ def _make_intermediate_bufs(
             # Constants that feed _OPS_WITH_CONSTANT_ARGS ops (clamp, softplus,
             # layernormscale) must remain as Python scalars — do not materialize.
             if final_op_name in _OPS_WITH_CONSTANT_ARGS:
-                logger.debug(
-                    "skipping constant materialization (final op '%s' is in _OPS_WITH_CONSTANT_ARGS)",
-                    final_op_name,
-                )
                 continue
-            logger.debug(
-                "materializing constant for final op '%s' (not in _OPS_WITH_CONSTANT_ARGS)",
-                final_op_name,
-            )
             # All other constants: lower as SpyreConstantFallback via the registered
             # torch.ops.spyre.constant lowering so they can be loaded from a buffer.
             fill_value = float(kwargs["fill_value"])
@@ -455,15 +501,21 @@ def _make_intermediate_bufs(
                 fill_value, dtype=out_dtype, device="meta"
             )
             # Lower the FX node; run_node registers in gl.operations.
+            # For ExternKernel like SpyreConstantFallback, extract the raw buffer
+            # only for positioning — don't replace it with raw buffer in operations.
             tb = gl.run_node(new_node)
+            # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
+            # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data
-            # Set origins before moving (same as insert_restickify line 136).
-            new_buf.origins = OrderedSet([new_node])
-            # Move from auto-registered position to our desired index.
+            # Set origins using object.__setattr__ to work around dataclass frozen fields.
+            object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+            # Move the buffer to our desired position, then continue with it wrapped.
             gl.operations.remove(new_buf)
             operations.insert(insert_idx, new_buf)
-            gl.name_to_buffer[new_buf.get_name()] = new_buf
-            vid_to_bufname[vid] = new_buf.get_name()
+            buf_name = new_buf.get_name()
+            vid_to_bufname[vid] = buf_name
+            # Track this materialized constant for the handler's constant_map.
+            constant_map[(fill_value, out_dtype)] = buf_name
             bufs.append(new_buf)
             insert_idx += 1
             continue
@@ -488,11 +540,17 @@ def _make_intermediate_bufs(
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-        # Set origins on the buffer.
-        new_buf.origins = OrderedSet([new_node])
-        vid_to_bufname[vid] = new_buf.get_name()
+        # Set origins using object.__setattr__ to work around dataclass frozen fields.
+        object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+        buf_name = new_buf.get_name()
+        vid_to_bufname[vid] = buf_name
+        # Track materialized compute intermediates so _IntermediateOpHandler can
+        # intercept inline calls to this op and load from the buffer instead.
+        op_queue.setdefault(op_name, []).append(buf_name)
         bufs.append(new_buf)
         insert_idx += 1
+
+    return constant_map, op_queue
 
 
 def _patch_original_buf(
@@ -500,24 +558,29 @@ def _patch_original_buf(
     orig_load_names: dict[int, str],
     vid_to_bufname: dict[int, str],
     operations: list,
+    constant_map: dict[tuple, str] | None = None,
+    op_queue: dict[str, list] | None = None,
 ) -> None:
     """Patch the original buffer's inner_fn to load from intermediate buffers.
 
-    Wraps the original inner_fn with _SplitOpsHandler so that load(old_buf_name, idx)
-    is redirected to load(new_intermediate_buf_name, idx).  Indices are left entirely
-    intact — the original inner_fn recomputes them correctly from the live loop
-    variables each time it is called.
+    Stacks two handlers over the original inner_fn:
+    - _SplitOpsHandler: redirects load(old_name) → load(new_name) and
+      constant() → load(const_buf) for materialized scalar constants.
+    - _IntermediateOpHandler: intercepts inlined compute ops (e.g. to_dtype)
+      that were materialized into their own buffers and replaces them with
+      load(buf_name, last_index).
 
-    Constants are NOT redirected: those that feed _OPS_WITH_CONSTANT_ARGS ops remain
-    as V.ops.constant() scalars (handled correctly by SpyreOpFuncs at codegen time);
-    those that feed other intermediate ops were already consumed by their own split
-    buffers, so the final op never sees them as constants.
+    Indices are never recomputed — the original inner_fn's index logic is
+    preserved exactly.  _IntermediateOpHandler tracks the last load index
+    (always current for pointwise ops) for use when intercepting compute ops.
 
     Args:
         op: ComputedBuffer whose inner_fn is to be patched
         orig_load_names: vid → original buffer name (from load trace entries)
         vid_to_bufname: vid → current buffer name (updated by _make_intermediate_bufs)
         operations: list of operations in the graph
+        constant_map: (fill_value, dtype) → buf_name for materialized scalar constants
+        op_queue: op_name → ordered list of buf_names for materialized compute intermediates
     """
     # Build name_map: only include load-buffer redirections where the name changed.
     name_map = {
@@ -527,12 +590,22 @@ def _patch_original_buf(
     }
 
     orig_inner = op.data.inner_fn
+    _cm = constant_map or {}
+    # Keep the canonical op_queue as a template; new_inner_fn makes a fresh copy
+    # each call so _IntermediateOpHandler can pop from it without exhausting it.
+    _oq_template = {k: list(v) for k, v in (op_queue or {}).items()}
 
     def new_inner_fn(*args, _nm=name_map, _orig=orig_inner):
-        with V.set_ops_handler(_SplitOpsHandler(V.ops, _nm)):
+        inner = _SplitOpsHandler(V.ops, _nm, _cm)
+        with V.set_ops_handler(
+            _IntermediateOpHandler(inner, {k: list(v) for k, v in _oq_template.items()})
+        ):
             return _orig(*args)
 
     new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
+    # Preserve origins from the original data object (dataclasses.replace creates
+    # a fresh object with empty origins; we must restore it).
+    object.__setattr__(new_data, "origins", op.data.origins)
     new_op = replace_computed_buffer_body(op, new_data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
@@ -704,7 +777,7 @@ def split_multi_ops(graph: GraphLowering):
         # map: orig_name → new_intermediate_name.
         orig_load_names = dict(bufname_map)
 
-        _make_intermediate_bufs(
+        constant_map, op_queue = _make_intermediate_bufs(
             intermediate_ops,
             dtype_map,
             bufname_map,
@@ -721,6 +794,8 @@ def split_multi_ops(graph: GraphLowering):
             orig_load_names,
             bufname_map,
             operations,
+            constant_map=constant_map,
+            op_queue=op_queue,
         )
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
