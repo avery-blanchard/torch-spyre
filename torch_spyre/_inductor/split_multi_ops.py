@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import sympy
 import torch
 import torch.fx as fx
@@ -22,7 +23,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
-from .insert_restickify import NameSwapHandler
+from .pass_utils import replace_computed_buffer_body
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
 
@@ -437,41 +438,90 @@ def _make_intermediate_bufs(
         insert_idx += 1
 
 
-def _update_original_buf(op, name_map, operations) -> None:
+def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant):
+    """Build inner_fn that loads from intermediate buffers using stride-based indexing.
+
+    Strides are read AT CALL TIME from V.graph.get_buffer() so they reflect the final
+    layout state after all passes (layout propagation, coarse tiling, stickification, etc).
+
+    Args:
+        op_name: Name of the operation to perform
+        value_vids: List of value IDs for operation inputs
+        kwargs: Operation keyword arguments
+        vid_to_bufname: Mapping from value ID to buffer name
+        vid_to_constant: Mapping from value ID to (fill_value, dtype)
+
+    Returns:
+        Function that takes an index tuple and returns the operation result
+    """
+    pos_keys = sorted(k for k in kwargs if k.startswith("_p"))
+    extra = tuple(kwargs[k] for k in pos_keys)
+    clean_kw = {k: v for k, v in kwargs.items() if not k.startswith("_p")}
+
+    def inner_fn(index):
+        inputs = []
+        for v in value_vids:
+            if v in vid_to_constant:
+                # Handle constant arguments that need to be passed as scalars
+                if op_name in _OPS_WITH_CONSTANT_ARGS:
+                    fill, _ = vid_to_constant[v]
+                    inputs.append(fill)
+                else:
+                    inputs.append(V.ops.load(vid_to_bufname[v], sympy.Integer(0)))
+            else:
+                # Use stride-based indexing with strides read at call time
+                buf_name = vid_to_bufname[v]
+                buf_stride = V.graph.get_buffer(buf_name).layout.stride
+                if len(index) != len(buf_stride):
+                    raise ValueError(
+                        f"Mismatch between index & stride dimensions: "
+                        f"{len(index)} vs {len(buf_stride)}"
+                    )
+                idx = sum(i * s for i, s in zip(index, buf_stride))
+                inputs.append(V.ops.load(buf_name, idx))
+        return getattr(V.ops, op_name)(*inputs, *extra, **clean_kw)
+
+    return inner_fn
+
+
+def _update_original_buf(
+    op, final_entry, vid_to_bufname, vid_to_constant, operations
+) -> None:
     """Update the original buffer to load from intermediate buffers.
 
-    Wraps the original inner_fn with NameSwapHandler to redirect loads
-    from original input buffers to the newly created intermediate buffers.
-    Reconstructs ComputedBuffer to invalidate the get_default_sizes_body cache.
+    Builds a new inner_fn that loads from intermediate buffers using stride-based indexing.
+    Strides are read at call time so they always reflect the current layout state.
 
     Args:
         op: Original ComputedBuffer to update
-        name_map: Mapping {old_buf_name: new_intermediate_buf_name}
+        final_entry: Final operation tuple (op_name, vid, inputs, kwargs)
+        vid_to_bufname: Mapping from value ID to buffer name (mutated by _make_intermediate_bufs)
+        vid_to_constant: Mapping from value ID to constant values
         operations: List of operations containing op
     """
-    orig_inner = op.data.inner_fn
+    op_name, _, vids, kwargs = final_entry
 
-    def new_inner_fn(*args, _map=name_map, _orig=orig_inner):
-        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-            return _orig(*args)
-
-    object.__setattr__(op.data, "inner_fn", new_inner_fn)
-
-    op_index = operations.index(op)
-    new_buf = ComputedBuffer(
-        name=op.get_name(),
-        layout=op.layout,
-        data=op.data,
-        _split_size=op._split_size,
-        _original_inner_fn=op._original_inner_fn,
-        _original_ranges=op._original_ranges,
-        _original_reduction_ranges=op._original_reduction_ranges,
+    new_data = dataclasses.replace(
+        op.data,
+        inner_fn=_build_inner_fn(
+            op_name, vids, kwargs, vid_to_bufname, vid_to_constant
+        ),
     )
-    new_buf.operation_name = op.operation_name
-    new_buf.origins = op.origins
-    operations[op_index] = new_buf
-    V.graph.name_to_buffer[new_buf.get_name()] = new_buf
-    ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
+
+    # Preserve metadata
+    metadata_attrs = (
+        "origins",
+        "traceback",
+        "origin_node",
+        "annotations",
+        "stream_idx",
+    )
+    for attr in metadata_attrs:
+        if hasattr(op.data, attr):
+            object.__setattr__(new_data, attr, getattr(op.data, attr))
+
+    new_op = replace_computed_buffer_body(op, new_data, operations)
+    V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
 def _get_op_name(op) -> str:
@@ -615,6 +665,7 @@ def split_multi_ops(graph: GraphLowering):
         layout = op.layout
         dtype_map = _propagate_dtypes(trace, layout.dtype)
         bufname_map = _init_vid_to_bufname(trace)
+        const_map = _init_vid_to_constant(trace)
 
         try:
             insert_idx = operations.index(op)
@@ -630,10 +681,7 @@ def split_multi_ops(graph: GraphLowering):
         if not isinstance(orig_node, fx.Node):
             continue
 
-        intermediate_ops = compute_ops[:-1]
-
-        # Snapshot bufname_map before _make_intermediate_bufs mutates it
-        original_bufnames = dict(bufname_map)
+        intermediate_ops, final_op = compute_ops[:-1], compute_ops[-1]
 
         _make_intermediate_bufs(
             intermediate_ops,
@@ -646,14 +694,7 @@ def split_multi_ops(graph: GraphLowering):
             orig_node,
         )
 
-        # Build name_map: entries where bufname_map changed point to new intermediates
-        name_map = {
-            original_bufnames[v]: bufname_map[v]
-            for v in bufname_map
-            if bufname_map[v] != original_bufnames.get(v)
-        }
-
-        _update_original_buf(op, name_map, operations)
+        _update_original_buf(op, final_op, bufname_map, const_map, operations)
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
             op.get_name(),
