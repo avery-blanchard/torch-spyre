@@ -28,7 +28,7 @@ chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
-allow_all_ops_in_lx_planning: bool = False
+allow_all_ops_in_lx_planning: bool = True
 
 # Insert clone ops at graph input/output boundaries so those buffers can be
 # LX-pinned (see scratchpad.utils.clone_at_graph_boundaries). This path is not
