@@ -19,6 +19,7 @@ import torch.fx as fx
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
@@ -32,12 +33,14 @@ logger = get_inductor_logger("split_multi_ops")
 # Operations that don't perform computation but manage data flow
 _STRUCTURAL_OPS = frozenset({"load", "store", "get_index"})
 
-# Operations that involve dtype conversion or constant creation
-_DTYPE_OPS = frozenset({"to_dtype", "convert_element_type", "constant"})
+# Operations that involve dtype conversion
+_DTYPE_OPS = frozenset({"to_dtype", "convert_element_type"})
 
-# These operations are a special case for SDSC codegen: their scalar parameters must be
-# passed as compile-time constants via an `op_info['constants']` dictionary rather than
-# as standard input buffers.
+# Operations whose scalar constant parameters must be passed as compile-time constants
+# via op_info["constants"] (not as 1-d tensor buffers) in SDSC codegen.
+# When the final op is one of these, intermediate constant ops must NOT be materialized
+# as SpyreConstantFallback buffers — they must remain as V.ops.constant() scalars so
+# SpyreOpFuncs.clamp / layernormscale / softplus can read them out of the RValue tree.
 _OPS_WITH_CONSTANT_ARGS = frozenset({"clamp", "layernormscale", "softplus"})
 
 # Mapping of operation names to their FX graph targets when there is no 1-1 mapping.
@@ -45,6 +48,28 @@ _OP_TARGET_TABLE = {
     "to_dtype": torch.ops.prims.convert_element_type.default,
     "convert_element_type": torch.ops.prims.convert_element_type.default,
 }
+
+
+class _SplitOpsHandler(WrapperHandler):
+    """Intercept load() calls to redirect them to split intermediate buffers.
+
+    Used by split_multi_ops to wrap the original inner_fn after intermediate buffers have
+    been materialized.  Only buffer names are redirected; index expressions are left intact
+    so the original inner_fn computes them correctly with the live loop variables.
+
+    Constants that are direct scalar inputs to _OPS_WITH_CONSTANT_ARGS ops (clamp, softplus,
+    layernormscale) are intentionally NOT redirected — they must remain as V.ops.constant()
+    scalars so SpyreOpFuncs can read them out of the RValue tree and place them in op_info.
+
+    name_map: old_buf_name → new_intermediate_buf_name
+    """
+
+    def __init__(self, inner, name_map: dict[str, str]):
+        super().__init__(inner)
+        self._name_map = name_map
+
+    def load(self, name, index):
+        return super().load(self._name_map.get(name, name), index)
 
 
 class _Val:
@@ -250,81 +275,6 @@ def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
     return tuple(args), clean_kw, out_dtype
 
 
-def _build_inner_fn(
-    op_name,
-    value_vids,
-    kwargs,
-    vid_to_bufname,
-    vid_to_constant,
-    vid_to_load_index=None,
-    n_dims=None,
-):
-    """Build an inner_fn that loads from intermediate buffers.
-
-    Special cases:
-    1. Constants in _OPS_WITH_CONSTANT_ARGS: Use scalar value directly
-    2. Other constants: Load from buffer at index 0
-    3. Regular values: Compute strided index and load
-
-    Args:
-        op_name: Name of the operation to perform
-        value_vids: List of value IDs for operation inputs
-        kwargs: Operation keyword arguments
-        vid_to_bufname: Mapping from value ID to buffer name
-        vid_to_constant: Mapping from value ID to (fill_value, dtype)
-
-    Returns:
-        Function that takes an index tuple and returns the operation result
-    """
-    pos_keys = sorted(k for k in kwargs if k.startswith("_p"))
-    extra = tuple(kwargs[k] for k in pos_keys)
-    clean_kw = {k: v for k, v in kwargs.items() if not k.startswith("_p")}
-
-    # Pre-compute strides for non-constant inputs
-    vid_to_stride = {}
-    for v in value_vids:
-        if v not in vid_to_constant:
-            if vid_to_load_index and n_dims and v in vid_to_load_index:
-                continue
-            buf_name = vid_to_bufname[v]
-            vid_to_stride[v] = V.graph.get_buffer(buf_name).layout.stride
-
-    def inner_fn(index):
-        subs = {}
-        if vid_to_load_index and n_dims:
-            subs = {sympy.Symbol(f"_i{k}"): index[k] for k in range(n_dims)}
-
-        inputs = []
-        for v in value_vids:
-            if v in vid_to_constant:
-                # Handle constant arguments that need to be passed as scalars
-                if op_name in _OPS_WITH_CONSTANT_ARGS:
-                    fill, _ = vid_to_constant[v]
-                    inputs.append(fill)
-                else:
-                    inputs.append(V.ops.load(vid_to_bufname[v], sympy.Integer(0)))
-            elif subs and vid_to_load_index and v in vid_to_load_index:
-                # Use the original traced load index expression
-                # instead of stride since index tuple could be different
-                # from allocated buffer dimension.
-                # ref - https://github.com/torch-spyre/torch-spyre/issues/2797
-                traced_idx = vid_to_load_index[v]
-                idx = traced_idx.subs(subs)
-                inputs.append(V.ops.load(vid_to_bufname[v], idx))
-            else:
-                buf_stride = vid_to_stride[v]
-                if len(index) != len(buf_stride):
-                    raise ValueError(
-                        f"Mismatch between index & stride dimensions: "
-                        f"{len(index)} vs {len(buf_stride)}"
-                    )
-                idx = sum(i * s for i, s in zip(index, buf_stride))
-                inputs.append(V.ops.load(vid_to_bufname[v], idx))
-        return getattr(V.ops, op_name)(*inputs, *extra, **clean_kw)
-
-    return inner_fn
-
-
 def _trace_inner_fn(op):
     """Trace the inner_fn of an operation to extract its structure.
 
@@ -392,27 +342,6 @@ def _init_vid_to_bufname(trace):
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
-def _init_vid_to_load_index(trace):
-    """Extract per-VID symbolic load indices from load operations in a trace."""
-    return {vid: kwargs["_index"] for op, vid, _, kwargs in trace if op == "load"}
-
-
-def _init_vid_to_constant(trace):
-    """Extract constant values from constant operations in a trace.
-
-    Args:
-        trace: List of traced operations
-
-    Returns:
-        Dictionary mapping value IDs to (fill_value, dtype) tuples
-    """
-    return {
-        vid: (kwargs["fill_value"], kwargs["dtype"])
-        for op, vid, _, kwargs in trace
-        if op == "constant"
-    }
-
-
 def _find_fx_node(name, gl):
     """Find an FX node by buffer name in the graph.
 
@@ -467,6 +396,7 @@ def _make_intermediate_bufs(
     insert_idx,
     gl,
     orig_node,
+    final_op_name="",
 ) -> None:
     """Create intermediate buffers for operations.
 
@@ -475,10 +405,11 @@ def _make_intermediate_bufs(
     2. A lowered buffer from that node
     3. Updates vid_to_bufname mapping for subsequent operations
 
-    Special cases:
-    1. Metadata propagation: Copies 'val' metadata from inputs or orig_node
-    2. Node insertion: Uses inserting_before context to maintain graph order
-    3. Origins tracking: Sets OrderedSet with single new_node as origin
+    Constants that are direct scalar inputs to _OPS_WITH_CONSTANT_ARGS (clamp, softplus,
+    layernormscale) are skipped — they must remain as V.ops.constant() scalars so that
+    SpyreOpFuncs can place them in op_info["constants"] for SDSC codegen.  All other
+    constants are materialized as SpyreConstantFallback buffers via
+    torch.ops.spyre.constant.default.
 
     Args:
         intermediate_ops: List of (op_name, vid, inputs, kwargs) tuples
@@ -489,10 +420,39 @@ def _make_intermediate_bufs(
         insert_idx: Starting index for insertion
         gl: GraphLowering instance
         orig_node: Original FX node being split
+        final_op_name: Name of the final (consumer) op, used to skip constant
+            materialization for _OPS_WITH_CONSTANT_ARGS.
     """
     bufs = []
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
+
+        if op_name == "constant":
+            # Constants that feed _OPS_WITH_CONSTANT_ARGS ops (clamp, softplus,
+            # layernormscale) must remain as Python scalars — do not materialize.
+            if final_op_name in _OPS_WITH_CONSTANT_ARGS:
+                continue
+            # All other constants: lower as SpyreConstantFallback via the registered
+            # torch.ops.spyre.constant lowering so they can be loaded from a buffer.
+            fill_value = float(kwargs["fill_value"])
+            out_dtype = kwargs.get("dtype", layout.dtype)
+            with gl.graph.inserting_before(orig_node):
+                new_node = gl.graph.create_node(
+                    "call_function",
+                    torch.ops.spyre.constant.default,
+                    (fill_value, out_dtype, layout.device),
+                    {},
+                )
+            new_node.meta["val"] = torch.tensor(
+                fill_value, dtype=out_dtype, device="meta"
+            )
+            new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
+            new_buf.origins = OrderedSet([new_node])
+            vid_to_bufname[vid] = new_buf.get_name()
+            bufs.append(new_buf)
+            insert_idx += 1
+            continue
+
         input_nodes = [_find_fx_node(vid_to_bufname[v], gl) for v in inputs]
         target = _resolve_fx_target(op_name)
         if target is None:
@@ -518,55 +478,44 @@ def _make_intermediate_bufs(
         insert_idx += 1
 
 
-def _update_original_buf(
-    op,
-    final_entry,
-    vid_to_bufname,
-    vid_to_constant,
-    operations,
-    vid_to_load_index=None,
+def _patch_original_buf(
+    op: ComputedBuffer,
+    orig_load_names: dict[int, str],
+    vid_to_bufname: dict[int, str],
+    operations: list,
 ) -> None:
-    """Update the original buffer to use intermediate buffers.
+    """Patch the original buffer's inner_fn to load from intermediate buffers.
 
-    Replaces the original fused operation's inner_fn with one that loads
-    from the newly created intermediate buffers. Preserves all metadata
-    and attributes from the original operation.
+    Wraps the original inner_fn with _SplitOpsHandler so that load(old_buf_name, idx)
+    is redirected to load(new_intermediate_buf_name, idx).  Indices are left entirely
+    intact — the original inner_fn recomputes them correctly from the live loop
+    variables each time it is called.
+
+    Constants are NOT redirected: those that feed _OPS_WITH_CONSTANT_ARGS ops remain
+    as V.ops.constant() scalars (handled correctly by SpyreOpFuncs at codegen time);
+    those that feed other intermediate ops were already consumed by their own split
+    buffers, so the final op never sees them as constants.
 
     Args:
-        op: Original ComputedBuffer to update
-        final_entry: Final operation tuple (op_name, vid, inputs, kwargs)
-        vid_to_bufname: Mapping from value ID to buffer name
-        vid_to_constant: Mapping from value ID to constant values
-        operations: List of operations containing op
+        op: ComputedBuffer whose inner_fn is to be patched
+        orig_load_names: vid → original buffer name (from load trace entries)
+        vid_to_bufname: vid → current buffer name (updated by _make_intermediate_bufs)
+        operations: list of operations in the graph
     """
-    op_name, _, vids, kwargs = final_entry
+    # Build name_map: only include load-buffer redirections where the name changed.
+    name_map = {
+        orig_load_names[v]: vid_to_bufname[v]
+        for v in orig_load_names
+        if vid_to_bufname.get(v) != orig_load_names[v]
+    }
 
-    # New data for the new op
-    new_data = dataclasses.replace(
-        op.data,
-        inner_fn=_build_inner_fn(
-            op_name,
-            vids,
-            kwargs,
-            vid_to_bufname,
-            vid_to_constant,
-            vid_to_load_index=vid_to_load_index,
-            n_dims=len(op.data.ranges),
-        ),
-    )
+    orig_inner = op.data.inner_fn
 
-    # Preserve metadata from original's ops data in new_data
-    metadata_attrs = (
-        "origins",
-        "traceback",
-        "origin_node",
-        "annotations",
-        "stream_idx",
-    )
-    for attr in metadata_attrs:
-        if hasattr(op.data, attr):
-            object.__setattr__(new_data, attr, getattr(op.data, attr))
+    def new_inner_fn(*args, _nm=name_map, _orig=orig_inner):
+        with V.set_ops_handler(_SplitOpsHandler(V.ops, _nm)):
+            return _orig(*args)
 
+    new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
     new_op = replace_computed_buffer_body(op, new_data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
@@ -650,29 +599,24 @@ def validate_ops(graph: GraphLowering) -> None:
 def split_multi_ops(graph: GraphLowering):
     """Split multi-ops in a single loop body into separate buffers.
 
-    1. Multi-op fusion: Splits multi-op loop bodies (e.g., type conversion + arithmetic)
-       into individual ops by creating FX graph nodes and lowering.
-    2. Constant arguments: creates SpyreConstantFallback IRNode.
+    Splits fused multi-op loop bodies (e.g., type conversion + clamp) into individual
+    ComputedBuffer ops by creating FX graph nodes, lowering them, and patching the
+    original buffer's inner_fn to load from the new intermediates.
 
-    More pytorch programming patterns that result in multi-op in a single loop body can
-    be supported by adding required handling in this pass.
+    Scalar constants (e.g., clamp bounds, softplus beta) are materialized as
+    SpyreConstantFallback buffers via torch.ops.spyre.constant.default.
 
-    Special cases:
-    1. Only processes ComputedBuffer with Pointwise data and FixedLayout
-    2. Skips operations if only 1 compute ops (nothing to split)
-    3. Skips if tracing fails or operation is not in operations list
-    4. Requires valid FX node origins for graph manipulation
-    5. Builds environment mapping from name_to_users for FX node lookup
-    6. load index is computed from traced index rather using stride
+    The final (original) buffer's inner_fn is wrapped with _SplitOpsHandler rather
+    than rebuilt from scratch.  This preserves all index computations exactly — only
+    buffer names are redirected — avoiding stale-index substitution bugs.
 
     Algorithm:
-    1. Build FX node environment from name_to_users
-    2. For each eligible operation in graph.operations:
-       a. Trace inner_fn to extract operation structure
-       b. Filter to compute operations (exclude load/store/get_index)
-       c. Propagate dtypes through the trace
-       d. Create intermediate buffers for all but last operation
-       e. Update final buffer to load from intermediates
+    1. Build FX node environment from name_to_users.
+    2. For each eligible ComputedBuffer (Pointwise, FixedLayout):
+       a. Trace inner_fn to detect multi-op structure.
+       b. Skip if only 1 compute op.
+       c. Create intermediate buffers (including SpyreConstantFallback for constants).
+       d. Wrap the original inner_fn with _SplitOpsHandler to redirect buffer names.
 
     Args:
         graph: GraphLowering instance containing operations to process
@@ -712,7 +656,6 @@ def split_multi_ops(graph: GraphLowering):
         layout = op.layout
         dtype_map = _propagate_dtypes(trace, layout.dtype)
         bufname_map = _init_vid_to_bufname(trace)
-        const_map = _init_vid_to_constant(trace)
 
         try:
             insert_idx = operations.index(op)
@@ -728,9 +671,13 @@ def split_multi_ops(graph: GraphLowering):
         if not isinstance(orig_node, fx.Node):
             continue
 
-        intermediate_ops, final_op = compute_ops[:-1], compute_ops[-1]
+        intermediate_ops = compute_ops[:-1]
+        final_op_name = compute_ops[-1][0]
 
-        vid_to_load_index = _init_vid_to_load_index(trace)
+        # Snapshot the original load-buffer names before _make_intermediate_bufs
+        # updates bufname_map.  This lets _patch_original_buf build the redirect
+        # map: orig_name → new_intermediate_name.
+        orig_load_names = dict(bufname_map)
 
         _make_intermediate_bufs(
             intermediate_ops,
@@ -741,15 +688,14 @@ def split_multi_ops(graph: GraphLowering):
             insert_idx,
             gl,
             orig_node,
+            final_op_name=final_op_name,
         )
 
-        _update_original_buf(
+        _patch_original_buf(
             op,
-            final_op,
+            orig_load_names,
             bufname_map,
-            const_map,
             operations,
-            vid_to_load_index=vid_to_load_index,
         )
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
