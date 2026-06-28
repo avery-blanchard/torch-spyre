@@ -172,6 +172,25 @@ def _arg_byte_strides_for_syms(
     return result
 
 
+def _all_op_specs(entry) -> list[OpSpec]:
+    """Return all OpSpecs reachable from a body entry, in order.
+
+    Used to collect the full set of pre-unroll OpSpecs from a LoopSpec body
+    entry before recursing — so device_size is still the original full-tensor
+    value rather than a tile-shrunk value produced by inner-loop unrolling.
+    Nested LoopSpec bodies are walked recursively: each inner iteration
+    produces the same op sequence, so one pass suffices.
+    """
+    if isinstance(entry, OpSpec):
+        return [entry]
+    if isinstance(entry, LoopSpec):
+        ops: list[OpSpec] = []
+        for child in entry.body:
+            ops.extend(_all_op_specs(child))
+        return ops
+    return []
+
+
 def _unroll_one(loop: LoopSpec) -> list:
     """Unroll a single LoopSpec node, returning flat OpSpec copies.
 
@@ -180,15 +199,14 @@ def _unroll_one(loop: LoopSpec) -> list:
     independently computes per-iteration byte strides from its own
     ``tiled_symbols`` and ``iteration_space``, so strides accumulate
     correctly across nesting depths without explicit offset propagation.
-    """
-    # --- Recursively unroll any nested LoopSpecs in body first. ----------
-    flat_body: list[OpSpec] = []
-    for entry in loop.body:
-        if isinstance(entry, LoopSpec):
-            flat_body.extend(_unroll_one(entry))
-        else:
-            flat_body.append(entry)
 
+    Strides and tile device_sizes are computed from the **original** body
+    entries *before* recursing into inner loops.  This is critical: inner-loop
+    unrolling may shrink ``device_size`` on the flat copies it returns, and
+    using those shrunk sizes to compute outer-loop strides yields wrong byte
+    advances (too small by the inner tile factor), causing out-of-bounds
+    accesses and non-deterministic results.
+    """
     # --- Evaluate trip count. --------------------------------------------
     count_expr = sympy.sympify(loop.count)
     if count_expr.free_symbols:
@@ -206,66 +224,117 @@ def _unroll_one(loop: LoopSpec) -> list:
         this_level_syms: list[Symbol] = loop.tiled_symbols
     else:
         this_level_syms = next(
-            (list(e.tiled_symbols) for e in flat_body if isinstance(e, OpSpec)),
+            (list(op.tiled_symbols) for e in loop.body for op in _all_op_specs(e)),
             [],
         )
 
-    # --- Pre-compute per-arg byte strides and tile device_sizes once. ----
-    strides_per_op: list[list[dict[Symbol, int]]] = []
-    tile_sizes_per_op: list[list[list[int] | None]] = []
-    for entry in flat_body:
-        if isinstance(entry, OpSpec):
-            arg_strides = _arg_byte_strides_for_syms(entry, this_level_syms)
-            strides_per_op.append(arg_strides)
-            tile_sizes: list[list[int] | None] = []
-            for arg, strides in zip(entry.args, arg_strides):
-                if strides:
-                    tile_sizes.append(
-                        _tile_device_size(arg, this_level_syms, entry.iteration_space)
-                    )
-                else:
-                    tile_sizes.append(None)
-            tile_sizes_per_op.append(tile_sizes)
+    # --- Pre-compute strides and tile device_sizes from the ORIGINAL body
+    #     entries, before inner-loop unrolling shrinks device_size. -------
+    #
+    # We walk each body entry's OpSpecs *before* recursing so device_size is
+    # still the full-tensor value.  For a LoopSpec body entry with N distinct
+    # ops per inner iteration, we get N stride tables; after the inner loop
+    # unrolls to count_inner * N flat ops, we tile those N tables count_inner
+    # times to stay in sync with flat_body.
+    def _stride_table(op: OpSpec):
+        arg_strides = _arg_byte_strides_for_syms(op, this_level_syms)
+        tile_sizes: list[list[int] | None] = []
+        for arg, strides in zip(op.args, arg_strides):
+            if strides:
+                tile_sizes.append(
+                    _tile_device_size(arg, this_level_syms, op.iteration_space)
+                )
+            else:
+                tile_sizes.append(None)
+        return arg_strides, tile_sizes
+
+    # pre_entry_tables: for each body entry, a list of (arg_strides, tile_sizes)
+    # — one per distinct OpSpec in that entry (in traversal order).
+    pre_entry_tables: list[list[tuple]] = []
+    for entry in loop.body:
+        ops = _all_op_specs(entry)
+        if ops:
+            pre_entry_tables.append([_stride_table(op) for op in ops])
         else:
-            strides_per_op.append([])
-            tile_sizes_per_op.append([])
+            pre_entry_tables.append([([], [])])
+
+    # --- Recursively unroll any nested LoopSpecs in body. ----------------
+    flat_body: list[OpSpec] = []
+    flat_strides: list[tuple] = []  # parallel to flat_body
+    for entry, tables in zip(loop.body, pre_entry_tables):
+        if isinstance(entry, LoopSpec):
+            inner_flat = _unroll_one(entry)
+            flat_body.extend(inner_flat)
+            # The inner loop produces count_inner repetitions of the N-op
+            # sequence.  Tile the tables to match.
+            n = len(tables)
+            flat_strides.extend(tables[k % n] for k in range(len(inner_flat)))
+        else:
+            flat_body.append(entry)
+            flat_strides.append(tables[0])
 
     # --- Emit count copies, advancing addresses per iteration. -----------
     result: list = []
     for i in range(count):
-        for entry, arg_strides, tile_sizes in zip(
-            flat_body, strides_per_op, tile_sizes_per_op
-        ):
+        for entry, (arg_strides, tile_sizes) in zip(flat_body, flat_strides):
             if not isinstance(entry, OpSpec):
                 result.append(copy.deepcopy(entry))
                 continue
 
             op_copy = copy.deepcopy(entry)
 
-            for arg, strides, tile_size in zip(op_copy.args, arg_strides, tile_sizes):
+            for arg_idx, (arg, strides, tile_size) in enumerate(
+                zip(op_copy.args, arg_strides, tile_sizes)
+            ):
                 if not strides:
                     continue
                 iter_offset = sum(
                     i * strides[s] for s in this_level_syms if s in strides
                 )
+                # Always copy the allocation dict for args that advance — even
+                # when iter_offset is 0 (first tile) — so each copy owns its
+                # allocation independently and downstream mutations cannot alias
+                # back to the template entry.
+                arg.allocation = dict(arg.allocation)
                 if iter_offset:
-                    arg.allocation = dict(arg.allocation)
                     # Advance whichever allocation key is present (hbm, pool, lx).
                     for alloc_key in ("pool", "hbm", "lx"):
                         if alloc_key in arg.allocation:
                             arg.allocation[alloc_key] += iter_offset
+                            logger.debug(
+                                "  iter=%d op=%s arg[%d] %s += %d → %d",
+                                i,
+                                entry.op,
+                                arg_idx,
+                                alloc_key,
+                                iter_offset,
+                                arg.allocation[alloc_key],
+                            )
                             break
                 # Replace device_size with the tile dimensions so the SDSC
                 # does not generate a backGap relative to the full tensor.
+                # Copy the list so each unrolled op owns its own device_size —
+                # shared mutable lists cause non-deterministic corruption when
+                # downstream code modifies device_size in-place on any copy.
                 if tile_size is not None:
-                    arg.device_size = tile_size
+                    arg.device_size = list(tile_size)
+                    logger.debug(
+                        "  iter=%d op=%s arg[%d] device_size=%s",
+                        i,
+                        entry.op,
+                        arg_idx,
+                        arg.device_size,
+                    )
 
             # Clear tiled_symbols: addresses are now concrete.
             op_copy.tiled_symbols = []
             result.append(op_copy)
 
     logger.debug(
-        "unrolled LoopSpec(count=%s) → %d flat copies", loop.count, len(result)
+        "unrolled LoopSpec(count=%s, syms=%s) → %d flat copies",
+        loop.count,
+        [str(s) for s in this_level_syms],
+        len(result),
     )
     return result
 
