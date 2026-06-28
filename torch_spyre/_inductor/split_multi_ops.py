@@ -51,7 +51,7 @@ _OP_TARGET_TABLE = {
 
 
 class _SplitOpsHandler(WrapperHandler):
-    """Intercept load() calls to redirect them to split intermediate buffers.
+    """Intercept load() and constant() calls to redirect to split intermediate buffers.
 
     Used by split_multi_ops to wrap the original inner_fn after intermediate buffers have
     been materialized.  Only buffer names are redirected; index expressions are left intact
@@ -62,14 +62,29 @@ class _SplitOpsHandler(WrapperHandler):
     scalars so SpyreOpFuncs can read them out of the RValue tree and place them in op_info.
 
     name_map: old_buf_name → new_intermediate_buf_name
+    constant_map: (fill_value, dtype) → materialized_const_buf_name (for constants that
+                  feed non-_OPS_WITH_CONSTANT_ARGS ops and were materialized as buffers)
     """
 
-    def __init__(self, inner, name_map: dict[str, str]):
+    def __init__(
+        self,
+        inner,
+        name_map: dict[str, str],
+        constant_map: dict[tuple, str] | None = None,
+    ):
         super().__init__(inner)
         self._name_map = name_map
+        self._constant_map = constant_map or {}
 
     def load(self, name, index):
         return super().load(self._name_map.get(name, name), index)
+
+    def constant(self, fill_value, dtype):
+        key = (fill_value, dtype)
+        if key in self._constant_map:
+            # Load from the materialized constant buffer at index 0 (0-dim tensor)
+            return super().load(self._constant_map[key], sympy.Integer(0))
+        return super().constant(fill_value, dtype)
 
 
 class _Val:
@@ -397,7 +412,7 @@ def _make_intermediate_bufs(
     gl,
     orig_node,
     final_op_name="",
-) -> None:
+) -> dict[tuple, str]:
     """Create intermediate buffers for operations.
 
     For each intermediate operation in a fused computation, this creates:
@@ -422,8 +437,12 @@ def _make_intermediate_bufs(
         orig_node: Original FX node being split
         final_op_name: Name of the final (consumer) op, used to skip constant
             materialization for _OPS_WITH_CONSTANT_ARGS.
+
+    Returns:
+        constant_map: Mapping from (fill_value, dtype) to materialized constant buffer name
     """
     bufs = []
+    constant_map = {}
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
 
@@ -455,15 +474,21 @@ def _make_intermediate_bufs(
                 fill_value, dtype=out_dtype, device="meta"
             )
             # Lower the FX node; run_node registers in gl.operations.
+            # For ExternKernel like SpyreConstantFallback, extract the raw buffer
+            # only for positioning — don't replace it with raw buffer in operations.
             tb = gl.run_node(new_node)
+            # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
+            # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data
-            # Set origins before moving (same as insert_restickify line 136).
-            new_buf.origins = OrderedSet([new_node])
-            # Move from auto-registered position to our desired index.
+            # Set origins using object.__setattr__ to work around dataclass frozen fields.
+            object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+            # Move the buffer to our desired position, then continue with it wrapped.
             gl.operations.remove(new_buf)
             operations.insert(insert_idx, new_buf)
-            gl.name_to_buffer[new_buf.get_name()] = new_buf
-            vid_to_bufname[vid] = new_buf.get_name()
+            buf_name = new_buf.get_name()
+            vid_to_bufname[vid] = buf_name
+            # Track this materialized constant for the handler's constant_map.
+            constant_map[(fill_value, out_dtype)] = buf_name
             bufs.append(new_buf)
             insert_idx += 1
             continue
@@ -488,11 +513,13 @@ def _make_intermediate_bufs(
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-        # Set origins on the buffer.
-        new_buf.origins = OrderedSet([new_node])
+        # Set origins using object.__setattr__ to work around dataclass frozen fields.
+        object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         vid_to_bufname[vid] = new_buf.get_name()
         bufs.append(new_buf)
         insert_idx += 1
+
+    return constant_map
 
 
 def _patch_original_buf(
@@ -500,6 +527,7 @@ def _patch_original_buf(
     orig_load_names: dict[int, str],
     vid_to_bufname: dict[int, str],
     operations: list,
+    constant_map: dict[tuple, str] | None = None,
 ) -> None:
     """Patch the original buffer's inner_fn to load from intermediate buffers.
 
@@ -508,16 +536,17 @@ def _patch_original_buf(
     intact — the original inner_fn recomputes them correctly from the live loop
     variables each time it is called.
 
-    Constants are NOT redirected: those that feed _OPS_WITH_CONSTANT_ARGS ops remain
-    as V.ops.constant() scalars (handled correctly by SpyreOpFuncs at codegen time);
-    those that feed other intermediate ops were already consumed by their own split
-    buffers, so the final op never sees them as constants.
+    Materialized constants (those not in _OPS_WITH_CONSTANT_ARGS) are redirected to load
+    from their constant buffers. Unmaterialized constants (those in _OPS_WITH_CONSTANT_ARGS)
+    are NOT redirected — they must remain as V.ops.constant() scalars so SpyreOpFuncs can
+    read them out of the RValue tree for SDSC codegen.
 
     Args:
         op: ComputedBuffer whose inner_fn is to be patched
         orig_load_names: vid → original buffer name (from load trace entries)
         vid_to_bufname: vid → current buffer name (updated by _make_intermediate_bufs)
         operations: list of operations in the graph
+        constant_map: (fill_value, dtype) → materialized_const_buf_name (from _make_intermediate_bufs)
     """
     # Build name_map: only include load-buffer redirections where the name changed.
     name_map = {
@@ -528,11 +557,14 @@ def _patch_original_buf(
 
     orig_inner = op.data.inner_fn
 
-    def new_inner_fn(*args, _nm=name_map, _orig=orig_inner):
-        with V.set_ops_handler(_SplitOpsHandler(V.ops, _nm)):
+    def new_inner_fn(*args, _nm=name_map, _cm=constant_map or {}, _orig=orig_inner):
+        with V.set_ops_handler(_SplitOpsHandler(V.ops, _nm, _cm)):
             return _orig(*args)
 
     new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
+    # Preserve origins from the original data object (dataclasses.replace creates
+    # a fresh object with empty origins; we must restore it).
+    object.__setattr__(new_data, "origins", op.data.origins)
     new_op = replace_computed_buffer_body(op, new_data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
@@ -704,7 +736,7 @@ def split_multi_ops(graph: GraphLowering):
         # map: orig_name → new_intermediate_name.
         orig_load_names = dict(bufname_map)
 
-        _make_intermediate_bufs(
+        constant_map = _make_intermediate_bufs(
             intermediate_ops,
             dtype_map,
             bufname_map,
@@ -721,9 +753,37 @@ def split_multi_ops(graph: GraphLowering):
             orig_load_names,
             bufname_map,
             operations,
+            constant_map=constant_map,
         )
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
             op.get_name(),
             len(intermediate_ops),
         )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Operations list after split_multi_ops:")
+            for i, buf in enumerate(operations):
+                has_origins = hasattr(buf, "origins") and buf.origins
+                logger.debug(
+                    "  [%d] %s (%s) - origins: %s",
+                    i,
+                    buf.get_name() if hasattr(buf, "get_name") else str(buf),
+                    type(buf).__name__,
+                    "yes" if has_origins else "EMPTY/MISSING",
+                )
+
+
+def ensure_all_buffers_have_origins(graph: GraphLowering) -> None:
+    """Ensure all buffers in the operations list have origins set.
+
+    Some buffers (especially ExternKernel subclasses) may not have origins set
+    by default. This pass ensures all buffers have at least an empty OrderedSet
+    for origins to prevent StopIteration errors downstream.
+    """
+    for buf in graph.operations:
+        if not hasattr(buf, "origins"):
+            object.__setattr__(buf, "origins", OrderedSet())
+        elif not buf.origins:
+            # Origins exists but is empty — set to empty OrderedSet for consistency
+            object.__setattr__(buf, "origins", OrderedSet())
