@@ -51,7 +51,9 @@ def _find_leaf_sched_node(node: BaseSchedulerNode):
     return None
 
 
-def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -> list:
+def _tiled_syms_for_sched_node_at_depth(
+    sched_node: SchedulerNode, depth: int, canonical_dims: set[int] | None = None
+) -> list:
     """Return the OpSpec iteration-space symbols tiled at ``depth``.
 
     Uses ``loop_tiled_dims[depth]`` and ``loop_tiled_reduction_dims[depth]``
@@ -84,15 +86,12 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
         return []
     dims_per_level: list[list[int]] = raw if raw else [[] for _ in raw_rdims]
     rdims_per_level: list[list[int]] = raw_rdims if raw_rdims else [[] for _ in raw]
-    if depth >= len(dims_per_level):
-        return []
     it_space = iteration_space(sched_node)
     keys = list(it_space.keys())
 
     # Build a map from host-range index → iteration-space key index.
-    # loop_tiled_dims is only stamped on ComputedBuffer ops (Pointwise/Reduction),
-    # so data.ranges is always present here.  The iteration space simply omits
-    # unit-size dims, so we walk ranges and count only non-unit entries.
+    # loop_tiled_dims stores coordinate positions (from _loop_var_to_ranges_pos).
+    # We need to map those to iteration-space indices by counting only non-unit ranges.
     host_to_it: dict[int, int] = {}
     it_idx = 0
     for host_idx, r in enumerate(ir_op.data.ranges):
@@ -100,9 +99,41 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
             host_to_it[host_idx] = it_idx
             it_idx += 1
 
+    logger.debug(
+        "_tiled_syms_for_sched_node_at_depth: depth=%d op=%s ranges=%s host_to_it=%s dims_per_level[%d]=%s keys=%s",
+        depth,
+        ir_op.get_operation_name(),
+        list(ir_op.data.ranges),
+        host_to_it,
+        depth,
+        dims_per_level[depth] if depth < len(dims_per_level) else "N/A",
+        keys,
+    )
+
     result = []
-    for d in dims_per_level[depth]:
+    # Use canonical_dims if provided (from the parent loop group), else fall back to this op's dims.
+    dims_at_depth = (
+        canonical_dims
+        if canonical_dims is not None
+        else (dims_per_level[depth] if depth < len(dims_per_level) else [])
+    )
+
+    for d in dims_at_depth:
+        # d is the coordinate position (from _loop_var_to_ranges_pos).
+        # Map it to iteration-space by finding which symbol is at ranges[d]
+        # and then finding that symbol's position in the iteration space.
+        if d >= len(ir_op.data.ranges):
+            continue
+        range_sym = ir_op.data.ranges[d]
+        # Find which iteration-space key corresponds to this range symbol
         mapped = host_to_it.get(d)
+        logger.debug(
+            "_tiled_syms_for_sched_node_at_depth: d=%s (ranges[%d]=%s) mapped=%s",
+            d,
+            d,
+            range_sym,
+            mapped,
+        )
         if mapped is not None and mapped < len(keys):
             result.append(keys[mapped])
 
@@ -437,14 +468,40 @@ class SuperDSCScheduling(BaseScheduling):
                         snode.codegen(index_vars)
 
         # Compute per-level tiled symbols for the outer (depth=0) LoopSpec.
-        # Find a leaf SchedulerNode to read loop_tiled_dims + iteration_space.
-        outer_tiled_syms: list = []
+        # Recursively collect all dims tiled at depth 0 from the entire subtree.
+        def collect_dims_recursive(n: BaseSchedulerNode, d: int) -> set[int]:
+            dims: set[int] = set()
+            for snode in n.get_nodes():
+                if isinstance(snode, SchedulerNode) and snode.node is not None:
+                    loop_info = getattr(snode.node, "loop_info", None)
+                    if loop_info and hasattr(loop_info, "loop_tiled_dims"):
+                        raw = loop_info.loop_tiled_dims
+                        if d < len(raw):
+                            dims.update(raw[d])
+                elif isinstance(snode, CountedLoopSchedulerNode):
+                    dims.update(collect_dims_recursive(snode, d))
+            return dims
+
+        tiled_dims_at_depth_0: set[int] = set()
+        ref_for_depth_0 = None
         for inner in inner_nodes:
             ref = _find_leaf_sched_node(inner)
             if ref is not None:
-                outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(ref, 0)
+                ref_for_depth_0 = ref
+                tiled_dims_at_depth_0.update(collect_dims_recursive(inner, 0))
                 break
 
+        outer_tiled_syms: list = []
+        if ref_for_depth_0 is not None:
+            outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(
+                ref_for_depth_0, 0, tiled_dims_at_depth_0
+            )
+
+        # NOTE: When split_multi_ops creates intermediate buffers, different ops
+        # in the loop may have different ranges. However, all ops in a single
+        # LoopSpec share the same iteration_space (from the first op that determined
+        # the loop structure). The tiled_symbols should reflect this shared iteration_space,
+        # not vary per-op. We use the computed tiled_syms from the reference op.
         kernel.wrap_op_specs_in_loop(
             node.loop_count,
             tiled_symbols=outer_tiled_syms,
@@ -503,12 +560,38 @@ class SuperDSCScheduling(BaseScheduling):
                     ]
                     snode.codegen(index_vars)
 
-        # Determine this level's tiled symbols using the IR's loop_tiled_dims[depth].
+        # Determine this level's tiled symbols by collecting dims tiled at this depth
+        # across all ops in node (including nested loops), then mapping to iteration-space symbols.
+        def collect_tiled_dims_recursive(n: BaseSchedulerNode, d: int) -> set[int]:
+            dims: set[int] = set()
+            for snode in n.get_nodes():
+                if isinstance(snode, SchedulerNode) and snode.node is not None:
+                    loop_info = getattr(snode.node, "loop_info", None)
+                    if loop_info and hasattr(loop_info, "loop_tiled_dims"):
+                        raw = loop_info.loop_tiled_dims
+                        if d < len(raw):
+                            dims.update(raw[d])
+                elif isinstance(snode, CountedLoopSchedulerNode):
+                    dims.update(collect_tiled_dims_recursive(snode, d))
+            return dims
+
+        tiled_dims_at_depth: set[int] = collect_tiled_dims_recursive(node, depth)
+
         ref_sched_node = _find_leaf_sched_node(node)
         level_syms = (
-            _tiled_syms_for_sched_node_at_depth(ref_sched_node, depth)
+            _tiled_syms_for_sched_node_at_depth(
+                ref_sched_node, depth, tiled_dims_at_depth
+            )
             if ref_sched_node is not None
             else []
+        )
+
+        logger.debug(
+            "_codegen_loop_body: depth=%d node.loop_count=%s tiled_dims_at_depth=%s level_syms=%s",
+            depth,
+            node.loop_count,
+            tiled_dims_at_depth,
+            [str(s) for s in level_syms],
         )
 
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
