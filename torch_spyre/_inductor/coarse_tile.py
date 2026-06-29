@@ -1525,15 +1525,23 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
         if not pstar_cands:
             pstar_cands = unmatched_all
         if len(pstar_cands) != 1:
-            raise RuntimeError(
-                f"_resize_device_layout: cannot uniquely identify the stick host dim "
-                f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
-                f"unmatched host dims={unmatched_all} "
-                f"(non-singleton candidates={pstar_cands}), "
-                f"non-stick device dims={matched_host}. "
-                f"This layout is not supported by the device-native reconstruction."
-            )
-        pstar = pstar_cands[0]
+            # When all remaining candidates are size-1 singletons they are
+            # interchangeable: ceil(1/eps)==1 for Pass 3 and new_host_size==1
+            # forces stride to -1 in Passes 3 and 4 regardless of which is
+            # chosen.  Pick the first to avoid a spurious error.
+            if all(old_host_size[p] == 1 for p in pstar_cands):
+                pstar = pstar_cands[0]
+            else:
+                raise RuntimeError(
+                    f"_resize_device_layout: cannot uniquely identify the stick host dim "
+                    f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
+                    f"unmatched host dims={unmatched_all} "
+                    f"(non-singleton candidates={pstar_cands}), "
+                    f"non-stick device dims={matched_host}. "
+                    f"This layout is not supported by the device-native reconstruction."
+                )
+        else:
+            pstar = pstar_cands[0]
 
     # Pass 2: update device_size and (if contiguous) stride_map for non-stick dims.
     for j, p in matched_host.items():
