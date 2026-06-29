@@ -581,8 +581,19 @@ class SpyreKernel(Kernel[CSEVariable]):
         all_tiled_dims = [d for level in raw_tiled_dims for d in level]
         all_tiled_red_dims = [d for level in raw_tiled_red_dims for d in level]
         it_space_keys = list(it_space.keys())
+
+        # Map host-range indices (from loop_tiled_dims) to iteration-space indices
+        # by filtering out unit-size ranges. loop_tiled_dims stores host-range
+        # positions; iteration_space skips unit-size ranges.
+        host_to_it: dict[int, int] = {}
+        it_idx = 0
+        for host_idx, r in enumerate(ir_node.data.ranges):
+            if int(r) != 1:
+                host_to_it[host_idx] = it_idx
+                it_idx += 1
+
         tiled_syms = [
-            it_space_keys[i] for i in all_tiled_dims if i < len(it_space_keys)
+            it_space_keys[host_to_it[i]] for i in all_tiled_dims if i in host_to_it
         ]
         # For reduction ops tiled over a reduction dimension, it_space (from
         # reads.ranges) has output-dim symbols first, then reduction-dim symbols.
@@ -592,9 +603,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             write_dep = next(iter(self.current_node.read_writes.writes), None)
             n_output_syms = len(write_dep.ranges) if write_dep is not None else 0
             tiled_syms += [
-                it_space_keys[n_output_syms + r]
+                it_space_keys[n_output_syms + host_to_it[n_output_syms + r]]
                 for r in all_tiled_red_dims
-                if n_output_syms + r < len(it_space_keys)
+                if (n_output_syms + r) in host_to_it
             ]
 
         # Collect (max, granularity) bounds for any symbolic iteration-space

@@ -292,15 +292,7 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
 
     operations = graph.operations
     for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-
-        # Get all hint IDs regardless of loop_var status (include loop-invariant hints).
-        # All ops in a scope should be grouped together even if some hints are
-        # loop-invariant for certain ops.
-        op_hints = getattr(op, "dim_hints", [])
-        all_hint_ids = frozenset(h.hint_id for h in op_hints)
-        key = all_hint_ids or None
+        key = _hint_key(op)
 
         if key is not None and key == current_key:
             current_ops.append(op)
@@ -1307,7 +1299,10 @@ def _stamp_group(
         return
 
     _validate_contiguous(ops, op_to_position, group_id)
-
+    # Filter out loop levels with count=1 (no actual tiling).
+    levels = [
+        (hint_id, count, is_red) for hint_id, count, is_red in levels if int(count) != 1
+    ]
     nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
     counts = [count for _, count, _ in levels]
 
@@ -1344,6 +1339,9 @@ def _stamp_group(
         op_tiled_dims: list[list[int]] = []
         op_tiled_reduction_dims: list[list[int]] = []
         for hint_id, count, is_reduction_level in levels:
+            # Skip loop levels with count=1 (no actual tiling).
+            if int(count) == 1:
+                continue
             if is_reduction_level:
                 rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
                 op_tiled_dims.append([])

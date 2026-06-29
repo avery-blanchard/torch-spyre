@@ -492,7 +492,7 @@ class SuperDSCScheduling(BaseScheduling):
                 break
 
         outer_tiled_syms: list = []
-        if ref_for_depth_0 is not None:
+        if ref_for_depth_0 is not None and int(node.loop_count) > 1:
             outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(
                 ref_for_depth_0, 0, tiled_dims_at_depth_0
             )
@@ -597,11 +597,14 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
+        # Only set tiled_symbols if this loop level actually tiles (count > 1).
+        # Loops with count=1 don't divide any dimension, so tiled_symbols should be empty.
+        tiled_syms_for_loop = level_syms if int(node.loop_count) > 1 else []
         kernel.op_specs.append(
             LoopSpec(
                 count=node.loop_count,
                 body=body,
-                tiled_symbols=level_syms,
+                tiled_symbols=tiled_syms_for_loop,
             )
         )
 
