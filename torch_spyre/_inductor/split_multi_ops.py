@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import dataclasses
 import sympy
 import torch
@@ -92,20 +93,24 @@ class _IntermediateOpHandler(WrapperHandler):
 
     Sits on top of _SplitOpsHandler in the handler stack.  When an intermediate
     op (e.g. to_dtype) was materialized into its own buffer by _make_intermediate_bufs,
-    this handler intercepts that op call and emits load(buf_name, last_index) instead
-    of executing the op inline — exactly as if the result had been a separately loaded
-    buffer all along.
+    this handler intercepts that op call and emits load(buf_name, _last_index) instead
+    of executing the op inline.
 
-    _last_index is updated on every load() call.  For pointwise fused ops all loads
-    in the same loop iteration share the same flat index, and an intermediate op always
-    follows the load of its input, so _last_index is always current when the intercept fires.
+    _last_index is updated on every load() call.  For Pointwise ComputedBuffers every
+    load in a loop iteration uses the same flat index, so _last_index is always current
+    when _default fires for an intermediate op.
 
-    op_map: op_name → buf_name (1-to-1 mapping for each materialized intermediate op).
+    Multiple ops of the same name (e.g. two to_dtype calls) are handled in call order:
+    op_queues maps op_name → deque[buf_name].  Each interception pops the front of the
+    deque, so the Nth interception of op X maps to the Nth materialized intermediate
+    buffer for X (deterministic because inner_fn replays in trace order).
+
+    op_queues: op_name → deque of materialized buf_names in trace order.
     """
 
-    def __init__(self, inner, op_map: dict[str, str]):
+    def __init__(self, inner, op_queues: dict[str, collections.deque]):
         super().__init__(inner)
-        self._op_map = op_map
+        self._op_queues = op_queues
         self._last_index = sympy.Integer(0)
 
     def load(self, name, index):
@@ -113,8 +118,9 @@ class _IntermediateOpHandler(WrapperHandler):
         return super().load(name, index)
 
     def _default(self, name, args, kwargs):
-        buf_name = self._op_map.get(name)
-        if buf_name:
+        queue = self._op_queues.get(name)
+        if queue:
+            buf_name = queue.popleft()
             return super().load(buf_name, self._last_index)
         return super()._default(name, args, kwargs)
 
@@ -444,7 +450,7 @@ def _make_intermediate_bufs(
     gl,
     orig_node,
     final_op_name="",
-) -> tuple[dict[tuple, str], dict[str, str]]:
+) -> tuple[dict[tuple, str], dict[str, collections.deque]]:
     """Create intermediate buffers for operations.
 
     For each intermediate operation in a fused computation, this creates:
@@ -472,10 +478,11 @@ def _make_intermediate_bufs(
 
     Returns:
         constant_map: Mapping from (fill_value, dtype) to materialized constant buffer name
+        op_queues: Mapping from op_name to deque of materialized buffer names in trace order
     """
     bufs = []
     constant_map = {}
-    op_map: dict[str, str] = {}
+    op_queues: dict[str, collections.deque] = {}
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
 
@@ -544,11 +551,14 @@ def _make_intermediate_bufs(
         vid_to_bufname[vid] = buf_name
         # Track materialized compute intermediates so _IntermediateOpHandler can
         # intercept inline calls to this op and load from the buffer instead.
-        op_map[op_name] = buf_name
+        # Use a deque so multiple ops of the same name are consumed in trace order.
+        if op_name not in op_queues:
+            op_queues[op_name] = collections.deque()
+        op_queues[op_name].append(buf_name)
         bufs.append(new_buf)
         insert_idx += 1
 
-    return constant_map, op_map
+    return constant_map, op_queues
 
 
 def _patch_original_buf(
@@ -557,7 +567,8 @@ def _patch_original_buf(
     vid_to_bufname: dict[int, str],
     operations: list,
     constant_map: dict[tuple, str] | None = None,
-    op_map: dict[str, str] | None = None,
+    op_queues: dict[str, collections.deque] | None = None,
+    load_redirects: dict[int, str] | None = None,
 ) -> None:
     """Patch the original buffer's inner_fn to load from intermediate buffers.
 
@@ -566,11 +577,11 @@ def _patch_original_buf(
       constant() → load(const_buf) for materialized scalar constants.
     - _IntermediateOpHandler: intercepts inlined compute ops (e.g. to_dtype)
       that were materialized into their own buffers and replaces them with
-      load(buf_name, last_index).
+      load(buf_name, index).  Multiple ops of the same name are consumed in
+      call order from per-name deques, matching the original trace order.
 
     Indices are never recomputed — the original inner_fn's index logic is
-    preserved exactly.  _IntermediateOpHandler tracks the last load index
-    (always current for pointwise ops) for use when intercepting compute ops.
+    preserved exactly.
 
     Args:
         op: ComputedBuffer whose inner_fn is to be patched
@@ -578,22 +589,38 @@ def _patch_original_buf(
         vid_to_bufname: vid → current buffer name (updated by _make_intermediate_bufs)
         operations: list of operations in the graph
         constant_map: (fill_value, dtype) → buf_name for materialized scalar constants
-        op_map: op_name → buf_name for materialized compute intermediates
+        op_queues: op_name → deque[buf_name] for materialized compute intermediates
+        load_redirects: vid → new_buf_name for compute-intermediate inputs that must
+            be redirected at the load level.  For each compute intermediate
+            (op_name, v_out, (v_in,...)) that was materialized into new_buf, maps
+            v_in → new_buf so _SplitOpsHandler redirects load(arg1_1) → load(buf3).
+            This removes the original input from get_read_writes() so validate_ops
+            sees a uniform ElementArrangement on the final buffer.
     """
-    # Build name_map: only include load-buffer redirections where the name changed.
+    # Base name_map from load vids whose buffer names changed (rare: constant
+    # materialization can update vid_to_bufname for load vids directly).
     name_map = {
         orig_load_names[v]: vid_to_bufname[v]
         for v in orig_load_names
         if vid_to_bufname.get(v) != orig_load_names[v]
     }
+    # For compute intermediates (e.g. to_dtype), redirect the input buffer load to the
+    # intermediate's output buffer so the original input is no longer a dependency.
+    for v_in, new_buf in (load_redirects or {}).items():
+        orig_name = orig_load_names[v_in]
+        name_map[orig_name] = new_buf
 
     orig_inner = op.data.inner_fn
     _cm = constant_map or {}
-    _om = op_map or {}
+    # Deep-copy the deques so each call to new_inner_fn starts with a fresh queue.
+    # (inner_fn may be called multiple times, e.g. during get_default_sizes_body.)
+    _oq_snapshot = {k: collections.deque(v) for k, v in (op_queues or {}).items()}
 
     def new_inner_fn(*args, _nm=name_map, _orig=orig_inner):
+        # Rebuild fresh deques from the snapshot for each invocation.
+        fresh_queues = {k: collections.deque(v) for k, v in _oq_snapshot.items()}
         inner = _SplitOpsHandler(V.ops, _nm, _cm)
-        with V.set_ops_handler(_IntermediateOpHandler(inner, _om)):
+        with V.set_ops_handler(_IntermediateOpHandler(inner, fresh_queues)):
             return _orig(*args)
 
     new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
@@ -771,7 +798,7 @@ def split_multi_ops(graph: GraphLowering):
         # map: orig_name → new_intermediate_name.
         orig_load_names = dict(bufname_map)
 
-        constant_map, op_map = _make_intermediate_bufs(
+        constant_map, op_queues = _make_intermediate_bufs(
             intermediate_ops,
             dtype_map,
             bufname_map,
@@ -783,13 +810,29 @@ def split_multi_ops(graph: GraphLowering):
             final_op_name=final_op_name,
         )
 
+        # For each compute intermediate, redirect its input load vids to its output
+        # buffer so the original input buffer is no longer a read dependency of the
+        # final buffer.  This fixes validate_ops when intermediate ops change dtype
+        # (e.g. to_dtype fp16→fp32 before an add) — without this redirect the final
+        # buffer still lists the fp16 input in get_read_writes(), causing a mismatch
+        # in ElementArrangement checks.
+        load_redirects: dict[int, str] = {}
+        for iop_name, iop_vid, iop_inputs, _ in intermediate_ops:
+            if iop_name == "constant":
+                continue
+            new_buf = bufname_map[iop_vid]
+            for v_in in iop_inputs:
+                if v_in in orig_load_names:
+                    load_redirects[v_in] = new_buf
+
         _patch_original_buf(
             op,
             orig_load_names,
             bufname_map,
             operations,
             constant_map=constant_map,
-            op_map=op_map,
+            op_queues=op_queues,
+            load_redirects=load_redirects,
         )
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
