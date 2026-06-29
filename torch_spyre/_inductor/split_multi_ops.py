@@ -100,13 +100,12 @@ class _IntermediateOpHandler(WrapperHandler):
     in the same loop iteration share the same flat index, and an intermediate op always
     follows the load of its input, so _last_index is always current when the intercept fires.
 
-    op_queue: op_name → ordered list of buf_names (consumed front-to-back to handle
-              multiple intermediates of the same op type in call order).
+    op_map: op_name → buf_name (1-to-1 mapping for each materialized intermediate op).
     """
 
-    def __init__(self, inner, op_queue: dict[str, list]):
+    def __init__(self, inner, op_map: dict[str, str]):
         super().__init__(inner)
-        self._op_queue = op_queue
+        self._op_map = op_map
         self._last_index = sympy.Integer(0)
 
     def load(self, name, index):
@@ -114,9 +113,8 @@ class _IntermediateOpHandler(WrapperHandler):
         return super().load(name, index)
 
     def _default(self, name, args, kwargs):
-        queue = self._op_queue.get(name)
-        if queue:
-            buf_name = queue.pop(0)
+        buf_name = self._op_map.get(name)
+        if buf_name:
             return super().load(buf_name, self._last_index)
         return super()._default(name, args, kwargs)
 
@@ -446,7 +444,7 @@ def _make_intermediate_bufs(
     gl,
     orig_node,
     final_op_name="",
-) -> tuple[dict[tuple, str], dict[str, list]]:
+) -> tuple[dict[tuple, str], dict[str, str]]:
     """Create intermediate buffers for operations.
 
     For each intermediate operation in a fused computation, this creates:
@@ -477,7 +475,7 @@ def _make_intermediate_bufs(
     """
     bufs = []
     constant_map = {}
-    op_queue: dict[str, list] = {}
+    op_map: dict[str, str] = {}
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
 
@@ -546,11 +544,11 @@ def _make_intermediate_bufs(
         vid_to_bufname[vid] = buf_name
         # Track materialized compute intermediates so _IntermediateOpHandler can
         # intercept inline calls to this op and load from the buffer instead.
-        op_queue.setdefault(op_name, []).append(buf_name)
+        op_map[op_name] = buf_name
         bufs.append(new_buf)
         insert_idx += 1
 
-    return constant_map, op_queue
+    return constant_map, op_map
 
 
 def _patch_original_buf(
@@ -559,7 +557,7 @@ def _patch_original_buf(
     vid_to_bufname: dict[int, str],
     operations: list,
     constant_map: dict[tuple, str] | None = None,
-    op_queue: dict[str, list] | None = None,
+    op_map: dict[str, str] | None = None,
 ) -> None:
     """Patch the original buffer's inner_fn to load from intermediate buffers.
 
@@ -580,7 +578,7 @@ def _patch_original_buf(
         vid_to_bufname: vid → current buffer name (updated by _make_intermediate_bufs)
         operations: list of operations in the graph
         constant_map: (fill_value, dtype) → buf_name for materialized scalar constants
-        op_queue: op_name → ordered list of buf_names for materialized compute intermediates
+        op_map: op_name → buf_name for materialized compute intermediates
     """
     # Build name_map: only include load-buffer redirections where the name changed.
     name_map = {
@@ -591,15 +589,11 @@ def _patch_original_buf(
 
     orig_inner = op.data.inner_fn
     _cm = constant_map or {}
-    # Keep the canonical op_queue as a template; new_inner_fn makes a fresh copy
-    # each call so _IntermediateOpHandler can pop from it without exhausting it.
-    _oq_template = {k: list(v) for k, v in (op_queue or {}).items()}
+    _om = op_map or {}
 
     def new_inner_fn(*args, _nm=name_map, _orig=orig_inner):
         inner = _SplitOpsHandler(V.ops, _nm, _cm)
-        with V.set_ops_handler(
-            _IntermediateOpHandler(inner, {k: list(v) for k, v in _oq_template.items()})
-        ):
+        with V.set_ops_handler(_IntermediateOpHandler(inner, _om)):
             return _orig(*args)
 
     new_data = dataclasses.replace(op.data, inner_fn=new_inner_fn)
@@ -777,7 +771,7 @@ def split_multi_ops(graph: GraphLowering):
         # map: orig_name → new_intermediate_name.
         orig_load_names = dict(bufname_map)
 
-        constant_map, op_queue = _make_intermediate_bufs(
+        constant_map, op_map = _make_intermediate_bufs(
             intermediate_ops,
             dtype_map,
             bufname_map,
@@ -795,7 +789,7 @@ def split_multi_ops(graph: GraphLowering):
             bufname_map,
             operations,
             constant_map=constant_map,
-            op_queue=op_queue,
+            op_map=op_map,
         )
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
