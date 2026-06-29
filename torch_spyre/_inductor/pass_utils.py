@@ -940,6 +940,9 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     nonstick_vars: set[sympy.Symbol] = set()
     for dc in coords:
         tensor_stick_vars = dc[-1].free_symbols
+        # If this tensor is sparse (stick coord is constant), skip it
+        if len(tensor_stick_vars) == 0:
+            continue
         stick_vars |= tensor_stick_vars
         for coord in dc[:-1]:
             nonstick_vars |= coord.free_symbols - tensor_stick_vars
