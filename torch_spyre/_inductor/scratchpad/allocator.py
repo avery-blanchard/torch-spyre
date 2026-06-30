@@ -74,15 +74,11 @@ def _would_produce_lx_back_gap(
     buf_name: str,
     uses: list[int],
 ) -> bool:
-    """Return True if pinning this buffer to LX would produce a backGapCore_.
+    """Check if pinning a buffer to LX would produce a backGapCore_.
 
-    A backGap fires in superdsc when device_size[d] > it_dim_size for any
-    device dimension d, where it_dim_size is the iteration range of the loop
-    symbol that indexes that dimension.  Hardware can apply backGap to HBM
-    but not to LX tensors, so any such buffer must stay in HBM.
-
-    ``uses`` is the liveness list from lifetimes: for a computed output this
-    includes the writer (index 0) and all readers; for a graph input only readers.
+    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
+    The backend supports backGap for HBM but not for LX, so buffers triggering
+    this condition must stay in HBM.
     """
     buf = graph.get_buffer(buf_name)
     stl = buf.layout.device_layout
@@ -98,12 +94,9 @@ def _would_produce_lx_back_gap(
                 coords = device_coordinates(stl, dep, None)
             except Exception:
                 continue
-            for d, coord_expr in enumerate(coords[:-1]):  # skip stick dim
+            for d, coord_expr in enumerate(coords[:-1]):
                 syms = coord_expr.free_symbols
                 if not syms:
-                    # Constant coordinate on a non-unit dimension: normalize_coordinates
-                    # injects a synthetic z variable with range=1, so it_dim_size=1
-                    # and the backGap condition fires whenever device_size[d] > 1.
                     if device_size[d] > 1:
                         return True
                     continue
