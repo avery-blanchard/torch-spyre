@@ -87,18 +87,23 @@ def get_indirect_stride_idx(arg: TensorArg) -> int | None:
 
 def get_indirect_dim_symbols(
     value_arg: TensorArg, index_arg: TensorArg, symbol_mapping: dict
-) -> set[Symbol]:
-    """Extract all free symbols from the index tensor's device coordinates.
+) -> list[Symbol]:
+    """Extract free symbols from the index tensor's device coordinates.
 
-    Returns the set of symbols that should be in the value tensor's dim_order
-    for the indirect dimension.
+    Iterates right-to-left through coordinates (excluding stick), collecting
+    free symbols in the order they appear.
     """
-    all_symbols: set[Symbol] = set()
-    for coord in index_arg.device_coordinates:
+    seen: set[Symbol] = set()
+    ordered: list[Symbol] = []
+    for i in range(len(index_arg.device_coordinates) - 2, -1, -1):
+        coord = index_arg.device_coordinates[i]
         if hasattr(coord, "free_symbols"):
             expr = coord.subs(symbol_mapping)
-            all_symbols.update(expr.free_symbols)
-    return all_symbols
+            for sym in expr.free_symbols:
+                if sym not in seen:
+                    seen.add(sym)
+                    ordered.append(sym)
+    return ordered
 
 
 def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
