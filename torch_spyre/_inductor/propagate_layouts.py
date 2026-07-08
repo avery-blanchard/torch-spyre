@@ -157,7 +157,13 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr, output, output_dep, c_size, c_stride, outermost_dim=None
+    stick_expr,
+    output,
+    output_dep,
+    c_size,
+    c_stride,
+    outermost_dim=None,
+    indirect_sizes=None,
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -166,15 +172,27 @@ def _output_stl_from_stick_expr(
     stick_size = get_elem_in_stick(output.dtype)
     if not is_stick_expr_offset_free(stick_expr, stick_size):
         return None
-    out_coords = host_coordinates(output, output_dep, None)
+    out_coords = host_coordinates(output, output_dep, indirect_sizes)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
     return _make_output_stl(
-        output, output_dep, c_size, c_stride, out_stick_dim, outermost_dim
+        output,
+        output_dep,
+        c_size,
+        c_stride,
+        out_stick_dim,
+        outermost_dim,
+        indirect_sizes,
     )
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim, outermost_dim=None
+    output,
+    output_dep,
+    c_size,
+    c_stride,
+    stick_dim,
+    outermost_dim=None,
+    indirect_sizes=None,
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
@@ -182,10 +200,10 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
-    out_coords = host_coordinates(output, output_dep, None)
+    out_coords = host_coordinates(output, output_dep, indirect_sizes)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-    coords = device_coordinates(stl, output_dep, None)
+    coords = device_coordinates(stl, output_dep, indirect_sizes)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
     return None
@@ -199,13 +217,14 @@ def _candidate_output_stls(
     stick_size: int,
     skip_stick_expr: sympy.Expr,
     outermost_dim=None,
+    indirect_sizes=None,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
     Skip the dim that already produces an unsupported stick.
     If outermost_dim is specified, all candidates must place it at device dim 0.
     """
-    out_coords = host_coordinates(output, output_dep, None)
+    out_coords = host_coordinates(output, output_dep, indirect_sizes)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
     result = []
@@ -216,7 +235,13 @@ def _candidate_output_stls(
             # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
         stl = _make_output_stl(
-            output, output_dep, c_size, c_stride, alt_stick_dim, outermost_dim
+            output,
+            output_dep,
+            c_size,
+            c_stride,
+            alt_stick_dim,
+            outermost_dim,
+            indirect_sizes,
         )
         if stl is not None:
             result.append(stl)
@@ -860,7 +885,15 @@ def _multi_arg_pointwise_layouts(
         return True
 
     def _try_stick_dim(stick_dim):
-        dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
+        # For indirect writes, recompute dim_order with ind_sizes so outermost_dim
+        # calculation is correct.
+        if outermost_dim is not None and ind_sizes:
+            coords_for_dim_order = host_coordinates(output, output_dep, ind_sizes)
+            dim_order = _compute_dim_order(
+                stick_dim, c_size, coords_for_dim_order, outermost_dim
+            )
+        else:
+            dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
         if _is_supported_layout(dim_order):
             results.append(
                 SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea)
