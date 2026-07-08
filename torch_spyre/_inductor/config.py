@@ -85,6 +85,16 @@ core_id_k_fast_emission: bool = (
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
+# Debugging aids: disable symbolic start addresses for index or value tensors
+# in indirect access (gather/scatter-style) ops, even when bundle_symbolic_args
+# is True. Each has no effect on tensors that aren't part of indirect access.
+disable_symbolic_args_index_tensor: bool = (
+    os.environ.get("DISABLE_SYMBOLIC_ARGS_INDEX_TENSOR", "0") == "1"
+)
+disable_symbolic_args_value_tensor: bool = (
+    os.environ.get("DISABLE_SYMBOLIC_ARGS_VALUE_TENSOR", "0") == "1"
+)
+
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
 # for the scf.for / affine.apply path.

@@ -18,6 +18,8 @@ import dataclasses
 from torch_spyre._C import encode_constant, DataFormats
 from sympy import Symbol
 
+from torch_spyre._inductor import config as _spyre_config
+
 
 @dataclasses.dataclass(frozen=True)
 class SymbolKind:
@@ -501,6 +503,23 @@ def generate_sdsc(
             arg_index=arg_index,
         )
 
+    # Tensor indices for which symbolic addressing is force-disabled via the
+    # DISABLE_SYMBOLIC_ARGS_INDEX_TENSOR / DISABLE_SYMBOLIC_ARGS_VALUE_TENSOR debug
+    # knobs, even though use_symbols is True overall. No effect when use_symbols
+    # is False (those tensors already bake concrete addresses).
+    value_tensor_indices = {
+        t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor
+    }
+    no_symbol_tensor_indices: set[int] = {
+        i
+        for i, t in enumerate(sdsc_spec.args)
+        if (t.is_index_tensor and _spyre_config.disable_symbolic_args_index_tensor)
+        or (
+            i in value_tensor_indices
+            and _spyre_config.disable_symbolic_args_value_tensor
+        )
+    }
+
     if use_symbols:
 
         def offset_as_symbol(s, kind: SymbolKind):
@@ -530,8 +549,11 @@ def generate_sdsc(
         # the symbols at that level that advance tensor i.  Empty list of dicts
         # (i.e. [{}] * n_levels or []) for non-tiled / lx tensors.
         affine_strides: list[list[dict]] = []
-        for tensor in sdsc_spec.args:
-            if "lx" in tensor.allocation:
+        for tensor_idx, tensor in enumerate(sdsc_spec.args):
+            if "lx" in tensor.allocation or tensor_idx in no_symbol_tensor_indices:
+                # Index/value tensors with symbolic addressing force-disabled are
+                # treated like lx tensors here: no symbol is registered and
+                # _start_addr_data falls back to baking a concrete address below.
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue
             nb = num_bytes(tensor.data_format)
@@ -666,12 +688,26 @@ def generate_sdsc(
                             )
                 affine_strides.append(per_level_strides)
 
-        def _start_addr_data(tensor):
+        def _start_addr_data(tensor, tensor_idx=None):
             # All per-core addresses were already registered by the per-tensor loop
             # above. Look them up using the same key scheme as offset_as_symbol.
             if "lx" in tensor.allocation:
                 return {
                     f"[{c}, 0, 0]": str(tensor.start_address)
+                    for c in range(sdsc_spec.num_cores)
+                }
+            if tensor_idx in no_symbol_tensor_indices:
+                # Index/value tensors with symbolic addressing force-disabled were
+                # skipped by offset_as_symbol above; bake the concrete address here,
+                # matching the use_symbols=False formula.
+                return {
+                    f"[{c}, 0, 0]": str(
+                        tensor.start_address
+                        + core_idx_to_slice_offset(
+                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                        )
+                        * num_bytes(tensor.data_format)
+                    )
                     for c in range(sdsc_spec.num_cores)
                 }
             nb = num_bytes(tensor.data_format)
@@ -720,7 +756,7 @@ def generate_sdsc(
         # symbols and local_symbols are not modified.
         affine_strides = [[{} for _ in tiled_symbols] for _ in sdsc_spec.args]
 
-        def _start_addr_data(tensor):
+        def _start_addr_data(tensor, tensor_idx=None):  # noqa: ARG001
             if "lx" in tensor.allocation:
                 return {
                     f"[{c}, 0, 0]": str(tensor.start_address)
@@ -857,7 +893,9 @@ def generate_sdsc(
                                     else "hbm",
                                     **(
                                         {"isStartAddrSymbolic_": 1}
-                                        if use_symbols and "lx" not in tensor.allocation
+                                        if use_symbols
+                                        and "lx" not in tensor.allocation
+                                        and i not in no_symbol_tensor_indices
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
@@ -886,7 +924,7 @@ def generate_sdsc(
                                             {"factor_": 1, "label_": "corelet"},
                                             {"factor_": 1, "label_": "time"},
                                         ],
-                                        "data_": _start_addr_data(tensor),
+                                        "data_": _start_addr_data(tensor, i),
                                     },
                                     **(
                                         {
