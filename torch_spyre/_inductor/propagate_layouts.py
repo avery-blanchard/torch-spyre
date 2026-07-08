@@ -121,10 +121,31 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def _compute_dim_order(stick_dim, size, coords):
-    """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
-    dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
-    dim_order += [d for d in range(len(size)) if d != stick_dim and coords[d] == 0]
+def _compute_dim_order(stick_dim, size, coords, outermost_dim=None):
+    """Order dimensions with stick_dim last, optionally placing outermost_dim first.
+
+    If outermost_dim is specified, it will be placed first (device dim 0) for
+    indirect-access constraints. Raises Unsupported if outermost_dim == stick_dim.
+    """
+    if outermost_dim is not None and outermost_dim == stick_dim:
+        raise Unsupported(
+            f"indirect access dimension {outermost_dim} cannot also be the stick dimension"
+        )
+
+    dim_order = []
+    if outermost_dim is not None:
+        dim_order.append(outermost_dim)
+
+    dim_order += [
+        d
+        for d in range(len(size))
+        if d != stick_dim and d != outermost_dim and coords[d] != 0
+    ]
+    dim_order += [
+        d
+        for d in range(len(size))
+        if d != stick_dim and d != outermost_dim and coords[d] == 0
+    ]
     dim_order += [stick_dim]
     return dim_order
 
@@ -136,7 +157,7 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr, output, output_dep, c_size, c_stride
+    stick_expr, output, output_dep, c_size, c_stride, outermost_dim=None
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -147,19 +168,22 @@ def _output_stl_from_stick_expr(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
+    return _make_output_stl(
+        output, output_dep, c_size, c_stride, out_stick_dim, outermost_dim
+    )
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim
+    output, output_dep, c_size, c_stride, stick_dim, outermost_dim=None
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
+    If outermost_dim is specified, places it as device dim 0 for indirect-access constraints.
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
     out_coords = host_coordinates(output, output_dep, None)
-    dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
+    dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
@@ -174,10 +198,12 @@ def _candidate_output_stls(
     c_stride: list,
     stick_size: int,
     skip_stick_expr: sympy.Expr,
+    outermost_dim=None,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
     Skip the dim that already produces an unsupported stick.
+    If outermost_dim is specified, all candidates must place it at device dim 0.
     """
     out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
@@ -189,7 +215,9 @@ def _candidate_output_stls(
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
-        stl = _make_output_stl(output, output_dep, c_size, c_stride, alt_stick_dim)
+        stl = _make_output_stl(
+            output, output_dep, c_size, c_stride, alt_stick_dim, outermost_dim
+        )
         if stl is not None:
             result.append(stl)
     return result
@@ -784,6 +812,19 @@ def _multi_arg_pointwise_layouts(
     # across all inputs and the output we can just propagate the device layout.
     in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
     out_coords = host_coordinates(output, output_dep, ind_sizes)
+
+    # For indirect writes (scatter/index_put), find the host dim carrying the
+    # indirect index and constrain it to be outermost (device dim 0).
+    outermost_dim = None
+    if output_dep.is_indirect() and ind_sizes:
+        for dim_idx, coord in enumerate(out_coords):
+            if hasattr(coord, "free_symbols"):
+                # Check if this coordinate contains an indirect symbol
+                indirect_syms = coord.free_symbols & set(ind_sizes.keys())
+                if indirect_syms:
+                    outermost_dim = dim_idx
+                    break
+
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -819,7 +860,7 @@ def _multi_arg_pointwise_layouts(
         return True
 
     def _try_stick_dim(stick_dim):
-        dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
+        dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
         if _is_supported_layout(dim_order):
             results.append(
                 SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea)
@@ -856,6 +897,12 @@ def _multi_arg_pointwise_layouts(
             _try_stick_dim(alt_stick_dim)
 
     if not results:
+        if outermost_dim is not None:
+            raise Unsupported(
+                f"Scatter ({op.get_name()}): cannot place indirect dimension {outermost_dim} "
+                f"as outermost device dimension; no valid output layout found. "
+                f"Output size={output.size}, coordinates={out_coords}"
+            )
         raise Unsupported(
             f"Multi-arg pointwise ({op.get_name()}): no supported output layout found "
             f"with size={output.size} and coordinates={out_coords}"
