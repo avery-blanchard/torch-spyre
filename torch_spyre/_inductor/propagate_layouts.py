@@ -867,6 +867,50 @@ def _multi_arg_pointwise_layouts(
                 if outermost_dim is not None:
                     break
 
+    # For scatter with indirect writes, return early with the constraint applied
+    if outermost_dim is not None:
+        stick_size = get_elem_in_stick(output.dtype)
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+
+        # Build device layout with outermost_dim at position 0
+        new_device_size = []
+        new_stride_map = []
+
+        # First add the outermost dimension (indirect-accessed)
+        new_device_size.append(c_size[outermost_dim])
+        new_stride_map.append(c_stride[outermost_dim])
+
+        # Then add other dimensions
+        for host_dim in range(len(c_size)):
+            if host_dim != outermost_dim:
+                new_device_size.append(c_size[host_dim])
+                new_stride_map.append(c_stride[host_dim])
+
+        # Finally add stick dimension
+        new_device_size.append(stick_size)
+        new_stride_map.append(1)
+
+        # Determine output EA
+        input_eas = set()
+        for arg in args:
+            if arg.layouts:
+                input_eas.add(arg.layouts[0].element_arrangement)
+        staggered_inputs = input_eas & STAGGERED_EAS
+        if len(staggered_inputs) == 1:
+            output_ea = next(iter(staggered_inputs))
+        else:
+            output_ea = ElementArrangement.STANDARD
+
+        stl = SpyreTensorLayout(
+            new_device_size,
+            new_stride_map,
+            get_device_dtype(output.dtype),
+            output_ea,
+        )
+        op.restick_cost_fn = AllSameNode.from_args(args, [stl], output_dep, op)
+        return [stl]
+
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -912,44 +956,14 @@ def _multi_arg_pointwise_layouts(
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
-        # For scatter with outermost_dim constraint, reconstruct device layout to place indirect dim first
-        if outermost_dim is not None:
-            stick_size = get_elem_in_stick(output.dtype)
-            new_device_size = []
-            new_stride_map = []
-
-            # First add the outermost dimension (indirect-accessed)
-            new_device_size.append(c_size[outermost_dim])
-            new_stride_map.append(c_stride[outermost_dim])
-
-            # Then add other non-stick dimensions
-            for host_dim in range(len(c_size)):
-                if host_dim != outermost_dim:
-                    new_device_size.append(c_size[host_dim])
-                    new_stride_map.append(c_stride[host_dim])
-
-            # Finally add stick dimension
-            new_device_size.append(stick_size)
-            new_stride_map.append(1)
-
-            results.append(
-                SpyreTensorLayout(
-                    new_device_size,
-                    new_stride_map,
-                    get_device_dtype(output.dtype),
-                    output_ea,
-                )
+        results.append(
+            SpyreTensorLayout(
+                template_stl.device_size,
+                template_stl.stride_map,
+                get_device_dtype(output.dtype),
+                output_ea,
             )
-            return results
-        else:
-            results.append(
-                SpyreTensorLayout(
-                    template_stl.device_size,
-                    template_stl.stride_map,
-                    get_device_dtype(output.dtype),
-                    output_ea,
-                )
-            )
+        )
     elif not stick_exprs:
         _try_stick_dim(-1)
     else:
