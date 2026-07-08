@@ -912,14 +912,44 @@ def _multi_arg_pointwise_layouts(
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
-        results.append(
-            SpyreTensorLayout(
-                template_stl.device_size,
-                template_stl.stride_map,
-                get_device_dtype(output.dtype),
-                output_ea,
+        # For scatter with outermost_dim constraint, reconstruct device layout to place indirect dim first
+        if outermost_dim is not None:
+            stick_size = get_elem_in_stick(output.dtype)
+            new_device_size = []
+            new_stride_map = []
+
+            # First add the outermost dimension (indirect-accessed)
+            new_device_size.append(c_size[outermost_dim])
+            new_stride_map.append(c_stride[outermost_dim])
+
+            # Then add other non-stick dimensions
+            for host_dim in range(len(c_size)):
+                if host_dim != outermost_dim:
+                    new_device_size.append(c_size[host_dim])
+                    new_stride_map.append(c_stride[host_dim])
+
+            # Finally add stick dimension
+            new_device_size.append(stick_size)
+            new_stride_map.append(1)
+
+            results.append(
+                SpyreTensorLayout(
+                    new_device_size,
+                    new_stride_map,
+                    get_device_dtype(output.dtype),
+                    output_ea,
+                )
             )
-        )
+            return results
+        else:
+            results.append(
+                SpyreTensorLayout(
+                    template_stl.device_size,
+                    template_stl.stride_map,
+                    get_device_dtype(output.dtype),
+                    output_ea,
+                )
+            )
     elif not stick_exprs:
         _try_stick_dim(-1)
     else:
