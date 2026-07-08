@@ -842,12 +842,21 @@ def _multi_arg_pointwise_layouts(
     # indirect index and constrain it to be outermost (device dim 0).
     outermost_dim = None
     if output_dep.is_indirect() and ind_sizes:
+        logger.info(
+            f"DEBUG: Scatter detected. output_dep={output_dep}, ind_sizes={ind_sizes}"
+        )
+        logger.info(f"DEBUG: out_coords={out_coords}")
         for dim_idx, coord in enumerate(out_coords):
+            logger.info(
+                f"DEBUG: dim_idx={dim_idx}, coord={coord}, free_symbols={getattr(coord, 'free_symbols', 'N/A')}"
+            )
             if hasattr(coord, "free_symbols"):
                 # Check if this coordinate contains an indirect symbol
                 indirect_syms = coord.free_symbols & set(ind_sizes.keys())
+                logger.info(f"DEBUG: indirect_syms={indirect_syms}")
                 if indirect_syms:
                     outermost_dim = dim_idx
+                    logger.info(f"DEBUG: Found outermost_dim={outermost_dim}")
                     break
 
     can_use_same_layout = True
@@ -892,12 +901,24 @@ def _multi_arg_pointwise_layouts(
             dim_order = _compute_dim_order(
                 stick_dim, c_size, coords_for_dim_order, outermost_dim
             )
+            logger.info(
+                f"DEBUG _try_stick_dim: stick_dim={stick_dim}, outermost_dim={outermost_dim}, coords_for_dim_order={coords_for_dim_order}, dim_order={dim_order}"
+            )
         else:
             dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
-        if _is_supported_layout(dim_order):
-            results.append(
-                SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea)
+            logger.info(
+                f"DEBUG _try_stick_dim: (no indirect) stick_dim={stick_dim}, outermost_dim={outermost_dim}, dim_order={dim_order}"
             )
+        if _is_supported_layout(dim_order):
+            stl = SpyreTensorLayout(
+                c_size, c_stride, output.dtype, dim_order, output_ea
+            )
+            logger.info(
+                f"DEBUG: Created STL with dim_order={dim_order}, device_size={stl.device_size}, stride_map={stl.stride_map}"
+            )
+            coords = device_coordinates(stl, output_dep, ind_sizes)
+            logger.info(f"DEBUG: device_coordinates from STL={coords}")
+            results.append(stl)
 
     results: list[SpyreTensorLayout] = []
 
