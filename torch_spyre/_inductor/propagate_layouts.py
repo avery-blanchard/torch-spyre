@@ -841,22 +841,30 @@ def _multi_arg_pointwise_layouts(
     # For indirect writes (scatter/index_put), find the host dim carrying the
     # indirect index and constrain it to be outermost (device dim 0).
     outermost_dim = None
-    if output_dep.is_indirect() and ind_sizes:
-        logger.info(
-            f"DEBUG: Scatter detected. output_dep={output_dep}, ind_sizes={ind_sizes}"
-        )
-        logger.info(f"DEBUG: out_coords={out_coords}")
-        for dim_idx, coord in enumerate(out_coords):
-            logger.info(
-                f"DEBUG: dim_idx={dim_idx}, coord={coord}, free_symbols={getattr(coord, 'free_symbols', 'N/A')}"
-            )
-            if hasattr(coord, "free_symbols"):
-                # Check if this coordinate contains an indirect symbol
-                indirect_syms = coord.free_symbols & set(ind_sizes.keys())
-                logger.info(f"DEBUG: indirect_syms={indirect_syms}")
-                if indirect_syms:
-                    outermost_dim = dim_idx
-                    logger.info(f"DEBUG: Found outermost_dim={outermost_dim}")
+    if output_dep.is_indirect():
+        # Get the indirect symbols (those not in output_dep.ranges, i.e., not loop vars)
+        loop_vars = set(output_dep.ranges.keys())
+        indirect_syms = output_dep.index.free_symbols - loop_vars
+        if indirect_syms:
+            # The stride coefficient of the indirect symbol tells us which dim it maps to
+            # For index = d1 + 256*tmp0, coefficient of tmp0 is 256
+            # We need to find which stride equals 256 (or divide by it to get coeff)
+            for indirect_sym in indirect_syms:
+                # Find the stride of the term containing this indirect symbol
+                indirect_coeff = None
+                terms = output_dep.index.as_coefficients_dict()
+                for term, coeff in terms.items():
+                    if term.has(indirect_sym):
+                        indirect_coeff = coeff
+                        break
+                if indirect_coeff is not None:
+                    # Match this coefficient to a host dimension's stride
+                    c_stride = [concretize_expr(s) for s in output.stride]
+                    for dim_idx, stride in enumerate(c_stride):
+                        if stride == indirect_coeff:
+                            outermost_dim = dim_idx
+                            break
+                if outermost_dim is not None:
                     break
 
     can_use_same_layout = True
@@ -894,31 +902,11 @@ def _multi_arg_pointwise_layouts(
         return True
 
     def _try_stick_dim(stick_dim):
-        # For indirect writes, recompute dim_order with ind_sizes so outermost_dim
-        # calculation is correct.
-        if outermost_dim is not None and ind_sizes:
-            coords_for_dim_order = host_coordinates(output, output_dep, ind_sizes)
-            dim_order = _compute_dim_order(
-                stick_dim, c_size, coords_for_dim_order, outermost_dim
-            )
-            logger.info(
-                f"DEBUG _try_stick_dim: stick_dim={stick_dim}, outermost_dim={outermost_dim}, coords_for_dim_order={coords_for_dim_order}, dim_order={dim_order}"
-            )
-        else:
-            dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
-            logger.info(
-                f"DEBUG _try_stick_dim: (no indirect) stick_dim={stick_dim}, outermost_dim={outermost_dim}, dim_order={dim_order}"
-            )
+        dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
         if _is_supported_layout(dim_order):
-            stl = SpyreTensorLayout(
-                c_size, c_stride, output.dtype, dim_order, output_ea
+            results.append(
+                SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea)
             )
-            logger.info(
-                f"DEBUG: Created STL with dim_order={dim_order}, device_size={stl.device_size}, stride_map={stl.stride_map}"
-            )
-            coords = device_coordinates(stl, output_dep, ind_sizes)
-            logger.info(f"DEBUG: device_coordinates from STL={coords}")
-            results.append(stl)
 
     results: list[SpyreTensorLayout] = []
 
@@ -1339,6 +1327,20 @@ def propagate_spyre_tensor_layouts(
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+
+                # For scatter ops with indirect writes, ensure the indirect dimension
+                # is outermost in the device layout by recomputing with the constraint
+                from torch._inductor.ir import Scatter
+
+                if isinstance(op.data, Scatter) and output_dep.is_indirect():
+                    target_layout = target.get_layout()
+                    if isinstance(target_layout, FixedLayout):
+                        # Recompute layouts with the scatter constraint
+                        layouts = _multi_arg_pointwise_layouts(
+                            op, target_layout, output_dep, args
+                        )
+                        if layouts:
+                            target_stl = layouts[0]
 
                 # Find an alternative layout if the write has an unsupported stick
                 # expression (e.g. offset like v+32). Force the optimizer to use
