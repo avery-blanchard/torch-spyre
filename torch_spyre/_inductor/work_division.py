@@ -624,11 +624,10 @@ def apply_splits(
     splits: dict,
     output_td: TensorDep,
 ) -> None:
-    """Commit splits to op.
+    """Commit splits to op (op_it_space_splits only; core assignment done later).
 
-    Always stores ``op.op_core_to_slice_mapping`` (including the single-core
-    case where the product of splits is 1).  ``op.op_it_space_splits`` is only
-    set when more than one core is used.
+    Sets ``op.op_it_space_splits`` when multi-core. Core assignment via
+    ``op_core_to_slice_mapping`` is handled by assign_core_splits() post-pass.
     """
     # Ensure splits has entries for all dims (defaults to 1 for unsplit dims).
     # This matches the structure guaranteed by multi_dim_iteration_space_split.
@@ -636,10 +635,6 @@ def apply_splits(
     full_splits = {sym: splits.get(sym, 1) for sym in it_space}
 
     num_cores = math.prod(full_splits.values())
-    op.op_core_to_slice_mapping = compute_core_to_slice_mapping(
-        op, it_space, full_splits, num_cores
-    )
-
     if num_cores <= 1:
         return
 
@@ -1389,6 +1384,27 @@ def work_distribution(
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
         elif isinstance(op.data, Reduction):
             divide_reduction_op(op, args, max_cores, work_distribution_pass)
+
+
+def assign_core_splits(graph: GraphLowering) -> None:
+    """Assign core-to-slice mappings to all ComputedBuffer ops.
+
+    Runs as a post-processing step after span_reduction, cost_model_matmul_division,
+    and work_distribution. Computes op_core_to_slice_mapping for every op based on
+    its op_it_space_splits (set by the work_division passes).
+    """
+    operations = graph.operations
+    for op in _iter_computed_buffers(operations):
+        # Recover splits from op_it_space_splits (set by earlier passes if multi-core)
+        splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+
+        it_space = iteration_space_from_op(op)
+        full_splits = {sym: splits[0].get(sym, 1) for sym in it_space}
+
+        num_cores = math.prod(full_splits.values())
+        op.op_core_to_slice_mapping = compute_core_to_slice_mapping(
+            op, it_space, full_splits, num_cores
+        )
 
 
 def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:

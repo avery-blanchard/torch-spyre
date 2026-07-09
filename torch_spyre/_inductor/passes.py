@@ -69,6 +69,7 @@ from .work_division import (
     span_reduction,
     work_distribution,
     cost_model_matmul_division,
+    assign_core_splits,
 )
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad.allocator import (
@@ -303,6 +304,7 @@ def _distribute_work(graph: GraphLowering) -> None:
     # those so every op is divided by exactly one of the two passes.
     preassigned_ops = cost_model_matmul_division(graph)
     work_distribution(graph, preassigned_ops)
+    assign_core_splits(graph)
 
 
 @_runs(scratchpad_planning)
