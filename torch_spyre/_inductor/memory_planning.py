@@ -223,8 +223,18 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             and id(layout.allocation) not in io_alloc_ids
         )
 
+    # Buffers read by Fallback/Extern/Nop nodes must stay Python-side tensors.
+    fallback_read = {
+        dep.name
+        for node in flat_nodes
+        if isinstance(node, _kernel_arg_types)
+        for dep in node.read_writes.reads
+    }
+
     intermediates = {
-        name for name in (written & read) - io_names if _is_intermediate(name)
+        name
+        for name in (written & read) - io_names - fallback_read
+        if _is_intermediate(name)
     }
     if not intermediates:
         V.graph.pool_size = 0
@@ -233,7 +243,12 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
     # Sort by start step so the allocator processes tensors in execution order.
-    sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
+    # Tie-break on (end_step, name) for determinism:
+    def _alloc_sort_key(item: tuple[str, tuple[int, int]]) -> tuple[int, int, str]:
+        name, (start, end) = item
+        return (start, end, name)
+
+    sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
     allocator = Allocator(SEGMENT_SIZE)
 
