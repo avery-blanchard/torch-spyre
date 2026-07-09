@@ -47,10 +47,7 @@ from .pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
-    _get_core_to_slice_mapping,
-    _is_matmul_op,
-    _k_fast_core_to_slice_mapping,
-    _should_use_k_fast_mapping,
+    compute_core_to_slice_mapping,
 )
 from .propagate_hints import get_op_hints
 from typing import Callable
@@ -638,16 +635,10 @@ def apply_splits(
     it_space = iteration_space_from_op(op)
     full_splits = {sym: splits.get(sym, 1) for sym in it_space}
 
-    is_matmul = _is_matmul_op(op)
     num_cores = math.prod(full_splits.values())
-    if _should_use_k_fast_mapping(is_matmul, it_space, full_splits):
-        op.op_core_to_slice_mapping = _k_fast_core_to_slice_mapping(
-            it_space, full_splits, num_cores
-        )
-    else:
-        op.op_core_to_slice_mapping = _get_core_to_slice_mapping(
-            it_space, full_splits, num_cores
-        )
+    op.op_core_to_slice_mapping = compute_core_to_slice_mapping(
+        op, it_space, full_splits, num_cores
+    )
 
     if num_cores <= 1:
         return
@@ -1306,13 +1297,12 @@ def divide_reduction_op(
 
     # Currently we support Topk for k<=4, which can be handled efficiently on single core
     # TODO: Modification will be required to enable Topk for k>4
-    if red.reduction_type in TOPK_OPS:
-        if not config.ignore_work_division_hints and _has_work_div_hint(op):
+    if red.reduction_type in TOPK_OPS and _has_work_div_hint(op):
+        if not config.ignore_work_division_hints:
             logger.warning(
                 f"work_division_hint: {op.get_name()} ignores work_div hint "
                 f"because TOPK reductions run single-core."
             )
-        return
 
     pass_fn(op, args, max_cores)
 

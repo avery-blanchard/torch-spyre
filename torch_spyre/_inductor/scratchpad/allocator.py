@@ -32,11 +32,9 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.dependencies import ReadWrites
 
 from torch_spyre._inductor.pass_utils import (
-    _get_core_to_slice_mapping,
     _is_matmul_op,
-    _k_fast_core_to_slice_mapping,
-    _should_use_k_fast_mapping,
     apply_splits_from_index_coeff,
+    compute_core_to_slice_mapping,
     concretize_expr,
     device_coordinates,
     iteration_space_from_op,
@@ -510,10 +508,7 @@ def _recompute_core_to_slice(
     # Ensure per_sym has entries for all dims (defaults to 1 for unsplit dims).
     full_per_sym = {sym: per_sym.get(sym, 1) for sym in it_space}
     num_cores = math.prod(full_per_sym.values())
-    is_matmul = _is_matmul_op(op)
-    if _should_use_k_fast_mapping(is_matmul, it_space, full_per_sym):
-        return _k_fast_core_to_slice_mapping(it_space, full_per_sym, num_cores)
-    return _get_core_to_slice_mapping(it_space, full_per_sym, num_cores)
+    return compute_core_to_slice_mapping(op, it_space, full_per_sym, num_cores)
 
 
 def _output_stride_to_device_size(op: Operation) -> dict[int, int]:

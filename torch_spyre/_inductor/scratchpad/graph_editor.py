@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 from torch.fx.graph import Graph
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
+
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
+    compute_core_to_slice_mapping,
     copy_op_metadata,
     iteration_space_from_op,
     splits_by_index_coeff,
@@ -218,6 +222,22 @@ class GraphEditor:
         # An output clone copies the produced buffer 1:1 (same shape/layout), so
         # the consumer's output splits transfer directly without re-keying.
         new_com_buf.op_it_space_splits = (clone_out_splits, {})
+
+        # Keep op_core_to_slice_mapping in sync with op_it_space_splits -- the
+        # kernel prefers the stored mapping and only re-derives it from
+        # op_it_space_splits when unset, so a clone missing this attr would
+        # silently fall back to independently re-derived (and possibly
+        # inconsistent) core assignment.
+        clone_it_space = iteration_space_from_op(new_com_buf)
+        full_clone_splits = {
+            sym: clone_out_splits.get(sym, 1) for sym in clone_it_space
+        }
+        new_com_buf.op_core_to_slice_mapping = compute_core_to_slice_mapping(
+            new_com_buf,
+            clone_it_space,
+            full_clone_splits,
+            math.prod(full_clone_splits.values()),
+        )
 
         if input:
             # Step 3: Update self.graph.name_to_users (a list of TensorBox), e.g., existing users of

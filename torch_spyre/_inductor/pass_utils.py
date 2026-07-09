@@ -1291,6 +1291,24 @@ def _is_matmul_op(op: Operation) -> bool:
     )
 
 
+def compute_core_to_slice_mapping(
+    op: Operation,
+    iteration_space: dict,
+    dim_splits: dict[sympy.Symbol, int],
+    num_cores: int,
+) -> dict[str, Expr]:
+    """Single source of truth for the k_fast-vs-default core-mapping dispatch.
+
+    Used by every producer of ``op.op_core_to_slice_mapping`` (work division,
+    scratchpad re-search) and by codegen's fallback path, so the gating
+    decision (`_should_use_k_fast_mapping`) can't drift between them.
+    """
+    is_matmul = _is_matmul_op(op)
+    if _should_use_k_fast_mapping(is_matmul, iteration_space, dim_splits):
+        return _k_fast_core_to_slice_mapping(iteration_space, dim_splits, num_cores)
+    return _get_core_to_slice_mapping(iteration_space, dim_splits, num_cores)
+
+
 # TODO: refactor core assignment so the LX planner consumes determined
 # assignments instead of re-deriving them here.
 def _per_core_view_on_buf(
@@ -1479,12 +1497,9 @@ def _per_core_view_on_buf(
     # uses (_should_use_k_fast_mapping), so K-fast matmul ops compare
     # under the K-cohort-adjacent ordering they will actually emit.
     num_cores = int(math.prod(per_sym.values()))
-    is_matmul = _is_matmul_op(op)
-    if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
-        _mapping_func = _k_fast_core_to_slice_mapping
-    else:
-        _mapping_func = _get_core_to_slice_mapping
-    core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
+    core_to_slot_by_name = compute_core_to_slice_mapping(
+        op, iter_space, per_sym, num_cores
+    )
     # Re-key by the buffer's device-dim index (canonical) instead of the op's
     # iter symbol name. Two ops with the same physical per-core slicing on
     # this buffer compare equal even if they name their iter axes differently

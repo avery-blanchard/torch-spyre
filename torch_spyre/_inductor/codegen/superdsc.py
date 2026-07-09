@@ -853,25 +853,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
-    if op_spec.core_to_slice_mapping is not None:
-        # Re-key stored mapping from original symbol names to SDSC dim labels.
-        core_id_to_work_slice = {
-            str(symbol_mapping[sym]): op_spec.core_to_slice_mapping[str(sym)]
-            for sym in op_spec.iteration_space
-            if sym in symbol_mapping and str(sym) in op_spec.core_to_slice_mapping
-        }
-        # Dims injected by parse_op_spec (mb_sym, stick_sym, padding dims) have
-        # split=1; _get_core_to_slice_mapping would emit Integer(0) for them.
-        for extra_dim in set(dim_splits) - set(core_id_to_work_slice):
-            core_id_to_work_slice[str(extra_dim)] = Integer(0)
-    elif _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
-        core_id_to_work_slice = _k_fast_core_to_slice_mapping(
-            sdsc_iteration_space, dim_splits, num_cores
-        )
-    else:
-        core_id_to_work_slice = _get_core_to_slice_mapping(
-            sdsc_iteration_space, dim_splits, num_cores
-        )
+    assert op_spec.core_to_slice_mapping is not None, (
+        "core_to_slice_mapping must be set by work_division (span_reduction_pass, "
+        "cost_model_matmul_division, or work_distribution_pass call apply_splits)"
+    )
+    # Re-key stored mapping from original symbol names to SDSC dim labels.
+    core_id_to_work_slice = {
+        str(symbol_mapping[sym]): op_spec.core_to_slice_mapping[str(sym)]
+        for sym in op_spec.iteration_space
+        if sym in symbol_mapping and str(sym) in op_spec.core_to_slice_mapping
+    }
+    # Dims injected by parse_op_spec (mb_sym, stick_sym, padding dims) have
+    # split=1; _get_core_to_slice_mapping would emit Integer(0) for them.
+    for extra_dim in set(dim_splits) - set(core_id_to_work_slice):
+        core_id_to_work_slice[str(extra_dim)] = Integer(0)
 
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
