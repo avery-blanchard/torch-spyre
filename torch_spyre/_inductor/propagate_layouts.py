@@ -873,24 +873,6 @@ def _multi_arg_pointwise_layouts(
         c_size = [concretize_expr(s) for s in output.size]
         c_stride = [concretize_expr(s) for s in output.stride]
 
-        # Build device layout with outermost_dim at position 0
-        new_device_size = []
-        new_stride_map = []
-
-        # First add the outermost dimension (indirect-accessed)
-        new_device_size.append(c_size[outermost_dim])
-        new_stride_map.append(c_stride[outermost_dim])
-
-        # Then add other dimensions
-        for host_dim in range(len(c_size)):
-            if host_dim != outermost_dim:
-                new_device_size.append(c_size[host_dim])
-                new_stride_map.append(c_stride[host_dim])
-
-        # Finally add stick dimension
-        new_device_size.append(stick_size)
-        new_stride_map.append(1)
-
         # Determine output EA
         input_eas = set()
         for arg in args:
@@ -902,14 +884,36 @@ def _multi_arg_pointwise_layouts(
         else:
             output_ea = ElementArrangement.STANDARD
 
-        stl = SpyreTensorLayout(
-            new_device_size,
-            new_stride_map,
-            get_device_dtype(output.dtype),
-            output_ea,
-        )
-        op.restick_cost_fn = AllSameNode.from_args(args, [stl], output_dep, op)
-        return [stl]
+        # Try each valid stick dimension with the outermost_dim constraint
+        for candidate_stick_dim in range(len(c_size)):
+            if candidate_stick_dim == outermost_dim:
+                continue
+            if concretize_expr(output.size[candidate_stick_dim]) % stick_size != 0:
+                continue
+            # Compute dim_order with outermost_dim first and candidate_stick_dim last
+            dim_order = _compute_dim_order(
+                candidate_stick_dim, c_size, out_coords, outermost_dim
+            )
+            # Compute device_size and stride_map from host layout and dim_order
+            # dim_order maps host dims to device dims, with stick_dim as the last host dim
+            device_size = [c_size[d] for d in dim_order]  # Reorder all host dims
+            stick_count = (c_size[candidate_stick_dim] + stick_size - 1) // stick_size
+            device_size[-1] = stick_count  # Replace stick_dim size with stick_count
+            device_size.append(stick_size)  # Add elems_per_stick
+            stride_map = [c_stride[d] for d in dim_order]  # Reorder all host strides
+            stride_map[-1] = stick_size  # Replace stick_dim stride with stick_size
+            stride_map.append(1)  # Add final stride of 1
+            # Use constructor 3 with device_size and stride_map
+            stl = SpyreTensorLayout(
+                device_size, stride_map, get_device_dtype(output.dtype)
+            )
+            # Verify the stick expression is offset-free
+            coords = device_coordinates(stl, output_dep, ind_sizes)
+            if is_stick_expr_offset_free(coords[-1], stick_size):
+                if output_ea != ElementArrangement.STANDARD:
+                    stl = _rescale_stl_for_dtype(stl, output.dtype, output_ea)
+                op.restick_cost_fn = AllSameNode.from_args(args, [stl], output_dep, op)
+                return [stl]
 
     can_use_same_layout = True
 
