@@ -122,20 +122,14 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
 
 
 def _compute_dim_order(stick_dim, size, coords, outermost_dim=None):
-    """Order dimensions with stick_dim last, optionally placing outermost_dim first.
-
-    If outermost_dim is specified, it will be placed first (device dim 0) for
-    indirect-access constraints. Raises Unsupported if outermost_dim == stick_dim.
-    """
+    """Order dimensions with stick_dim last, optionally placing outermost_dim first."""
     if outermost_dim is not None and outermost_dim == stick_dim:
         raise Unsupported(
             f"indirect access dimension {outermost_dim} cannot also be the stick dimension"
         )
-
     dim_order = []
     if outermost_dim is not None:
         dim_order.append(outermost_dim)
-
     dim_order += [
         d
         for d in range(len(size))
@@ -157,13 +151,7 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr,
-    output,
-    output_dep,
-    c_size,
-    c_stride,
-    outermost_dim=None,
-    indirect_sizes=None,
+    stick_expr, output, output_dep, c_size, c_stride
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -172,38 +160,23 @@ def _output_stl_from_stick_expr(
     stick_size = get_elem_in_stick(output.dtype)
     if not is_stick_expr_offset_free(stick_expr, stick_size):
         return None
-    out_coords = host_coordinates(output, output_dep, indirect_sizes)
+    out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(
-        output,
-        output_dep,
-        c_size,
-        c_stride,
-        out_stick_dim,
-        outermost_dim,
-        indirect_sizes,
-    )
+    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
 
 
 def _make_output_stl(
-    output,
-    output_dep,
-    c_size,
-    c_stride,
-    stick_dim,
-    outermost_dim=None,
-    indirect_sizes=None,
+    output, output_dep, c_size, c_stride, stick_dim
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
-    If outermost_dim is specified, places it as device dim 0 for indirect-access constraints.
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
-    out_coords = host_coordinates(output, output_dep, indirect_sizes)
-    dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
+    out_coords = host_coordinates(output, output_dep, None)
+    dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-    coords = device_coordinates(stl, output_dep, indirect_sizes)
+    coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
     return None
@@ -216,15 +189,12 @@ def _candidate_output_stls(
     c_stride: list,
     stick_size: int,
     skip_stick_expr: sympy.Expr,
-    outermost_dim=None,
-    indirect_sizes=None,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
     Skip the dim that already produces an unsupported stick.
-    If outermost_dim is specified, all candidates must place it at device dim 0.
     """
-    out_coords = host_coordinates(output, output_dep, indirect_sizes)
+    out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
     result = []
@@ -232,17 +202,8 @@ def _candidate_output_stls(
         if alt_stick_dim == skip_dim:
             continue
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
-        stl = _make_output_stl(
-            output,
-            output_dep,
-            c_size,
-            c_stride,
-            alt_stick_dim,
-            outermost_dim,
-            indirect_sizes,
-        )
+        stl = _make_output_stl(output, output_dep, c_size, c_stride, alt_stick_dim)
         if stl is not None:
             result.append(stl)
     return result
@@ -842,78 +803,22 @@ def _multi_arg_pointwise_layouts(
     # indirect index and constrain it to be outermost (device dim 0).
     outermost_dim = None
     if output_dep.is_indirect():
-        # Get the indirect symbols (those not in output_dep.ranges, i.e., not loop vars)
         loop_vars = set(output_dep.ranges.keys())
         indirect_syms = output_dep.index.free_symbols - loop_vars
         if indirect_syms:
-            # The stride coefficient of the indirect symbol tells us which dim it maps to
-            # For index = d1 + 256*tmp0, coefficient of tmp0 is 256
-            # We need to find which stride equals 256 (or divide by it to get coeff)
             for indirect_sym in indirect_syms:
-                # Find the stride of the term containing this indirect symbol
-                indirect_coeff = None
                 terms = output_dep.index.as_coefficients_dict()
                 for term, coeff in terms.items():
                     if term.has(indirect_sym):
-                        indirect_coeff = coeff
+                        c_stride = [concretize_expr(s) for s in output.stride]
+                        for dim_idx, stride in enumerate(c_stride):
+                            if stride == coeff:
+                                outermost_dim = dim_idx
+                                break
+                    if outermost_dim is not None:
                         break
-                if indirect_coeff is not None:
-                    # Match this coefficient to a host dimension's stride
-                    c_stride = [concretize_expr(s) for s in output.stride]
-                    for dim_idx, stride in enumerate(c_stride):
-                        if stride == indirect_coeff:
-                            outermost_dim = dim_idx
-                            break
                 if outermost_dim is not None:
                     break
-
-    # For scatter with indirect writes, return early with the constraint applied
-    if outermost_dim is not None:
-        stick_size = get_elem_in_stick(output.dtype)
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-
-        # Determine output EA
-        input_eas = set()
-        for arg in args:
-            if arg.layouts:
-                input_eas.add(arg.layouts[0].element_arrangement)
-        staggered_inputs = input_eas & STAGGERED_EAS
-        if len(staggered_inputs) == 1:
-            output_ea = next(iter(staggered_inputs))
-        else:
-            output_ea = ElementArrangement.STANDARD
-
-        # Try each valid stick dimension with the outermost_dim constraint
-        for candidate_stick_dim in range(len(c_size)):
-            if candidate_stick_dim == outermost_dim:
-                continue
-            if concretize_expr(output.size[candidate_stick_dim]) % stick_size != 0:
-                continue
-            # Compute dim_order with outermost_dim first and candidate_stick_dim last
-            dim_order = _compute_dim_order(
-                candidate_stick_dim, c_size, out_coords, outermost_dim
-            )
-            # Compute device_size and stride_map from host layout and dim_order
-            # dim_order maps host dims to device dims, with stick_dim as the last host dim
-            device_size = [c_size[d] for d in dim_order]  # Reorder all host dims
-            stick_count = (c_size[candidate_stick_dim] + stick_size - 1) // stick_size
-            device_size[-1] = stick_count  # Replace stick_dim size with stick_count
-            device_size.append(stick_size)  # Add elems_per_stick
-            stride_map = [c_stride[d] for d in dim_order]  # Reorder all host strides
-            stride_map[-1] = stick_size  # Replace stick_dim stride with stick_size
-            stride_map.append(1)  # Add final stride of 1
-            # Use constructor 3 with device_size and stride_map
-            stl = SpyreTensorLayout(
-                device_size, stride_map, get_device_dtype(output.dtype)
-            )
-            # Verify the stick expression is offset-free
-            coords = device_coordinates(stl, output_dep, ind_sizes)
-            if is_stick_expr_offset_free(coords[-1], stick_size):
-                if output_ea != ElementArrangement.STANDARD:
-                    stl = _rescale_stl_for_dtype(stl, output.dtype, output_ea)
-                op.restick_cost_fn = AllSameNode.from_args(args, [stl], output_dep, op)
-                return [stl]
 
     can_use_same_layout = True
 
