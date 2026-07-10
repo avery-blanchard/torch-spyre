@@ -164,41 +164,32 @@ def add_constant(kwargs, name, value) -> int:
     return index
 
 
-def _compute_fp8_coord_params(tensor, dim, sdsc_spec):
-    """Compute FP8 2D stick coordinate parameters for a dimension.
-
-    Returns tuple: (is_fp8_stick, other_stick_size, stick_idx)
-    """
-    stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
-    stick_dim_order = sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
-
-    is_fp8_stick = (
-        tensor.data_format == DataFormats.SEN143_FP8 and len(stick_size_list) > 1
-    )
-
-    if dim in stick_dim_order and len(stick_size_list) > 1:
-        stick_idx = stick_dim_order.index(dim)
-        other_idx = 1 - stick_idx
-        other_stick_size = stick_size_list[other_idx]
-    else:
-        stick_idx = -1
-        other_stick_size = 1
-
-    return is_fp8_stick, other_stick_size, stick_idx
-
-
 def gen_coord_info_value(
     size: int,
     nsplits: int,
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
-    is_fp8_stick: bool = False,
-    other_stick_size: int = 1,
-    stick_idx: int = -1,
+    tensor=None,
+    dim=None,
+    sdsc_spec=None,
     tensor_idx: int = -1,
     opfunc: str = "",
 ):
+    stick_size_list = (
+        sdsc_spec.layouts[tensor.layout]["stick_size"] if is_stick_dim else []
+    )
+    is_fp8_stick = (
+        is_stick_dim
+        and tensor.data_format == DataFormats.SEN143_FP8
+        and len(stick_size_list) > 1
+    )
+    stick_idx = (
+        sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
+        if is_fp8_stick
+        else -1
+    )
+
     if not is_stick_dim:
         return {
             "spatial": 3,
@@ -932,37 +923,29 @@ def generate_sdsc(
                                     ),
                                     "coordinates_": {
                                         "coordInfo": {
-                                            str(dim): (
-                                                lambda is_fp8,
-                                                other_sz,
-                                                st_idx: gen_coord_info_value(
-                                                    size=sdsc_spec.iteration_space[dim]
-                                                    // sdsc_spec.work_slices[dim]
-                                                    if (tensor.scales[dim] == 1)
-                                                    else 1,
-                                                    nsplits=sdsc_spec.work_slices[dim]
-                                                    if (tensor.scales[dim] == 1)
-                                                    else 1,
-                                                    elems_per_stick=tensor.data_format.elems_per_stick(),
-                                                    is_stick_dim=(
-                                                        dim
-                                                        in sdsc_spec.layouts[
-                                                            tensor.layout
-                                                        ]["stick_dim_order"]
-                                                    ),
-                                                    is_stick_reduction=(
-                                                        tensor.scales[dim] == -2
-                                                    ),
-                                                    is_fp8_stick=is_fp8,
-                                                    other_stick_size=other_sz,
-                                                    stick_idx=st_idx,
-                                                    tensor_idx=i,
-                                                    opfunc=sdsc_spec.opfunc,
-                                                )
-                                            )(
-                                                *_compute_fp8_coord_params(
-                                                    tensor, dim, sdsc_spec
-                                                )
+                                            str(dim): gen_coord_info_value(
+                                                size=sdsc_spec.iteration_space[dim]
+                                                // sdsc_spec.work_slices[dim]
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
+                                                nsplits=sdsc_spec.work_slices[dim]
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
+                                                elems_per_stick=tensor.data_format.elems_per_stick(),
+                                                is_stick_dim=(
+                                                    dim
+                                                    in sdsc_spec.layouts[tensor.layout][
+                                                        "stick_dim_order"
+                                                    ]
+                                                ),
+                                                is_stick_reduction=(
+                                                    tensor.scales[dim] == -2
+                                                ),
+                                                tensor=tensor,
+                                                dim=dim,
+                                                sdsc_spec=sdsc_spec,
+                                                tensor_idx=i,
+                                                opfunc=sdsc_spec.opfunc,
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
                                                 "dim_order"

@@ -264,15 +264,6 @@ def multi_dim_iteration_space_split(
     return splits
 
 
-def _has_qfp8wt_tensor(tds: list[TensorDep]) -> bool:
-    """Check if any tensor has QFP8WT element arrangement."""
-    return any(
-        hasattr(td.layout.device_layout, "element_arrangement")
-        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
-        for td in tds
-    )
-
-
 def _is_qfp8wt_tensor(td: TensorDep) -> bool:
     """Check if a specific tensor has QFP8WT element arrangement."""
     return (
@@ -281,29 +272,22 @@ def _is_qfp8wt_tensor(td: TensorDep) -> bool:
     )
 
 
+def _has_qfp8wt_tensor(tds: list[TensorDep]) -> bool:
+    """Check if any tensor has QFP8WT element arrangement."""
+    return any(_is_qfp8wt_tensor(td) for td in tds)
+
+
 def _get_qfp8wt_split_constraints(
     input_tds: list[TensorDep],
     output_td: TensorDep,
 ) -> dict[Symbol, int]:
     """Return split constraints (=1) for QFP8WT second stick dimension."""
     constraints: dict[Symbol, int] = {}
-    if not _has_qfp8wt_tensor(input_tds + [output_td]):
-        return constraints
-
-    # Kernel tensor (second input for batchmatmul)
-    if len(input_tds) > 1:
-        kernel_td = input_tds[1]
-        if len(kernel_td.device_coords) > 1 and _is_qfp8wt_tensor(kernel_td):
-            second_stick_vars = kernel_td.device_coords[-2].free_symbols
-            for var in second_stick_vars:
+    # Kernel tensor (second input for batchmatmul) and output tensor.
+    for td in ([input_tds[1]] if len(input_tds) > 1 else []) + [output_td]:
+        if len(td.device_coords) > 1 and _is_qfp8wt_tensor(td):
+            for var in td.device_coords[-2].free_symbols:
                 constraints[var] = 1
-
-    # Output tensor
-    if len(output_td.device_coords) > 1 and _is_qfp8wt_tensor(output_td):
-        second_stick_vars = output_td.device_coords[-2].free_symbols
-        for var in second_stick_vars:
-            constraints[var] = 1
-
     return constraints
 
 
