@@ -624,20 +624,15 @@ def apply_splits(
     splits: dict,
     output_td: TensorDep,
 ) -> None:
-    """Commit splits to op (op_it_space_splits only; core assignment done later).
+    """Commit splits to op (op_it_space_splits only).
 
-    Sets ``op.op_it_space_splits`` when multi-core. Core assignment via
-    ``op_core_to_slice_mapping`` is handled by assign_core_splits() post-pass.
+    Core assignment is handled by assign_core_splits() post-pass.
     """
-    # Ensure splits has entries for all dims (defaults to 1 for unsplit dims).
-    # This matches the structure guaranteed by multi_dim_iteration_space_split.
     it_space = iteration_space_from_op(op)
     full_splits = {sym: splits.get(sym, 1) for sym in it_space}
-
     num_cores = math.prod(full_splits.values())
     if num_cores <= 1:
         return
-
     rw = op.get_read_writes()
     write_index = output_td.dep.index
     first_read = next(iter(rw.reads), None)
@@ -1387,20 +1382,11 @@ def work_distribution(
 
 
 def assign_core_splits(graph: GraphLowering) -> None:
-    """Assign core-to-slice mappings to all ComputedBuffer ops.
-
-    Runs as a post-processing step after span_reduction, cost_model_matmul_division,
-    and work_distribution. Computes op_core_to_slice_mapping for every op based on
-    its op_it_space_splits (set by the work_division passes).
-    """
-    operations = graph.operations
-    for op in _iter_computed_buffers(operations):
-        # Recover splits from op_it_space_splits (set by earlier passes if multi-core)
+    """Post-pass: assign op_core_to_slice_mapping to all ComputedBuffer ops."""
+    for op in _iter_computed_buffers(graph.operations):
         splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-
         it_space = iteration_space_from_op(op)
         full_splits = {sym: splits[0].get(sym, 1) for sym in it_space}
-
         num_cores = math.prod(full_splits.values())
         op.op_core_to_slice_mapping = compute_core_to_slice_mapping(
             op, it_space, full_splits, num_cores

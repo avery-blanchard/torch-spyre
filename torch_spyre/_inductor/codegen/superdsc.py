@@ -853,10 +853,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
-    # op_core_to_slice_mapping is always set by assign_core_splits() post-pass
-    assert op_spec.core_to_slice_mapping is not None, (
-        f"core_to_slice_mapping must be set by assign_core_splits for {op_spec.op}"
-    )
+    assert op_spec.core_to_slice_mapping is not None
     # Re-key stored mapping from original symbol names to SDSC dim labels.
     core_id_to_work_slice = {
         str(symbol_mapping[sym]): op_spec.core_to_slice_mapping[str(sym)]
