@@ -1388,9 +1388,16 @@ def work_distribution(
 def assign_core_splits(graph: GraphLowering) -> None:
     """Post-pass: assign op_core_to_slice_mapping to all ComputedBuffer ops."""
     for op in _iter_computed_buffers(graph.operations):
-        splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+        coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+        rw = op.get_read_writes()
+        write_index = next(iter(rw.writes)).index
+        first_read = next(iter(rw.reads), None)
+        read_index = first_read.index if first_read is not None else write_index
         it_space = iteration_space_from_op(op)
-        full_splits = {sym: splits[0].get(sym, 1) for sym in it_space}
+        per_sym = apply_splits_from_index_coeff(
+            coeff_splits, write_index, read_index, it_space
+        )
+        full_splits = {sym: per_sym.get(sym, 1) for sym in it_space}
         num_cores = math.prod(full_splits.values())
         op.op_core_to_slice_mapping = compute_core_to_slice_mapping(
             op, it_space, full_splits, num_cores
