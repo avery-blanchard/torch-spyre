@@ -2929,9 +2929,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_granite_attn_block", "test_granite_attn_block_cpu"): {
             "param_sets": {
-                "attention_block": (
+                "batch_size_1": (
                     cached_randn(
                         (1, 512, 4096), differentiation=1, dtype=torch.float16
+                    ),
+                    cached_randn((4096, 4096), differentiation=2, dtype=torch.float16),
+                    cached_randn((4096, 1024), differentiation=3, dtype=torch.float16),
+                    cached_randn((4096, 1024), differentiation=4, dtype=torch.float16),
+                    cached_randn((4096, 4096), differentiation=5, dtype=torch.float16),
+                ),
+                "batch_size_2": (
+                    cached_randn(
+                        (2, 512, 4096), differentiation=1, dtype=torch.float16
                     ),
                     cached_randn((4096, 4096), differentiation=2, dtype=torch.float16),
                     cached_randn((4096, 1024), differentiation=3, dtype=torch.float16),
