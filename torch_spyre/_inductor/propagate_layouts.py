@@ -772,6 +772,7 @@ def _indirect_write_host_dim(
             f"indirect but has no indirect index symbols outside its loop vars"
         )
     coeff_dict = output_dep.index.as_coefficients_dict()
+    c_size = [concretize_expr(s) for s in output.size]
     for indirect_sym in indirect_syms:
         # Extract the coefficient of this indirect symbol in the index.
         # For index = d1 + 1024*tmp0, we want coeff=1024.
@@ -789,13 +790,21 @@ def _indirect_write_host_dim(
                 d for d, stride in enumerate(c_stride) if stride == coeff_concrete
             )
         if len(matched_dims) > 1:
-            raise Unsupported(
-                f"Scatter ({op.get_name()}): indirect symbol {indirect_sym} "
-                f"in output index {output_dep.index!r} matches multiple host "
-                f"dimensions {sorted(matched_dims)} with the same stride "
-                f"(strides={c_stride}); cannot unambiguously determine the "
-                f"outermost dimension"
-            )
+            # Multiple dims match the coefficient (e.g., both dim 0 and dim 1
+            # have stride 256 when dim 1 is size-1 singleton). Prefer the
+            # non-singleton dim(s) -- singletons are broadcast and shouldn't
+            # be the scatter axis. If still ambiguous after this filter, raise.
+            non_singleton_dims = [d for d in matched_dims if c_size[d] > 1]
+            if non_singleton_dims:
+                matched_dims = set(non_singleton_dims)
+            if len(matched_dims) > 1:
+                raise Unsupported(
+                    f"Scatter ({op.get_name()}): indirect symbol {indirect_sym} "
+                    f"in output index {output_dep.index!r} matches multiple host "
+                    f"dimensions {sorted(matched_dims)} with the same stride "
+                    f"(strides={c_stride}, sizes={c_size}); cannot unambiguously "
+                    f"determine the outermost dimension"
+                )
         if matched_dims:
             return next(iter(matched_dims))
     raise Unsupported(

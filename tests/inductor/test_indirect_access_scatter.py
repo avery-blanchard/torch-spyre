@@ -368,6 +368,48 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
+    def test_scatter_transposed_output(self):
+        """Scatter with transposed (non-contiguous) output view.
+        [1024, 64] transposed to [64, 1024], then scattered on dim 0 via
+        index [32]. Tests that stride calculation in _indirect_write_host_dim
+        and the pinned layout construction handle non-standard strides.
+        """
+        out_base = torch.zeros(64, 1024, dtype=torch.float16).to("spyre")
+        out = out_base.t()  # Transpose: now [1024, 64], strides [1, 1024]
+        src = torch.rand(32, 64, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, 1024, (32,), dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": 1024, "N": 64})
+        self.name_dims(src, {"P": 32, "N": 64})
+        self.name_dims(idx, {"P": 32})
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self.assert_indirect_at_device_dim_0(r.op_specs)
+
+    def test_scatter_strided_view(self):
+        """Scatter with a strided view (sub-sampling every other element).
+        3D output [512, 16, 64] → view with step 2 on dim 1 → [512, 8, 64],
+        then scattered on dim 0. Tests that non-unit strides in non-scattered
+        dims are correctly captured and singleton handling works with them.
+        """
+        out_base = torch.zeros(512, 16, 64, dtype=torch.float16).to("spyre")
+        out = out_base[:, ::2, :]  # Step 2 on dim 1: [512, 8, 64]
+        src = torch.rand(32, 8, 64, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, 512, (32,), dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": 512, "N": 8, "K": 64})
+        self.name_dims(src, {"P": 32, "N": 8, "K": 64})
+        self.name_dims(idx, {"P": 32})
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self.assert_indirect_at_device_dim_0(r.op_specs)
+
     def test_scatter_3d_singleton_trailing_dim(self):
         """3D output [512, 4, 1], 1D index [16]: a non-pinned, non-stick dim has
         size 1. This must produce a genuine singleton (stride_map -1) device
