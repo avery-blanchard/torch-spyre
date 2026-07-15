@@ -909,13 +909,46 @@ def _multi_arg_pointwise_layouts(
             return
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
         if _is_supported_layout(dim_order):
-            results.append(
-                SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea)
-            )
+            if outermost_dim is not None:
+                # For scatter with outermost_dim constraint, manually construct
+                # device_size and stride_map to place indirect dim at device pos 0.
+                device_size = []
+                stride_map = []
+
+                # First, add outermost_dim at device position 0
+                device_size.append(c_size[outermost_dim])
+                stride_map.append(c_stride[outermost_dim])
+
+                # Then, add other host dims in the order specified by dim_order
+                # (excluding outermost_dim and stick_dim, which we handle separately)
+                for d in dim_order:
+                    if d != outermost_dim and d != stick_dim:
+                        device_size.append(c_size[d])
+                        stride_map.append(c_stride[d])
+
+                # Finally, add stick_dim split into stick_count + elems_per_stick
+                stick_count = (c_size[stick_dim] + stick_size - 1) // stick_size
+                device_size.append(stick_count)
+                stride_map.append(stick_size)
+                device_size.append(stick_size)
+                stride_map.append(1)
+
+                stl = SpyreTensorLayout(
+                    device_size, stride_map, get_device_dtype(output.dtype), output_ea
+                )
+            else:
+                # Normal path: use dim_order constructor
+                stl = SpyreTensorLayout(
+                    c_size, c_stride, output.dtype, dim_order, output_ea
+                )
+            results.append(stl)
 
     results: list[SpyreTensorLayout] = []
 
-    if can_use_same_layout:
+    # Skip the same-layout fast path if we have a scatter constraint to enforce
+    # (outermost_dim). The template layout from args[0] may not satisfy the
+    # outermost_dim requirement, so we must go through the normal layout search.
+    if can_use_same_layout and outermost_dim is None:
         template_stl = next(iter(args[0].layouts))
         results.append(
             SpyreTensorLayout(
@@ -1394,6 +1427,11 @@ def propagate_spyre_tensor_layouts(
                         target_stl = _multi_arg_pointwise_layouts(
                             op, target_layout, output_dep, args
                         )[0]
+                        # Update the graph input's layout to use the constrained STL
+                        # so that real_layout() will use it when computing the mutation layout
+                        graph_input = V.graph.graph_inputs.get(target_name)
+                        if graph_input is not None:
+                            graph_input.layouts = [target_stl]
 
                 # Find an alternative layout if the write has an unsupported stick
                 # expression (e.g. offset like v+32). Force the optimizer to use
