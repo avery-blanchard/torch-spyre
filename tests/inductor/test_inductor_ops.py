@@ -6456,7 +6456,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_granite_attn_block_cpu(self, x, wq, wk, wv, wo):
-        B, Hq, Hkv, S, D = 1, 32, 8, 512, 128
+        B, S, _ = x.shape
+        Hq, Hkv, D = 32, 8, 128
         expansion = Hq // Hkv
 
         def block(x, wq, wk, wv, wo):
