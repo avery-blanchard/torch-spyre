@@ -123,24 +123,32 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def _compute_dim_order(stick_dim, size, coords, outermost_dim=None):
-    """Order dimensions with stick_dim last, optionally placing outermost_dim first."""
-    if outermost_dim is not None and outermost_dim == stick_dim:
+def _compute_dim_order(stick_dim, size, coords, pinned_dims=()):
+    """Order dimensions with stick_dim last, optionally pinning some dims first.
+
+    pinned_dims is an ordered sequence of host dims that must occupy the
+    leading device positions, in the given order (device position 0, 1, ...).
+    Callers use this to express a positional constraint on a non-stick dim
+    (e.g. a scatter/index_put write's indirect-index dim, which must be
+    outermost) without otherwise disturbing the default ordering heuristic
+    (size-one dims pushed to the right, to avoid tiling). This function has
+    no knowledge of what the constraint means; it only places dims.
+    """
+    pinned_set = set(pinned_dims)
+    if pinned_set & {stick_dim}:
         raise Unsupported(
-            f"indirect access dimension {outermost_dim} cannot also be the stick dimension"
+            f"pinned dimension(s) {pinned_dims} cannot include the stick dimension"
         )
-    dim_order = []
-    if outermost_dim is not None:
-        dim_order.append(outermost_dim)
+    dim_order = list(pinned_dims)
     dim_order += [
         d
         for d in range(len(size))
-        if d != stick_dim and d != outermost_dim and coords[d] != 0
+        if d != stick_dim and d not in pinned_set and coords[d] != 0
     ]
     dim_order += [
         d
         for d in range(len(size))
-        if d != stick_dim and d != outermost_dim and coords[d] == 0
+        if d != stick_dim and d not in pinned_set and coords[d] == 0
     ]
     dim_order += [stick_dim]
     return dim_order
@@ -727,11 +735,66 @@ def _matmul_layouts(
     return [out_stl]
 
 
+def _indirect_write_host_dim(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+) -> int:
+    """Find the host dim an indirect write's index symbol(s) map to.
+
+    For a scatter/index_put-style write, output_dep.index contains a term
+    like ``coeff_d * tmp0`` where tmp0 is the (out-of-loop) indirect index
+    symbol and coeff_d is dim d's host stride. This resolves d so the caller
+    can pin it to device position 0 (the layout constraint scatter needs).
+    """
+    loop_vars = set(output_dep.ranges.keys())
+    indirect_syms = output_dep.index.free_symbols - loop_vars
+    c_stride = [concretize_expr(s) for s in output.stride]
+    if not indirect_syms:
+        raise Unsupported(
+            f"Scatter ({op.get_name()}): output index {output_dep.index!r} is "
+            f"indirect but has no indirect index symbols outside its loop vars"
+        )
+    coeff_dict = output_dep.index.as_coefficients_dict()
+    for indirect_sym in indirect_syms:
+        # Extract the coefficient of this indirect symbol in the index.
+        # For index = d1 + 1024*tmp0, we want coeff=1024.
+        matched_dims: set[int] = set()
+        for term, coeff in coeff_dict.items():
+            if not term.has(indirect_sym):
+                continue
+            # Match coeff to a host stride
+            try:
+                coeff_concrete = int(coeff)
+            except (TypeError, ValueError):
+                # Coefficient is not a concrete int; cannot match to stride
+                continue
+            matched_dims.update(
+                d for d, stride in enumerate(c_stride) if stride == coeff_concrete
+            )
+        if len(matched_dims) > 1:
+            raise Unsupported(
+                f"Scatter ({op.get_name()}): indirect symbol {indirect_sym} "
+                f"in output index {output_dep.index!r} matches multiple host "
+                f"dimensions {sorted(matched_dims)} with the same stride "
+                f"(strides={c_stride}); cannot unambiguously determine the "
+                f"outermost dimension"
+            )
+        if matched_dims:
+            return next(iter(matched_dims))
+    raise Unsupported(
+        f"Scatter ({op.get_name()}): could not map indirect symbol(s) "
+        f"{indirect_syms} in output index {output_dep.index!r} to a "
+        f"host dimension (strides={c_stride})"
+    )
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    pinned_dims: tuple[int, ...] = (),
 ) -> list[SpyreTensorLayout]:
     """
     Multi-arg pointwise is a join point so handled specially.
@@ -741,6 +804,12 @@ def _multi_arg_pointwise_layouts(
        2. Compute an out STL for each; fall back to alternate output dims if none survive.
        3. Determine output ElementArrangement based on input EAs (propagate staggered EA if present)
        4. Construct the AllSameNode cost function since in and out sticks must always match
+
+    pinned_dims optionally forces specific host dims of the output to occupy
+    the leading device positions, in order (see _compute_dim_order). This
+    function has no opinion on why a caller needs that -- callers with a
+    mutation-target constraint (e.g. scatter/index_put's indirect-index dim
+    must be outermost) compute the pinned dim(s) themselves and pass them in.
     """
 
     # Determine output ElementArrangement from inputs
@@ -831,41 +900,16 @@ def _multi_arg_pointwise_layouts(
     in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
     out_coords = host_coordinates(output, output_dep, ind_sizes)
 
-    # For indirect writes (scatter/index_put), find the host dim carrying the
-    # indirect index and constrain it to be outermost (device dim 0).
-    outermost_dim = None
-    if output_dep.is_indirect():
-        loop_vars = set(output_dep.ranges.keys())
-        indirect_syms = output_dep.index.free_symbols - loop_vars
-        if indirect_syms:
-            # Find which host dimension the indirect symbol(s) map to by examining
-            # the index expression: for index = sum(coeff_d * var_d), find the
-            # dimension whose stride appears in the term containing indirect symbols.
-            c_stride = [concretize_expr(s) for s in output.stride]
-            for indirect_sym in indirect_syms:
-                # Extract the coefficient of this indirect symbol in the index.
-                # For index = d1 + 1024*tmp0, we want coeff=1024.
-                coeff_dict = output_dep.index.as_coefficients_dict()
-                for term, coeff in coeff_dict.items():
-                    if term.has(indirect_sym):
-                        # Match coeff to a host stride
-                        try:
-                            coeff_concrete = int(coeff)
-                            for d, stride in enumerate(c_stride):
-                                if stride == coeff_concrete:
-                                    outermost_dim = d
-                                    break
-                        except (TypeError, ValueError):
-                            # Coefficient is not a concrete int; cannot match to stride
-                            pass
-                if outermost_dim is not None:
-                    break
-            if outermost_dim is None and indirect_syms:
-                raise Unsupported(
-                    f"Scatter ({op.get_name()}): could not map indirect symbol(s) "
-                    f"{indirect_syms} in output index {output_dep.index!r} to a "
-                    f"host dimension (strides={c_stride})"
-                )
+    # This function's manual STL-construction path (in _try_stick_dim) only
+    # implements a single leading pin so far; _compute_dim_order itself is
+    # general over an ordered sequence of pinned dims for future callers that
+    # need more than one pinned position.
+    if len(pinned_dims) > 1:
+        raise Unsupported(
+            f"Multi-arg pointwise ({op.get_name()}): pinned_dims={pinned_dims} "
+            f"has more than one entry, which is not yet supported"
+        )
+    outermost_dim = pinned_dims[0] if pinned_dims else None
 
     can_use_same_layout = True
 
@@ -903,15 +947,15 @@ def _multi_arg_pointwise_layouts(
 
     def _try_stick_dim(stick_dim):
         if outermost_dim is not None and stick_dim == outermost_dim:
-            # The indirect dim is pinned to device dim 0; it cannot also be the
+            # The pinned dim is pinned to device dim 0; it cannot also be the
             # stick dim. Skip rather than let _compute_dim_order raise, since
             # other stick_dim candidates may still be valid.
             return
-        dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
+        dim_order = _compute_dim_order(stick_dim, c_size, out_coords, pinned_dims)
         if _is_supported_layout(dim_order):
             if outermost_dim is not None:
-                # For scatter with outermost_dim constraint, manually construct
-                # device_size and stride_map to place indirect dim at device pos 0.
+                # With a pinned dim, manually construct device_size and
+                # stride_map to place it at device position 0.
                 device_size = []
                 stride_map = []
 
@@ -926,12 +970,22 @@ def _multi_arg_pointwise_layouts(
                         device_size.append(c_size[d])
                         stride_map.append(c_stride[d])
 
-                # Finally, add stick_dim split into stick_count + elems_per_stick
+                # Finally, add stick_dim split into stick_count + elems_per_stick.
+                # The stick dim's host stride need not be 1 (stick_dim is not
+                # necessarily the innermost host dim once outermost_dim has
+                # claimed device position 0), so the two device slots must be
+                # derived from the host stride rather than hardcoded to
+                # stick_size/1. This mirrors dim_map_to_stride_map in
+                # spyre_tensor_impl.cpp and restickify_stride_map in
+                # pass_utils.py: the elems-per-stick slot takes the stick dim's
+                # host stride, and the stick-count slot takes that stride
+                # scaled by stick_size.
+                stick_host_stride = c_stride[stick_dim]
                 stick_count = (c_size[stick_dim] + stick_size - 1) // stick_size
                 device_size.append(stick_count)
-                stride_map.append(stick_size)
+                stride_map.append(stick_host_stride * stick_size)
                 device_size.append(stick_size)
-                stride_map.append(1)
+                stride_map.append(stick_host_stride)
 
                 stl = SpyreTensorLayout(
                     device_size, stride_map, get_device_dtype(output.dtype), output_ea
@@ -945,9 +999,9 @@ def _multi_arg_pointwise_layouts(
 
     results: list[SpyreTensorLayout] = []
 
-    # Skip the same-layout fast path if we have a scatter constraint to enforce
+    # Skip the same-layout fast path if we have a pinned dim to enforce
     # (outermost_dim). The template layout from args[0] may not satisfy the
-    # outermost_dim requirement, so we must go through the normal layout search.
+    # pin, so we must go through the normal layout search instead.
     if can_use_same_layout and outermost_dim is None:
         template_stl = next(iter(args[0].layouts))
         results.append(
@@ -1027,9 +1081,10 @@ def _multi_arg_pointwise_layouts(
     if not results:
         if outermost_dim is not None:
             raise Unsupported(
-                f"Scatter ({op.get_name()}): cannot place indirect dimension {outermost_dim} "
-                f"as outermost device dimension; no valid output layout found. "
-                f"Output size={output.size}, coordinates={out_coords}"
+                f"Multi-arg pointwise ({op.get_name()}): cannot place pinned "
+                f"dimension {outermost_dim} as outermost device dimension; no "
+                f"valid output layout found. Output size={output.size}, "
+                f"coordinates={out_coords}"
             )
         raise Unsupported(
             f"Multi-arg pointwise ({op.get_name()}): no supported output layout found "
@@ -1417,11 +1472,19 @@ def propagate_spyre_tensor_layouts(
                 if output_dep.is_indirect():
                     target_layout = target.get_layout()
                     if isinstance(target_layout, FixedLayout):
-                        # Recompute layouts with the scatter constraint. Raises
-                        # Unsupported (propagated to the caller) rather than
-                        # returning an empty list if no valid layout exists.
+                        # A scatter/index_put-style indirect write must have its
+                        # indirect-index host dim placed outermost (device dim 0)
+                        # in the mutation target's device layout. Resolve that
+                        # dim here (this is the only caller that ever produces an
+                        # indirect write dep) and recompute layouts with it
+                        # pinned. Raises Unsupported (propagated to the caller)
+                        # rather than returning an empty list if no valid layout
+                        # exists.
+                        outermost_dim = _indirect_write_host_dim(
+                            op, target_layout, output_dep
+                        )
                         target_stl = _multi_arg_pointwise_layouts(
-                            op, target_layout, output_dep, args
+                            op, target_layout, output_dep, args, (outermost_dim,)
                         )[0]
                         # Update the graph input's layout to use the constrained STL
                         # so that real_layout() will use it when computing the mutation layout
