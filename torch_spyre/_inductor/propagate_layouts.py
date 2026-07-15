@@ -838,19 +838,20 @@ def _multi_arg_pointwise_layouts(
         loop_vars = set(output_dep.ranges.keys())
         indirect_syms = output_dep.index.free_symbols - loop_vars
         if indirect_syms:
-            for indirect_sym in indirect_syms:
-                terms = output_dep.index.as_coefficients_dict()
-                for term, coeff in terms.items():
-                    if term.has(indirect_sym):
-                        c_stride = [concretize_expr(s) for s in output.stride]
-                        for dim_idx, stride in enumerate(c_stride):
-                            if stride == coeff:
-                                outermost_dim = dim_idx
-                                break
-                    if outermost_dim is not None:
-                        break
-                if outermost_dim is not None:
-                    break
+            outermost_dim = next(
+                (
+                    d
+                    for d, coord in enumerate(out_coords)
+                    if coord.free_symbols & indirect_syms
+                ),
+                None,
+            )
+            if outermost_dim is None:
+                raise Unsupported(
+                    f"Scatter ({op.get_name()}): could not map indirect symbol(s) "
+                    f"{indirect_syms} in output index {output_dep.index!r} to a host "
+                    f"dimension via coordinates {out_coords!r}"
+                )
 
     can_use_same_layout = True
 
@@ -887,6 +888,11 @@ def _multi_arg_pointwise_layouts(
         return True
 
     def _try_stick_dim(stick_dim):
+        if outermost_dim is not None and stick_dim == outermost_dim:
+            # The indirect dim is pinned to device dim 0; it cannot also be the
+            # stick dim. Skip rather than let _compute_dim_order raise, since
+            # other stick_dim candidates may still be valid.
+            return
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords, outermost_dim)
         if _is_supported_layout(dim_order):
             results.append(
@@ -1368,12 +1374,12 @@ def propagate_spyre_tensor_layouts(
                 if isinstance(op.data, Scatter) and output_dep.is_indirect():
                     target_layout = target.get_layout()
                     if isinstance(target_layout, FixedLayout):
-                        # Recompute layouts with the scatter constraint
-                        layouts = _multi_arg_pointwise_layouts(
+                        # Recompute layouts with the scatter constraint. Raises
+                        # Unsupported (propagated to the caller) rather than
+                        # returning an empty list if no valid layout exists.
+                        target_stl = _multi_arg_pointwise_layouts(
                             op, target_layout, output_dep, args
-                        )
-                        if layouts:
-                            target_stl = layouts[0]
+                        )[0]
 
                 # Find an alternative layout if the write has an unsupported stick
                 # expression (e.g. offset like v+32). Force the optimizer to use

@@ -870,9 +870,7 @@ def generate_sdsc(
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in tensor.dim_order
                                     ],
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
