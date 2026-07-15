@@ -161,7 +161,7 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr, output, output_dep, c_size, c_stride
+    stick_expr, output, output_dep, c_size, c_stride, pinned_dim=None
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -172,19 +172,30 @@ def _output_stl_from_stick_expr(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
+    return _make_output_stl(
+        output, output_dep, c_size, c_stride, out_stick_dim, pinned_dim
+    )
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim
+    output, output_dep, c_size, c_stride, stick_dim, pinned_dim=None
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
-    Returns None if the resulting stick expression has an offset.
+    pinned_dim, if given, must occupy device position 0 (see _compute_dim_order);
+    it is rejected as a stick_dim candidate rather than silently ignored, so a
+    caller with a positional constraint on a non-stick dim (e.g. scatter's
+    indirect-index dim) never gets back a layout that violates it.
+
+    Returns None if stick_dim collides with pinned_dim or the resulting stick
+    expression has an offset.
     """
+    if pinned_dim is not None and stick_dim == pinned_dim:
+        return None
     stick_size = get_elem_in_stick(output.dtype)
     out_coords = host_coordinates(output, output_dep, None)
-    dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
+    pinned_dims = (pinned_dim,) if pinned_dim is not None else ()
+    dim_order = _compute_dim_order(stick_dim, c_size, out_coords, pinned_dims)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
@@ -199,10 +210,13 @@ def _candidate_output_stls(
     c_stride: list,
     stick_size: int,
     skip_stick_expr: sympy.Expr,
+    pinned_dim=None,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
-    Skip the dim that already produces an unsupported stick.
+    Skip the dim that already produces an unsupported stick. pinned_dim, if
+    given, is forwarded to _make_output_stl so no candidate is returned that
+    would place the pinned dim anywhere but device position 0.
     """
     out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
@@ -213,7 +227,9 @@ def _candidate_output_stls(
             continue
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             continue
-        stl = _make_output_stl(output, output_dep, c_size, c_stride, alt_stick_dim)
+        stl = _make_output_stl(
+            output, output_dep, c_size, c_stride, alt_stick_dim, pinned_dim
+        )
         if stl is not None:
             result.append(stl)
     return result
@@ -959,16 +975,19 @@ def _multi_arg_pointwise_layouts(
                 device_size = []
                 stride_map = []
 
+                def _non_stick_stride(d):
+                    return -1 if c_size[d] == 1 else c_stride[d]
+
                 # First, add outermost_dim at device position 0
                 device_size.append(c_size[outermost_dim])
-                stride_map.append(c_stride[outermost_dim])
+                stride_map.append(_non_stick_stride(outermost_dim))
 
                 # Then, add other host dims in the order specified by dim_order
                 # (excluding outermost_dim and stick_dim, which we handle separately)
                 for d in dim_order:
                     if d != outermost_dim and d != stick_dim:
                         device_size.append(c_size[d])
-                        stride_map.append(c_stride[d])
+                        stride_map.append(_non_stick_stride(d))
 
                 # Finally, add stick_dim split into stick_count + elems_per_stick.
                 # The stick dim's host stride need not be 1 (stick_dim is not
@@ -1301,11 +1320,18 @@ def _find_alt_target_stl(
     target_layout: FixedLayout,
     target_stl: SpyreTensorLayout,
     output_dep: MemoryDep,
+    pinned_dim=None,
 ) -> SpyreTensorLayout | None:
     """
     Find an alternative SpyreTensorLayout with an offset-free stick expression
     for a mutation target. Returns None if the current layout is already valid,
     or raises Unsupported if no valid alternative exists.
+
+    pinned_dim, if given (e.g. a scatter/index_put's indirect-index host dim),
+    must occupy device position 0 in any alternative returned. This is forwarded
+    to _candidate_output_stls rather than left for the caller to check
+    afterwards, so this function can never hand back a layout that silently
+    violates a caller's positional constraint.
     """
     stick_size = get_elem_in_stick(target_layout.dtype)
     write_stick = device_coordinates(target_stl, output_dep, None)[-1]
@@ -1315,12 +1341,14 @@ def _find_alt_target_stl(
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, stick_size, write_stick
+        target_layout, output_dep, c_size, c_stride, stick_size, write_stick, pinned_dim
     )
     if not candidates:
         raise Unsupported(
             f"no offset-free alternative stick dim for mutation target "
-            f"(write stick {write_stick!r}, size={target_layout.size})"
+            f"(write stick {write_stick!r}, size={target_layout.size}"
+            + (f", pinned_dim={pinned_dim}" if pinned_dim is not None else "")
+            + ")"
         )
     return candidates[0]
 
@@ -1469,6 +1497,11 @@ def propagate_spyre_tensor_layouts(
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
 
+                # Set when this write is an indirect scatter/index_put write,
+                # so the fallback alt-layout search below never returns a
+                # layout that moves the indirect-index dim off device dim 0.
+                outermost_dim = None
+
                 if output_dep.is_indirect():
                     target_layout = target.get_layout()
                     if isinstance(target_layout, FixedLayout):
@@ -1494,11 +1527,15 @@ def propagate_spyre_tensor_layouts(
 
                 # Find an alternative layout if the write has an unsupported stick
                 # expression (e.g. offset like v+32). Force the optimizer to use
-                # this layout for the mutation target.
+                # this layout for the mutation target. outermost_dim is passed
+                # through so an indirect write's pin can never be silently lost
+                # here: any alternative found is guaranteed to keep it at device
+                # dim 0, and _find_alt_target_stl raises Unsupported rather than
+                # returning a violating layout if none exists.
                 target_layout = target.get_layout()
                 if isinstance(target_layout, FixedLayout):
                     alt_stl = _find_alt_target_stl(
-                        target_layout, target_stl, output_dep
+                        target_layout, target_stl, output_dep, outermost_dim
                     )
                     if alt_stl is not None:
                         graph_input = V.graph.graph_inputs.get(target_name)

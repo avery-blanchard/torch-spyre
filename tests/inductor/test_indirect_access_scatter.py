@@ -368,6 +368,47 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
+    def test_scatter_3d_singleton_trailing_dim(self):
+        """3D output [512, 4, 1], 1D index [16]: a non-pinned, non-stick dim has
+        size 1. This must produce a genuine singleton (stride_map -1) device
+        dim rather than one carrying a stray host stride -- regression test
+        for the manual device_size/stride_map construction used once the
+        indirect-index dim is pinned to device dim 0.
+        """
+        out = torch.zeros(512, 4, 1, dtype=torch.float16).to("spyre")
+        src = torch.rand(16, 4, 1, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, 512, (16,), dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": 512, "N": 4, "K": 1})
+        self.name_dims(src, {"P": 16, "N": 4, "K": 1})
+        self.name_dims(idx, {"P": 16})
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self.assert_indirect_at_device_dim_0(r.op_specs)
+
+    def test_scatter_4d_singleton_middle_dim(self):
+        """4D output [256, 1, 16, 16], 1D index [32]: a non-pinned, non-stick,
+        non-trailing dim has size 1. Exercises the same singleton-stride case
+        as test_scatter_3d_singleton_trailing_dim but for a middle dim, to
+        confirm the fix isn't position-dependent.
+        """
+        out = torch.zeros(256, 1, 16, 16, dtype=torch.float16).to("spyre")
+        src = torch.rand(32, 1, 16, 16, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, 256, (32,), dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"A": 256, "B": 1, "C": 16, "D": 16})
+        self.name_dims(src, {"P": 32, "B": 1, "C": 16, "D": 16})
+        self.name_dims(idx, {"P": 32})
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self.assert_indirect_at_device_dim_0(r.op_specs)
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
