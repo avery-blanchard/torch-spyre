@@ -82,8 +82,7 @@ class TestScatter(IndirectAccessTestCase):
             out[idx] = src
             return out
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
-        self.assert_indirect_at_device_dim_0(r.op_specs)
+        self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
 
     def test_index_put_with_exp(self):
         """out[idx] = src.exp() -- index_put fused with a unary operation."""
@@ -155,8 +154,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return torch.index_copy(out, 0, idx, src)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
-        self.assert_indirect_at_device_dim_0(r.op_specs)
+        self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
 
     def test_index_add(self):
         """out.index_add_(0, idx, src)"""
@@ -165,8 +163,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
-        self.assert_indirect_at_device_dim_0(r.op_specs)
+        self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
 
     def test_scatter_reduce(self):
         """out.scatter_reduce_(0, index, src, "sum")"""
@@ -184,8 +181,7 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.index_put_((idx,), src, accumulate=True)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
-        self.assert_indirect_at_device_dim_0(r.op_specs)
+        self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
 
     def test_scatter_add_functional(self):
         """torch.scatter_add(out, 0, index, src) -- functional accumulating scatter."""
