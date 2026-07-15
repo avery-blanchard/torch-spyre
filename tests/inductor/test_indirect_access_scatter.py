@@ -293,7 +293,7 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
             out[idx] = src
             return out
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_2d_2d_index(self):
@@ -308,7 +308,7 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return torch.scatter(out, 0, idx, src)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_3d_output(self):
@@ -324,7 +324,7 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
             out[idx] = src
             return out
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_4d_output(self):
@@ -339,7 +339,7 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return torch.scatter(out, 0, idx, src)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_3d_2d_index(self):
@@ -354,7 +354,7 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.scatter_(0, idx, src)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_add_2d(self):
@@ -369,7 +369,7 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.scatter_add_(0, idx, src)
 
-        r = self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        r = self.check(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
 
