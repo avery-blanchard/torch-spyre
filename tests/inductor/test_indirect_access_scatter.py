@@ -44,6 +44,7 @@ from indirect_access_common import (  # noqa: E402
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
     IndirectAccessTestCase,
+    arg_has_indirect_access,
 )
 
 from torch_spyre._inductor import config  # noqa: E402
@@ -255,26 +256,21 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         """Assert that scatter output has IndirectAccess at device coordinate position 0."""
         from torch_spyre._inductor.op_spec import IndirectAccess
 
+        found_scatter_output = False
         for spec in op_specs:
-            # Find the output arg (is_input=False)
             for arg in spec.args:
-                if (
-                    not arg.is_input
-                    and isinstance(spec.op, str)
-                    and "scatter" in spec.op.lower()
-                ):
-                    # Check that device_coordinates[0] contains an IndirectAccess
-                    if arg.device_coordinates:
-                        first_coord = arg.device_coordinates[0]
-                        self.assertTrue(
-                            isinstance(first_coord, IndirectAccess)
-                            or (
-                                hasattr(first_coord, "has")
-                                and first_coord.has(IndirectAccess)
-                            ),
-                            f"Scatter output {arg.name}: expected IndirectAccess at device dim 0, "
-                            f"got {first_coord} in coordinates {arg.device_coordinates}",
-                        )
+                if not arg.is_input and arg_has_indirect_access(arg):
+                    found_scatter_output = True
+                    first_coord = arg.device_coordinates[0]
+                    self.assertTrue(
+                        isinstance(first_coord, IndirectAccess),
+                        f"Scatter output {arg.name}: expected IndirectAccess at device dim 0, "
+                        f"got {first_coord} in coordinates {arg.device_coordinates}",
+                    )
+        self.assertTrue(
+            found_scatter_output,
+            "no op spec had an IndirectAccess output arg to check",
+        )
 
     def test_scatter_2d_1d_index(self):
         """2D output [1024, 3], 1D index [3]: indirect dim should be outermost."""
