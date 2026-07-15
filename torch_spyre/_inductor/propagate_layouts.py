@@ -838,19 +838,33 @@ def _multi_arg_pointwise_layouts(
         loop_vars = set(output_dep.ranges.keys())
         indirect_syms = output_dep.index.free_symbols - loop_vars
         if indirect_syms:
-            outermost_dim = next(
-                (
-                    d
-                    for d, coord in enumerate(out_coords)
-                    if coord.free_symbols & indirect_syms
-                ),
-                None,
-            )
-            if outermost_dim is None:
+            # Find which host dimension the indirect symbol(s) map to by examining
+            # the index expression: for index = sum(coeff_d * var_d), find the
+            # dimension whose stride appears in the term containing indirect symbols.
+            c_stride = [concretize_expr(s) for s in output.stride]
+            for indirect_sym in indirect_syms:
+                # Extract the coefficient of this indirect symbol in the index.
+                # For index = d1 + 1024*tmp0, we want coeff=1024.
+                coeff_dict = output_dep.index.as_coefficients_dict()
+                for term, coeff in coeff_dict.items():
+                    if term.has(indirect_sym):
+                        # Match coeff to a host stride
+                        try:
+                            coeff_concrete = int(coeff)
+                            for d, stride in enumerate(c_stride):
+                                if stride == coeff_concrete:
+                                    outermost_dim = d
+                                    break
+                        except (TypeError, ValueError):
+                            # Coefficient is not a concrete int; cannot match to stride
+                            pass
+                if outermost_dim is not None:
+                    break
+            if outermost_dim is None and indirect_syms:
                 raise Unsupported(
                     f"Scatter ({op.get_name()}): could not map indirect symbol(s) "
-                    f"{indirect_syms} in output index {output_dep.index!r} to a host "
-                    f"dimension via coordinates {out_coords!r}"
+                    f"{indirect_syms} in output index {output_dep.index!r} to a "
+                    f"host dimension (strides={c_stride})"
                 )
 
     can_use_same_layout = True
