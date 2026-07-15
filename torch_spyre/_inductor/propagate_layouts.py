@@ -1414,11 +1414,7 @@ def propagate_spyre_tensor_layouts(
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
 
-                # For scatter ops with indirect writes, ensure the indirect dimension
-                # is outermost in the device layout by recomputing with the constraint
-                from torch._inductor.ir import Scatter
-
-                if isinstance(op.data, Scatter) and output_dep.is_indirect():
+                if output_dep.is_indirect():
                     target_layout = target.get_layout()
                     if isinstance(target_layout, FixedLayout):
                         # Recompute layouts with the scatter constraint. Raises
