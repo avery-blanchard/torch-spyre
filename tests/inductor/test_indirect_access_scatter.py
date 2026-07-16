@@ -448,15 +448,15 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_dim1_2d_output(self):
-        """Scatter on dim 1 (not dim 0): 2D output [128, 256], 1D index [64].
+        """Scatter on dim 1 (not dim 0): 2D output [128, 256], 2D index [128, 64].
         Tests that the layout constraint applies regardless of scatter dimension.
         """
         out = torch.zeros(128, 256, dtype=torch.float16).to("spyre")
         src = torch.rand(128, 64, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, 256, (64,), dtype=torch.int32).to("spyre")
+        idx = torch.randint(0, 256, (128, 64), dtype=torch.int64).to("spyre")
         self.name_dims(out, {"M": 128, "N": 256})
         self.name_dims(src, {"M": 128, "P": 64})
-        self.name_dims(idx, {"P": 64})
+        self.name_dims(idx, {"M": 128, "P": 64})
 
         def kernel(out, src, idx):
             return torch.scatter(out, 1, idx, src)
@@ -465,15 +465,15 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         self.assert_indirect_at_device_dim_0(r.op_specs)
 
     def test_scatter_dim1_3d_output(self):
-        """Scatter on dim 1 with 3D output [64, 512, 8], 1D index [32].
+        """Scatter on dim 1 with 3D output [64, 512, 8], 3D index [64, 32, 8].
         Verifies layout constraint on intermediate dimension.
         """
         out = torch.zeros(64, 512, 8, dtype=torch.float16).to("spyre")
         src = torch.rand(64, 32, 8, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, 512, (32,), dtype=torch.int32).to("spyre")
+        idx = torch.randint(0, 512, (64, 32, 8), dtype=torch.int64).to("spyre")
         self.name_dims(out, {"M": 64, "N": 512, "K": 8})
         self.name_dims(src, {"M": 64, "P": 32, "K": 8})
-        self.name_dims(idx, {"P": 32})
+        self.name_dims(idx, {"M": 64, "P": 32, "K": 8})
 
         def kernel(out, src, idx):
             return torch.scatter(out, 1, idx, src)
@@ -487,10 +487,10 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         """
         out = torch.zeros(64, 128, 256, dtype=torch.float16).to("spyre")
         src = torch.rand(64, 128, 48, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, 256, (48,), dtype=torch.int32).to("spyre")
+        idx = torch.randint(0, 256, (64, 128, 48), dtype=torch.int64).to("spyre")
         self.name_dims(out, {"M": 64, "N": 128, "K": 256})
         self.name_dims(src, {"M": 64, "N": 128, "P": 48})
-        self.name_dims(idx, {"P": 48})
+        self.name_dims(idx, {"M": 64, "N": 128, "P": 48})
 
         def kernel(out, src, idx):
             return torch.scatter(out, 2, idx, src)
@@ -504,10 +504,10 @@ class TestScatterLayoutConstraint(IndirectAccessTestCase):
         """
         out = torch.zeros(32, 64, 128, 16, dtype=torch.float16).to("spyre")
         src = torch.rand(32, 64, 32, 16, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, 128, (32,), dtype=torch.int32).to("spyre")
+        idx = torch.randint(0, 128, (32, 64, 32, 16), dtype=torch.int64).to("spyre")
         self.name_dims(out, {"A": 32, "B": 64, "C": 128, "D": 16})
         self.name_dims(src, {"A": 32, "B": 64, "P": 32, "D": 16})
-        self.name_dims(idx, {"P": 32})
+        self.name_dims(idx, {"A": 32, "B": 64, "P": 32, "D": 16})
 
         def kernel(out, src, idx):
             return torch.scatter(out, 2, idx, src)

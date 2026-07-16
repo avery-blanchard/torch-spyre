@@ -758,11 +758,37 @@ def _indirect_write_host_dim(
 ) -> int:
     """Find the host dim an indirect write's index symbol(s) map to.
 
-    For a scatter/index_put-style write, output_dep.index contains a term
-    like ``coeff_d * tmp0`` where tmp0 is the (out-of-loop) indirect index
-    symbol and coeff_d is dim d's host stride. This resolves d so the caller
-    can pin it to device position 0 (the layout constraint scatter needs).
+    For scatter/index_put operations, the scatter dimension is determined
+    from the operation's arguments (torch.scatter(out, dim, idx, src) has
+    dim as the second argument). For index_put/advanced indexing, we fall
+    back to coefficient matching: output_dep.index contains a term like
+    ``coeff_d * tmp0`` where tmp0 is the indirect index symbol and coeff_d
+    is dim d's host stride. This resolves d so the caller can pin it to
+    device position 0 (the layout constraint scatter needs).
     """
+    # Try to extract scatter dim directly from the operation.
+    # For torch.scatter and torch.scatter_, dim is the second positional arg.
+    data = getattr(op, "data", None)
+    if data and hasattr(data, "origins") and data.origins:
+        origin_node = next(iter(data.origins))
+        aten_op = getattr(origin_node, "target", None)
+        # Check if this is a scatter operation (torch.scatter, torch.scatter_, etc.)
+        if aten_op and hasattr(aten_op, "overloadpacket"):
+            op_name = getattr(aten_op.overloadpacket, "__name__", "")
+            if op_name in ("scatter", "scatter_"):
+                # For scatter(out, dim, idx, src) or scatter(out, dim, idx, src, reduce),
+                # args are: (self, dim, index, src, [reduce])
+                # We need the dim argument (args[1])
+                if len(origin_node.args) > 1:
+                    scatter_dim = origin_node.args[1]
+                    if isinstance(scatter_dim, int):
+                        # Handle negative indices
+                        if scatter_dim < 0:
+                            scatter_dim = len(output.size) + scatter_dim
+                        if 0 <= scatter_dim < len(output.size):
+                            return scatter_dim
+
+    # Fallback: match coefficient to host stride for index_put and other indirect writes.
     loop_vars = set(output_dep.ranges.keys())
     indirect_syms = output_dep.index.free_symbols - loop_vars
     c_stride = [concretize_expr(s) for s in output.stride]
