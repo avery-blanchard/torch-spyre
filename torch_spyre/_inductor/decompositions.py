@@ -565,7 +565,6 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
-    kv_block_size = 256
     q_block_size = 256
 
     # query is a transpose(1,2) VIEW: logical [B, H, Sq, D] but PHYSICALLY stored
@@ -604,24 +603,39 @@ def spyre__sdpa_overrideable(
     # CPU-side in-place ops opaque to torch.compile, so assert_functional_graph
     # is satisfied and the compiled graph sees only the resulting Spyre tensor.
     if is_causal:
-        causal_mask = torch.ops.spyre.causal_mask(
-            max_seqlen_q, max_seqlen_kv, query.dtype, query.device
-        )
+        with spyre_hint(
+            named_dims=["batch_size", "num_heads", "max_seqlen_q", "max_seqlen_kv"]
+        ):
+            causal_mask = torch.ops.spyre.causal_mask(
+                max_seqlen_q, max_seqlen_kv, query.dtype, query.device
+            )
 
     with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
         with spyre_hint(tiles={"num_heads": max(1, num_heads // 2)}):
             with spyre_hint(
                 tiles={"max_seqlen_q": max(1, max_seqlen_q // q_block_size)}
             ):
-                with spyre_hint(
-                    tiles={"max_seqlen_kv": max(1, max_seqlen_kv // kv_block_size)}
-                ):
+                with spyre_hint(tiles={"max_seqlen_kv": 1}):
                     with spyre_hint(
                         work_div={"num_heads": 2, "max_seqlen_q": 2, "max_seqlen_kv": 2}
                     ):
-                        with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_q", "head_dim"]):
+                        with spyre_hint(
+                            named_dims=[
+                                "batch_size",
+                                "num_heads",
+                                "max_seqlen_q",
+                                "head_dim",
+                            ]
+                        ):
                             scaled_query = query * scaling_factor
-                        with spyre_hint(named_dims=["batch_size", "num_heads", "max_seqlen_kv", "head_dim"]):
+                        with spyre_hint(
+                            named_dims=[
+                                "batch_size",
+                                "num_heads",
+                                "max_seqlen_kv",
+                                "head_dim",
+                            ]
+                        ):
                             scaled_keys = key * scaling_factor
                         keys_T = scaled_keys.transpose(-1, -2)
                         # batch_size, num_heads, head_dim, max_seqlen_kv
