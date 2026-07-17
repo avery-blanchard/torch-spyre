@@ -870,7 +870,7 @@ def coarse_tile(
         # Returns name_map without patching group ops (patching is deferred to
         # phase 2 so replace_computed_buffer_body runs after _stamp_group and
         # therefore copies the already-stamped loop_info onto the new object).
-        name_map = _replace_constant_fill_predecessors(
+        name_map, fill_retiled_infos = _replace_constant_fill_predecessors(
             group_ops, levels, operations, group_id
         )
         # Rebuild op_to_position after potential insertions from fill replacement.
@@ -879,7 +879,7 @@ def coarse_tile(
         # Phase 2: patch group ops to read tile-sized fills.  Done after
         # _stamp_group so loop_info is already present on each op when
         # replace_computed_buffer_body copies metadata to the reconstructed object.
-        _apply_fill_name_swap(group_ops, name_map, operations)
+        _apply_fill_name_swap(group_ops, name_map, fill_retiled_infos, operations)
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
@@ -1857,7 +1857,7 @@ def _replace_constant_fill_predecessors(
     levels: list[tuple],
     operations: list[Operation],
     group_id: tuple[int, ...],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, _RetiledBufferInfo]]:
     """Create tile-sized constant-fill buffers for full-size fills feeding the group.
 
     full.default / zeros_like / zeros ops are often created outside a
@@ -1876,10 +1876,17 @@ def _replace_constant_fill_predecessors(
     is semantically equivalent to slicing a per-iteration fill.  Because it
     sits outside the loop it is also a candidate for LX scratchpad allocation.
 
-    Returns a name_map {old_fill_name: new_tile_fill_name} for the caller to
-    apply via _apply_fill_name_swap after _stamp_group has run (so that
-    replace_computed_buffer_body preserves the loop_info already stamped on
-    each group op).
+    Returns a pair ``(name_map, retiled_infos)``:
+      - ``name_map``: {old_fill_name: new_tile_fill_name} for the caller to
+        apply via _apply_fill_name_swap after _stamp_group has run (so that
+        replace_computed_buffer_body preserves the loop_info already stamped
+        on each group op).
+      - ``retiled_infos``: {old_fill_name: _RetiledBufferInfo} recording the
+        full-size buffer's host strides and the tile-sized fill's host
+        strides, so _apply_fill_name_swap can rewrite stale load-index
+        coefficients (the swapped-in buffer is smaller, so any load index
+        built against the old buffer's strides must be rescaled — see
+        issue with ct_fill_* buffers producing unrepresentable stick exprs).
     """
     from torch._inductor.dependencies import MemoryDep
 
@@ -1892,7 +1899,7 @@ def _replace_constant_fill_predecessors(
             break
 
     if not ref_dim_hints:
-        return {}
+        return {}, {}
 
     # Collect the set of buffer names already in the group so we don't confuse
     # intra-group data-flow edges with inter-group constant-fill edges.
@@ -1905,10 +1912,16 @@ def _replace_constant_fill_predecessors(
         (i for i, op in enumerate(operations) if op is group_ops[0]), None
     )
     if first_group_idx is None:
-        return {}
+        return {}, {}
 
     # name_map collects old_fill_name → new_tile_fill_name for the NameSwapHandler.
     name_map: dict[str, str] = {}
+
+    # retiled_infos collects old_fill_name → (old full-size strides, new
+    # tile-size strides) so _apply_fill_name_swap can rescale stale load
+    # indexes when it retargets a load from old_fill_name to the smaller
+    # tile-sized fill.
+    retiled_infos: dict[str, _RetiledBufferInfo] = {}
 
     # Track already-replaced fills so we don't create duplicates when the same
     # fill feeds multiple ops in the group.
@@ -2002,6 +2015,10 @@ def _replace_constant_fill_predecessors(
                 inner_fn=lambda index, _loader=scalar_loader: _loader([]),
                 ranges=tile_ranges,
             )
+            old_strides = tuple(
+                sympy.Integer(int(s))
+                for s in FlexibleLayout.contiguous_strides(old_size)
+            )
             tile_strides = [
                 sympy.Integer(int(s))
                 for s in FlexibleLayout.contiguous_strides(tile_size)
@@ -2040,6 +2057,9 @@ def _replace_constant_fill_predecessors(
             first_group_idx += 1
 
             name_map[old_name] = fill_name
+            retiled_infos[old_name] = _RetiledBufferInfo(
+                old_strides, tuple(tile_strides)
+            )
             replaced.add(old_name)
             logger.debug(
                 "coarse_tile: created tile-sized fill %s (shape %s) replacing %s (shape %s)",
@@ -2049,15 +2069,49 @@ def _replace_constant_fill_predecessors(
                 old_size,
             )
 
-    return name_map
+    return name_map, retiled_infos
+
+
+class _RetileAndSwapHandler(WrapperHandler):
+    """Ops handler that rescales a stale load index and then swaps the buffer name.
+
+    Loads reaching this handler were built against the full-size fill buffer's
+    strides (``old_name``).  Before retargeting the load to the smaller
+    tile-sized fill (``name_map[old_name]``), the index must be rewritten from
+    the full-size strides to the tile-sized strides — otherwise the load reads
+    out of the smaller buffer's bounds using stale (too-large) coefficients.
+    """
+
+    def __init__(
+        self,
+        inner,
+        name_map: dict[str, str],
+        rewrites_by_name: dict[str, dict[Expr, Expr]],
+    ):
+        super().__init__(inner)
+        self._name_map = name_map
+        self._rewrites_by_name = rewrites_by_name
+
+    def load(self, name, index):
+        if name in self._rewrites_by_name:
+            index = _retile_load_index_from_strides(
+                name, index, self._rewrites_by_name[name]
+            )
+        return super().load(self._name_map.get(name, name), index)
 
 
 def _apply_fill_name_swap(
     group_ops: list[Operation],
     name_map: dict[str, str],
+    retiled_infos: dict[str, _RetiledBufferInfo],
     operations: list[Operation],
 ) -> None:
     """Patch group ops to read tile-sized fills instead of the original full-size ones.
+
+    Load indexes are rescaled from the full-size fill's strides to the
+    tile-sized fill's strides (see ``_RetileAndSwapHandler``) before the
+    buffer name is swapped, so consumers do not read the smaller fill using
+    stale full-size stride coefficients.
 
     Must be called AFTER _stamp_group so that replace_computed_buffer_body
     copies the already-stamped loop_info onto the reconstructed ComputedBuffer.
@@ -2066,8 +2120,13 @@ def _apply_fill_name_swap(
         return
 
     from torch._inductor.dependencies import MemoryDep
-    from .insert_restickify import NameSwapHandler
     from .pass_utils import replace_computed_buffer_body
+
+    rewrites_by_name = {
+        name: rewrites
+        for name, info in retiled_infos.items()
+        if (rewrites := _stride_rewrite_map(info))
+    }
 
     for op in group_ops:
         if not isinstance(op, ComputedBuffer):
@@ -2084,8 +2143,10 @@ def _apply_fill_name_swap(
 
         orig_inner = op.data.inner_fn
 
-        def new_inner_fn(*args, _map=name_map, _orig=orig_inner):
-            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+        def new_inner_fn(
+            *args, _map=name_map, _rewrites=rewrites_by_name, _orig=orig_inner
+        ):
+            with V.set_ops_handler(_RetileAndSwapHandler(V.ops, _map, _rewrites)):
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
