@@ -880,8 +880,12 @@ def coarse_tile(
         # _stamp_group so loop_info is already present on each op when
         # replace_computed_buffer_body copies metadata to the reconstructed object.
         _apply_fill_name_swap(group_ops, name_map, fill_retiled_infos, operations)
-        # Phase 3: retile full-size input buffers to match tiled consumers.
-        _retile_group_inputs(group_id, group_ops, levels, operations)
+        # Phase 3: patch load indices for full-size buffers that got retiled.
+        # When a buffer outside the loop (like a reduction) is tiled by _stamp_group
+        # because it's in the group, consumers outside the loop see its full-size
+        # version, but consumers inside the loop see it tiled. We need to retile
+        # the load indices for inside-loop consumers.
+        _patch_tiled_input_loads(group_id, group_ops, operations)
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
@@ -2155,101 +2159,96 @@ def _apply_fill_name_swap(
         replace_computed_buffer_body(op, op.data, operations)
 
 
-def _retile_group_inputs(
+def _patch_tiled_input_loads(
     group_id: tuple[int, ...],
     group_ops: list[Operation],
-    levels: list[tuple],
     operations: list[Operation],
 ) -> None:
-    """Retile full-size buffers consumed by tiled ops.
+    """Retile load indices for buffers that are in the group but read from outside.
 
-    When a tiled op reads a full-size buffer from outside the loop (e.g., a
-    full-size reduction like amax), divide that buffer's ranges by the loop's
-    tiling factors to match the tiled consumer's size. This allows compatible
-    device layouts without layout mismatch errors.
+    When a buffer (e.g., a reduction like amax) is in the group, its ranges get
+    divided by `_stamp_group`. But if that buffer is also read by ops outside
+    the group (or by ops inside but with full-size coordinates), those consumers
+    see it with full-size strides while the buffer itself is now tiled.
+
+    This function detects such mismatches and patches the consumer ops to use
+    retiled load indices via _RetileLoadIndexHandler.
     """
     from torch._inductor.dependencies import MemoryDep
 
-    group_names = {op.get_name() for op in group_ops if isinstance(op, ComputedBuffer)}
+    # Find group ops that are Reductions — these may have had their ranges divided
+    # and are now tiled, but could be read by other ops with stale (full-size) indices.
+    retiled_names_and_infos: dict[str, _RetiledBufferInfo] = {}
 
-    # Build a mapping: which dimensions are tiled in the group?
-    # For each level (hint), determine which output dimension it tiles.
-    # We'll use this to figure out which dimensions to divide in input buffers.
-    tiled_dims_per_level = []
     for op in group_ops:
         if not isinstance(op, ComputedBuffer):
             continue
-        if not isinstance(op.data, (Pointwise, Reduction)):
+        if not isinstance(op.data, Reduction):
             continue
+        # Reductions produce outputs; check if this one got retiled.
         loop_info = getattr(op, "loop_info", None)
-        if loop_info is None:
+        if loop_info is None or not any(dims for dims in loop_info.loop_tiled_dims):
             continue
-        tiled_dims_per_level = loop_info.loop_tiled_dims
-        break
 
-    if not tiled_dims_per_level:
+        # This reduction was tiled. Compute its old vs new strides.
+        # Old strides: what the output would have been before division
+        old_size = list(op.data.ranges)
+        for i, tiled_dims in enumerate(loop_info.loop_tiled_dims):
+            if tiled_dims:
+                loop_count = loop_info.loop_count[i]
+                for dim in tiled_dims:
+                    old_size[dim] = old_size[dim] * loop_count
+
+        old_strides = tuple(FlexibleLayout.contiguous_strides(old_size))
+        new_strides = (
+            tuple(op.layout.stride)
+            if hasattr(op, "layout")
+            else tuple(FlexibleLayout.contiguous_strides(op.data.ranges))
+        )
+
+        op_name = op.get_name()
+        retiled_names_and_infos[op_name] = _RetiledBufferInfo(old_strides, new_strides)
+
+    if not retiled_names_and_infos:
         return
 
-    # Collect full-size buffers read by tiled ops
-    for op in group_ops:
+    # Build rewrite maps for each retiled buffer
+    rewrites_by_name = {
+        name: rewrites
+        for name, info in retiled_names_and_infos.items()
+        if (rewrites := _stride_rewrite_map(info))
+    }
+
+    if not rewrites_by_name:
+        return
+
+    # Patch all ops (both inside and outside group) that read retiled buffers
+    for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
         try:
             rw = op.get_read_writes()
         except Exception:
             continue
-        for dep in rw.reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            buf_name = dep.name
-            if buf_name in group_names:
-                continue
-            buf = V.graph.get_buffer(buf_name)
-            if not isinstance(buf, ComputedBuffer):
-                continue
-            if not isinstance(buf.data, (Pointwise, Reduction)):
-                continue
-            # Skip if already has loop_info (it's already part of a group).
-            if hasattr(buf, "loop_info"):
-                continue
+        reads = {d.name for d in rw.reads if isinstance(d, MemoryDep)}
+        if not reads & set(rewrites_by_name):
+            continue
 
-            # This is a full-size buffer outside the loop. Retile it.
-            # Determine which dimensions to divide based on matching with consumer's tiled dims.
-            consumer_out_coords = op_out_coords(op)
-            tiled_dims_to_divide = []
+        orig_inner = op.data.inner_fn
 
-            for level_idx, tiled_dims in enumerate(tiled_dims_per_level):
-                if not tiled_dims:
-                    continue
-                # tiled_dims is a list like [1] meaning output dim 1 is tiled at this level
-                for out_dim in tiled_dims:
-                    # Try to find a corresponding input dimension in buf
-                    loop_var = None
-                    for h in getattr(op, "dim_hints", []):
-                        if h.loop_var is not None and not h.is_reduction:
-                            if (
-                                _loop_var_to_ranges_pos(consumer_out_coords, h.loop_var)
-                                == out_dim
-                            ):
-                                loop_var = h.loop_var
-                                break
-                    if loop_var is None:
-                        continue
+        def new_inner_fn(*args, _rewrites=rewrites_by_name, _orig=orig_inner):
+            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, {}, _rewrites)):
+                return _orig(*args)
 
-                    # Find the same loop_var in buf's output
-                    buf_out_coords = op_out_coords(buf)
-                    buf_pos = _loop_var_to_ranges_pos(buf_out_coords, loop_var)
-                    if buf_pos is not None and buf_pos not in tiled_dims_to_divide:
-                        tiled_dims_to_divide.append(buf_pos)
+        object.__setattr__(op.data, "inner_fn", new_inner_fn)
+        from .pass_utils import replace_computed_buffer_body
 
-            if tiled_dims_to_divide:
-                # Apply _divide_ranges to this buffer
-                _divide_ranges(buf, levels[0][1] if levels else 1, tiled_dims_to_divide)
-                logger.debug(
-                    "coarse_tile: retiled input buffer %s dims %s",
-                    buf_name,
-                    tiled_dims_to_divide,
-                )
+        replace_computed_buffer_body(op, op.data, operations)
+        logger.debug(
+            "coarse_tile: patched load indices for %s (reads retiled buffers %s)",
+            op.get_name(),
+            reads & set(rewrites_by_name),
+        )
 
 
 def _is_constant_fill(op: ComputedBuffer) -> bool:
