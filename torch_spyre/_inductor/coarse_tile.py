@@ -2164,55 +2164,71 @@ def _patch_tiled_input_loads(
     group_ops: list[Operation],
     operations: list[Operation],
 ) -> None:
-    """Retile load indices for buffers that are in the group but read from outside.
+    """Retile load indices for full-size buffers read by tiled ops.
 
-    When a buffer (e.g., a reduction like amax) is in the group, its ranges get
-    divided by `_stamp_group`. But if that buffer is also read by ops outside
-    the group (or by ops inside but with full-size coordinates), those consumers
-    see it with full-size strides while the buffer itself is now tiled.
-
-    This function detects such mismatches and patches the consumer ops to use
-    retiled load indices via _RetileLoadIndexHandler.
+    When tiled ops inside the loop read full-size buffers from outside the loop,
+    the load indices are stale (use full-size strides) but the iteration happens
+    with tiled ranges. This function detects such reads and patches the consumer
+    ops to use retiled load indices that match the tiled iteration ranges.
     """
     from torch._inductor.dependencies import MemoryDep
 
-    # Find group ops that are Reductions — these may have had their ranges divided
-    # and are now tiled, but could be read by other ops with stale (full-size) indices.
+    # Collect the tiled ranges from any op in the group
+    tiled_ranges = None
+    for op in group_ops:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if isinstance(op.data, (Pointwise, Reduction)):
+            tiled_ranges = list(op.data.ranges)
+            break
+
+    if tiled_ranges is None:
+        return
+
+    # Find full-size buffers read by tiled ops in the group
     retiled_names_and_infos: dict[str, _RetiledBufferInfo] = {}
 
     for op in group_ops:
         if not isinstance(op, ComputedBuffer):
             continue
-        if not isinstance(op.data, Reduction):
+        try:
+            rw = op.get_read_writes()
+        except Exception:
             continue
-        # Reductions produce outputs; check if this one got retiled.
-        loop_info = getattr(op, "loop_info", None)
-        if loop_info is None or not any(dims for dims in loop_info.loop_tiled_dims):
-            continue
+        for dep in rw.reads:
+            if not isinstance(dep, MemoryDep):
+                continue
+            buf_name = dep.name
+            if buf_name in retiled_names_and_infos:
+                continue
+            buf = V.graph.get_buffer(buf_name)
+            if not isinstance(buf, ComputedBuffer):
+                continue
+            if not isinstance(buf.data, (Pointwise, Reduction)):
+                continue
+            # Skip if it's already in a group (has loop_info)
+            if hasattr(buf, "loop_info"):
+                continue
 
-        # This reduction was tiled. Compute its old vs new strides.
-        # Old strides: what the output would have been before division
-        old_size = list(op.data.ranges)
-        for i, tiled_dims in enumerate(loop_info.loop_tiled_dims):
-            if tiled_dims:
-                loop_count = loop_info.loop_count[i]
-                for dim in tiled_dims:
-                    old_size[dim] = old_size[dim] * loop_count
+            # This is a full-size buffer outside the loop, read by a tiled op.
+            # Compute old (full) vs new (tiled) strides.
+            old_size = list(buf.data.ranges)
+            old_strides = tuple(FlexibleLayout.contiguous_strides(old_size))
+            new_strides = tuple(FlexibleLayout.contiguous_strides(tiled_ranges))
 
-        old_strides = tuple(FlexibleLayout.contiguous_strides(old_size))
-        new_strides = (
-            tuple(op.layout.stride)
-            if hasattr(op, "layout")
-            else tuple(FlexibleLayout.contiguous_strides(op.data.ranges))
-        )
-
-        op_name = op.get_name()
-        retiled_names_and_infos[op_name] = _RetiledBufferInfo(old_strides, new_strides)
+            retiled_names_and_infos[buf_name] = _RetiledBufferInfo(
+                old_strides, new_strides
+            )
+            logger.debug(
+                "coarse_tile: identified full-size input buffer %s read by tiled op %s",
+                buf_name,
+                op.get_name(),
+            )
 
     if not retiled_names_and_infos:
         return
 
-    # Build rewrite maps for each retiled buffer
+    # Build rewrite maps for each full-size buffer
     rewrites_by_name = {
         name: rewrites
         for name, info in retiled_names_and_infos.items()
@@ -2222,7 +2238,7 @@ def _patch_tiled_input_loads(
     if not rewrites_by_name:
         return
 
-    # Patch all ops (both inside and outside group) that read retiled buffers
+    # Patch all ops (both inside and outside group) that read full-size buffers
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -2237,7 +2253,7 @@ def _patch_tiled_input_loads(
         orig_inner = op.data.inner_fn
 
         def new_inner_fn(*args, _rewrites=rewrites_by_name, _orig=orig_inner):
-            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, {}, _rewrites)):
+            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _rewrites)):
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
@@ -2245,7 +2261,7 @@ def _patch_tiled_input_loads(
 
         replace_computed_buffer_body(op, op.data, operations)
         logger.debug(
-            "coarse_tile: patched load indices for %s (reads retiled buffers %s)",
+            "coarse_tile: patched load indices for %s (reads full-size buffers %s)",
             op.get_name(),
             reads & set(rewrites_by_name),
         )
