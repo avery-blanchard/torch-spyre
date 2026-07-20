@@ -1366,20 +1366,39 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     slice of (e.g. a reduction over a constant fill, which is itself a
     regular buffer once lowered).  See _insert_read_view_ops.
 
+    Also catches reads of non-tiled (or differently-tiled) buffers by a tiled
+    op: when a tiled op reads a buffer with different loop structure (e.g.
+    pre-computed full-size reductions like amax(fill)), that buffer is
+    allocated at its full size and the tiled op's per-tile access needs a
+    tile-sized view to avoid stick-expression mismatches during layout
+    propagation.
+
     SpyreConstantFallback reads are excluded: they are true scalars (rank-0,
     a single element) handled separately by _is_constant_fill /
     _replace_constant_fill_predecessors, not by the tile-view mechanism.
     """
+    op_loop_info = getattr(op, "loop_info", None)
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     full_deps = []
     for d in reads:
         buf = V.graph.get_buffer(d.name)
         if isinstance(buf, SpyreConstantFallback):
             continue
+        buf_loop_info = getattr(buf, "loop_info", None)
+        # Case 1: size mismatch (allocator produced a larger buffer than the
+        # read spans).
         buf_size = buf.get_size()
         if len(d.size) != len(buf_size) or any(
             s1 != s2 for s1, s2 in zip(d.size, buf_size)
         ):
+            full_deps.append(d)
+            continue
+        # Case 2: loop-structure mismatch (op is tiled but buffer is not, or
+        # they're tiled at different granularities).  A tiled op reading a
+        # non-tiled buffer accesses all of it through a tile-local index,
+        # which will produce a full-buffer-to-tile-access mismatch during
+        # layout propagation.
+        if op_loop_info is not None and buf_loop_info is None:
             full_deps.append(d)
     return full_deps
 
