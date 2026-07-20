@@ -2468,27 +2468,47 @@ def _apply_fill_name_swap(
 
 
 def _is_constant_fill(op: ComputedBuffer) -> bool:
-    """True if op is a Pointwise whose only reads come from SpyreConstantFallback.
+    """True if op is a constant-value fill or reduction thereof.
 
-    full.default / zeros_like / zeros lower to a SpyreConstantFallback scalar
-    broadcast through a thin Pointwise wrapper.  These ops are position-
-    independent, so shrinking their per-tile range to match the tiled group
-    is semantically equivalent to slicing a full-sized fill.
+    Detects:
+    1. Direct Pointwise fills: full.default / zeros_like / zeros (read from
+       SpyreConstantFallback scalar broadcast through Pointwise).
+    2. Reductions of constant fills: amax/amin/sum/etc of a fill buffer,
+       where the reduction is position-independent (output is constant
+       regardless of input structure).
+
+    Position-independent ops can be tile-sized by shrinking to match the
+    tiled group's per-tile range.
     """
-    if not isinstance(op.data, Pointwise):
-        return False
+    from torch._inductor.dependencies import MemoryDep
+
     try:
         rw = op.get_read_writes()
     except Exception:
         return False
-    from torch._inductor.dependencies import MemoryDep
 
-    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
-    if not reads:
-        return False
-    return all(
-        isinstance(V.graph.get_buffer(d.name), SpyreConstantFallback) for d in reads
-    )
+    # Case 1: Direct Pointwise fill (reads from SpyreConstantFallback scalar).
+    if isinstance(op.data, Pointwise):
+        reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        if not reads:
+            return False
+        return all(
+            isinstance(V.graph.get_buffer(d.name), SpyreConstantFallback) for d in reads
+        )
+
+    # Case 2: Reduction of a constant fill.
+    # A reduction (amax, amin, sum, etc) of a full-size constant fill is itself
+    # a constant. We can create a tile-sized version by reducing a tile-sized
+    # fill of the same value.
+    if isinstance(op.data, Reduction):
+        reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        if len(reads) != 1:
+            return False
+        buf = V.graph.get_buffer(reads[0].name)
+        # Check if the input is a constant fill (direct or transitive).
+        if isinstance(buf, ComputedBuffer) and _is_constant_fill(buf):
+            return True
+    return False
 
 
 def _stamp_group(
