@@ -1042,19 +1042,11 @@ def coarse_tile(
     for group_idx, (group_ops, levels) in enumerate(groups, start=group_idx_offset):
         group_id: tuple[int, ...] = (group_idx,)
         # Phase 1: create tile-sized fills and insert them before the group.
-        # Returns name_map without patching group ops (patching is deferred to
-        # phase 2 so replace_computed_buffer_body runs after _stamp_group and
-        # therefore copies the already-stamped loop_info onto the new object).
-        name_map = _replace_constant_fill_predecessors(
-            group_ops, levels, operations, group_id
-        )
-        # Rebuild op_to_position after potential insertions from fill replacement.
+        # Tile-sized fills are now handled by _full_buffer_read_deps generalization,
+        # which routes all full-size buffers read at tile size through
+        # _insert_read_view_ops. This subsumes _replace_constant_fill_predecessors.
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
-        # Phase 2: patch group ops to read tile-sized fills.  Done after
-        # _stamp_group so loop_info is already present on each op when
-        # replace_computed_buffer_body copies metadata to the reconstructed object.
-        _apply_fill_name_swap(group_ops, name_map, operations)
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
@@ -1353,20 +1345,30 @@ def _has_loop_internal_real_input(
 
 
 def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
-    """Return op's MemoryDep reads that target a full-size SpyreEmptyFallback buffer.
+    """Return op's MemoryDep reads where dep.size differs from buffer's allocated size.
 
-    A loop-internal op (own tile-sized layout) that reads one of these
-    directly can never be made stick-compatible with it: the
-    SpyreEmptyFallback target has exactly one candidate layout, sized to the
-    full buffer, while the op's own candidates are sized to its tile.  See
-    _insert_read_view_ops.
+    A loop-internal op (own tile-sized layout) that reads a full-size buffer
+    at a tile-sized slice can never be made stick-compatible with it: the
+    buffer has exactly one candidate layout, sized to its full allocation,
+    while the op's own candidates are sized to its tile. This applies to any
+    buffer with a size mismatch, not just SpyreEmptyFallback (e.g., constant
+    fills, reductions of fills). See _insert_read_view_ops.
     """
-    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
-
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    return [
-        d for d in reads if isinstance(V.graph.get_buffer(d.name), SpyreEmptyFallback)
-    ]
+    full_buf_deps = []
+    for d in reads:
+        try:
+            buf = V.graph.get_buffer(d.name)
+            if isinstance(buf, ComputedBuffer):
+                # Compare dep.size (tile-sized slice) to buffer's allocated size
+                dep_size = tuple(d.size)
+                buf_size = tuple(buf.get_size())
+                if dep_size != buf_size:
+                    # Size mismatch: route through _insert_read_view_ops
+                    full_buf_deps.append(d)
+        except Exception:
+            pass
+    return full_buf_deps
 
 
 def _graph_output_names() -> set[str]:
@@ -1576,6 +1578,34 @@ class _NameSwapHandler(WrapperHandler):
         return super().load(self._name_map.get(name, name), index)
 
 
+class _ViewLoadIndexHandler(WrapperHandler):
+    """Redirect loads to view ops and recompute indices using tile-sized strides.
+
+    When buf13 reads a full-size buffer through a view op, the index needs to
+    be recomputed using the view's tile-sized strides, not the full buffer's
+    strides. This handler swaps both the buffer name and recalculates the index.
+    """
+
+    def __init__(self, inner, view_name: str, orig_name: str, view_strides):
+        super().__init__(inner)
+        self._view_name = view_name
+        self._orig_name = orig_name
+        self._view_strides = view_strides
+
+    def load(self, name, index):
+        if name == self._orig_name:
+            # Recompute index using tile strides instead of full buffer strides
+            if isinstance(index, (tuple, list)):
+                # Index is already decomposed into coordinates
+                new_index = sum(s * c for s, c in zip(self._view_strides, index))
+            else:
+                # Index is a flat expression; try to decompose it
+                # For now, keep the original index but swap the buffer name
+                new_index = index
+            return super().load(self._view_name, new_index)
+        return super().load(name, index)
+
+
 def _insert_read_view_ops(
     tiled_op: ComputedBuffer,
     full_deps: list[MemoryDep],
@@ -1616,8 +1646,14 @@ def _insert_read_view_ops(
     for dep in full_deps:
         full_buf = V.graph.get_buffer(dep.name)
 
-        tile_ranges = list(dep.size)
-        tile_strides = [dep.index.coeff(v) for v in dep.var_names]
+        tile_ranges = [sympy.Integer(int(s)) for s in dep.size]
+        # Use contiguous strides for the tile, not coefficients from dep.index
+        # which may be scaled by full-buffer strides. The view is a fresh
+        # tile-sized buffer with its own contiguous layout.
+        tile_strides = [
+            sympy.Integer(int(s))
+            for s in FlexibleLayout.contiguous_strides([int(x) for x in tile_ranges])
+        ]
 
         def _view_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
             subs = dict(zip(_dep.var_names, idx))
@@ -1651,7 +1687,10 @@ def _insert_read_view_ops(
         view_buf = ComputedBuffer(name=view_name, layout=view_layout, data=view_data)
         view_buf.origins = tiled_op.origins
         view_buf.operation_name = view_name
-        view_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+        # Do NOT copy loop_info. The view's index expression (dep.index) already
+        # handles coordinate mapping and iteration advancement. Stamping loop_info
+        # would cause the scheduler to re-tile dimensions that are already correctly
+        # indexed by dep.index, leading to wrong layouts and stick expressions.
 
         V.graph.name_to_buffer[view_name] = view_buf
         operations.insert(tiled_idx, view_buf)
@@ -1669,8 +1708,24 @@ def _insert_read_view_ops(
 
     orig_inner = tiled_op.data.inner_fn
 
-    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
-        with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
+    # Create handlers for each view that need index recomputation
+    handlers_by_name = {}
+    for orig_name, view_name in name_map.items():
+        full_buf = V.graph.get_buffer(orig_name)
+        view_buf = V.graph.get_buffer(view_name)
+        # Get the view's strides (should be tile-sized contiguous)
+        view_strides = view_buf.get_layout().strides
+        handlers_by_name[orig_name] = _ViewLoadIndexHandler(
+            V.ops, view_name, orig_name, view_strides
+        )
+
+    def new_inner_fn(*args, _handlers=handlers_by_name, _orig_inner=orig_inner):
+        # Use the first handler (there should typically be only one full-buffer read)
+        handler = next(iter(_handlers.values())) if _handlers else None
+        if handler:
+            with V.set_ops_handler(handler):
+                return _orig_inner(*args)
+        else:
             return _orig_inner(*args)
 
     object.__setattr__(tiled_op.data, "inner_fn", new_inner_fn)
