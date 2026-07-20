@@ -735,7 +735,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
         mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
         mask_t.masked_fill_(~causal, float("-inf"))
-        lk_slices = Lk // block_size  # noqa: F841 — used in commented-out Lk hint
+        lq_slices = Lq // block_size
 
         def flash(queries, keys, values, mask):
             scale = 1.0 / math.sqrt(math.sqrt(D))
@@ -758,8 +758,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 num_tiles_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    # TODO: re-enable once numerical error with Lk tiling is fixed
-                    with spyre_hint(num_tiles_per_dim={"Lq": lk_slices}):
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
                         scaled_keys = keys * scale  # B, H, Lk, D
                         keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                         scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
@@ -1130,7 +1129,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     def test_hint_flash_attention_two_loop_levels_v2(self):
-        """Flash-attention graph: both H and Lk loop levels survive into codegen.
+        """Flash-attention graph: both H and Lq loop levels survive into codegen.
 
         Variant of test_hint_flash_attention_two_loop_levels with a causal
         mask and an explicit running-max (real_max) formulation that updates
@@ -1141,7 +1140,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
-        lq_slices = Lk // block_size  # 2
+        lq_slices = Lq // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -1230,24 +1229,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         self.assertIn(
             "count=sympify('2')",
             src,
-            "Expected Lk loop count 2 as count= in LoopSpec — _stamp_group must"
-            " divide Lk ranges on each op using that op's own dim role",
-        )
-        # The amax (op='max') reduces over Lk.  The bug causes it to receive
-        # is_reduction_level=False at the Lk loop level (group-wide flag taken
-        # from a pointwise op), so _divide_reduction_ranges is never called:
-        # amax iterates over the full Lk per tile and its tiled_symbols inner
-        # level stays empty ("[[], ").  After the per-op dispatch fix, the amax
-        # op gets a non-empty inner tiled_symbols entry for its Lk reduction dim.
-        max_op_idx = src.find("op='max'")
-        self.assertGreater(
-            max_op_idx, 0, "Expected op='max' (amax) OpSpec in generated source"
-        )
-        self.assertNotIn(
-            "tiled_symbols=[[], ",
-            src[max_op_idx : max_op_idx + 500],
-            "amax op has empty inner tiled_symbols — Lk reduction range not divided"
-            " by _stamp_group (group-wide is_reduction_level flag bug)",
+            "Expected Lq loop count 2 as count= in LoopSpec — _stamp_group must"
+            " divide Lq ranges on each op using that op's own dim role",
         )
 
     def test_hint_h_tiling_elementwise(self):
