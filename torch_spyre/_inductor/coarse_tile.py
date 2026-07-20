@@ -2308,28 +2308,58 @@ def _replace_constant_fill_predecessors(
             if not _is_constant_fill(buf):
                 continue
 
-            # Read the constant value from the SpyreConstantFallback scalar
-            # that is the fill's only input.
-            fill_rw = buf.get_read_writes()
-            scalar_dep = next(
-                (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
-            )
-            if scalar_dep is None:
+            # Extract the constant value and determine the base fill buffer.
+            # Case 1: buf is Pointwise fill → find SpyreConstantFallback
+            # Case 2: buf is Reduction of fill → find the fill input, then its SpyreConstantFallback
+            if isinstance(buf.data, Pointwise):
+                fill_rw = buf.get_read_writes()
+                scalar_dep = next(
+                    (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
+                )
+                if scalar_dep is None:
+                    continue
+                scalar_buf = V.graph.get_buffer(scalar_dep.name)
+                if not isinstance(scalar_buf, SpyreConstantFallback):
+                    continue
+                const_value = scalar_buf.constant_args[0]
+                base_fill_buf = buf
+            elif isinstance(buf.data, Reduction):
+                fill_rw = buf.get_read_writes()
+                fill_dep = next(
+                    (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
+                )
+                if fill_dep is None:
+                    continue
+                fill_input = V.graph.get_buffer(fill_dep.name)
+                if not isinstance(fill_input, ComputedBuffer):
+                    continue
+                fill_rw2 = fill_input.get_read_writes()
+                scalar_dep = next(
+                    (d for d in fill_rw2.reads if isinstance(d, MemoryDep)), None
+                )
+                if scalar_dep is None:
+                    continue
+                scalar_buf = V.graph.get_buffer(scalar_dep.name)
+                if not isinstance(scalar_buf, SpyreConstantFallback):
+                    continue
+                const_value = scalar_buf.constant_args[0]
+                base_fill_buf = fill_input
+            else:
                 continue
-            scalar_buf = V.graph.get_buffer(scalar_dep.name)
-            if not isinstance(scalar_buf, SpyreConstantFallback):
-                continue
-            const_value = scalar_buf.constant_args[0]
 
             # Compute the tile-sized shape using the consumer op's authoritative
             # loop_var→ranges_pos mapping.  Size-based matching (_constant_fill_
             # ranges_pos) is unreliable when two named dims share the same value
             # (e.g. Lq=256 and Lk=256 in flash attention).  Instead, for each
             # hint we ask: which output-ranges position of the consumer op does
-            # this hint tile?  If the fill has a dimension at that same position
-            # with the expected size, divide it; otherwise skip (the fill doesn't
+            # this hint tile?  If the buffer has a dimension at that same position
+            # with the expected size, divide it; otherwise skip (the buffer doesn't
             # have that dimension and should not be divided on it).
-            old_size = [int(r) for r in buf.data.ranges]
+            # For reductions, use the output ranges (post-reduction); for fills, use input ranges.
+            if isinstance(buf.data, Reduction):
+                old_size = [int(r) for r in buf.data.ranges]  # Reduction output
+            else:
+                old_size = [int(r) for r in base_fill_buf.data.ranges]  # Fill input
             tile_size = list(old_size)
             consumer_out = op_out_coords(op)
             for h in getattr(op, "dim_hints", None) or []:
@@ -2362,7 +2392,7 @@ def _replace_constant_fill_predecessors(
             dtype = buf.get_dtype()
             device = buf.get_device()
 
-            # Create the tile-sized scalar + fill.
+            # Create the tile-sized scalar + fill (or reduction thereof).
             new_scalar = SpyreConstantFallback(
                 torch.ops.spyre.constant.default, float(const_value), dtype, device
             )
@@ -2371,24 +2401,71 @@ def _replace_constant_fill_predecessors(
             scalar_loader = TensorBox.create(new_scalar).make_loader()
 
             tile_ranges = [sympy.Integer(s) for s in tile_size]
-            fill_data = Pointwise(
-                device=device,
-                dtype=dtype,
-                inner_fn=lambda index, _loader=scalar_loader: _loader([]),
-                ranges=tile_ranges,
-            )
             tile_strides = [
                 sympy.Integer(int(s))
                 for s in FlexibleLayout.contiguous_strides(tile_size)
             ]
             fill_name = V.graph.qualify_name(f"ct_fill_{old_name}")
-            fill_buf = ComputedBuffer(
-                name=fill_name,
-                layout=FixedLayout(device, dtype, list(tile_ranges), tile_strides),
-                data=fill_data,
-            )
-            fill_buf.origins = buf.origins
-            fill_buf.operation_name = fill_name
+
+            if isinstance(buf.data, Pointwise):
+                # Direct fill: create tile-sized Pointwise fill
+                fill_data = Pointwise(
+                    device=device,
+                    dtype=dtype,
+                    inner_fn=lambda index, _loader=scalar_loader: _loader([]),
+                    ranges=tile_ranges,
+                )
+                result_buf = ComputedBuffer(
+                    name=fill_name,
+                    layout=FixedLayout(device, dtype, list(tile_ranges), tile_strides),
+                    data=fill_data,
+                )
+            else:
+                # Reduction of fill: create tile-sized fill, then reduce it
+                # First, create and insert the tile-sized fill
+                tile_fill_name = V.graph.qualify_name(f"ct_fill_base_{old_name}")
+                tile_fill_data = Pointwise(
+                    device=device,
+                    dtype=dtype,
+                    inner_fn=lambda index, _loader=scalar_loader: _loader([]),
+                    ranges=tile_ranges,
+                )
+                tile_fill_buf = ComputedBuffer(
+                    name=tile_fill_name,
+                    layout=FixedLayout(device, dtype, list(tile_ranges), tile_strides),
+                    data=tile_fill_data,
+                )
+                tile_fill_buf.origins = buf.origins
+                tile_fill_buf.operation_name = tile_fill_name
+                V.graph.name_to_buffer[tile_fill_name] = tile_fill_buf
+
+                # Now create the reduction of the tile-sized fill
+                # Output ranges of the reduction (what consumers see)
+                output_ranges = [sympy.Integer(int(r)) for r in buf.data.ranges]
+                # Reduction ranges stay the same as original (not tiled)
+                reduction_ranges = [
+                    sympy.Integer(int(r)) for r in buf.data.reduction_ranges
+                ]
+
+                fill_data = Reduction(
+                    device=device,
+                    dtype=dtype,
+                    inner_fn=buf.data.inner_fn,
+                    ranges=output_ranges,
+                    reduction_ranges=reduction_ranges,
+                    reduction_type=buf.data.reduction_type,
+                    src_dtype=buf.data.src_dtype,
+                    reduction_hint=buf.data.reduction_hint,
+                )
+                result_buf = ComputedBuffer(
+                    name=fill_name,
+                    layout=FixedLayout(device, dtype, output_ranges, tile_strides),
+                    data=fill_data,
+                )
+
+            result_buf.origins = buf.origins
+            result_buf.operation_name = fill_name
+            fill_buf = result_buf
             # Stamp loop_info so the fill is placed inside the loop group by
             # build_loop_scheduler_nodes, with empty loop_tiled_dims (loop-
             # invariant: executed once per loop body but no range is divided).
@@ -2411,6 +2488,10 @@ def _replace_constant_fill_predecessors(
             operations.remove(new_scalar)
             operations.insert(first_group_idx, new_scalar)
             first_group_idx += 1
+            if isinstance(buf.data, Reduction):
+                # Also splice the intermediate tile-sized fill
+                operations.insert(first_group_idx, tile_fill_buf)
+                first_group_idx += 1
             operations.insert(first_group_idx, fill_buf)
             first_group_idx += 1
 
