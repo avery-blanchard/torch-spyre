@@ -2311,6 +2311,7 @@ def _replace_constant_fill_predecessors(
             # Extract the constant value and determine the base fill buffer.
             # Case 1: buf is Pointwise fill → find SpyreConstantFallback
             # Case 2: buf is Reduction of fill → find the fill input, then its SpyreConstantFallback
+            fill_dep: MemoryDep | None = None  # Narrowed for mypy in Reduction case
             if isinstance(buf.data, Pointwise):
                 fill_rw = buf.get_read_writes()
                 scalar_dep = next(
@@ -2447,10 +2448,26 @@ def _replace_constant_fill_predecessors(
                     sympy.Integer(int(r)) for r in buf.data.reduction_ranges
                 ]
 
+                # Create reduction reading from tile-sized fill.
+                # The original reduction's inner_fn captured the original full-size
+                # fill in its closure. We need to patch it to read the tile-sized
+                # fill instead. Use a NameSwapHandler wrapper.
+                assert fill_dep is not None, "fill_dep checked above"
+                original_inner_fn = buf.data.inner_fn
+                swap_map = {fill_dep.name: tile_fill_name}
+
+                def wrapped_reduction_inner_fn(index, reduction_index):
+                    prev_handler = V.ops_handler
+                    try:
+                        V.set_ops_handler(_NameSwapHandler(swap_map))
+                        return original_inner_fn(index, reduction_index)
+                    finally:
+                        V.set_ops_handler(prev_handler)
+
                 fill_data = Reduction(
                     device=device,
                     dtype=dtype,
-                    inner_fn=buf.data.inner_fn,
+                    inner_fn=wrapped_reduction_inner_fn,
                     ranges=output_ranges,
                     reduction_ranges=reduction_ranges,
                     reduction_type=buf.data.reduction_type,
@@ -2497,6 +2514,17 @@ def _replace_constant_fill_predecessors(
 
             name_map[old_name] = fill_name
             replaced.add(old_name)
+
+            # If buf is a reduction, also replace the original fill input with the tile-sized fill
+            if isinstance(buf.data, Reduction):
+                fill_rw = buf.get_read_writes()
+                fill_dep = next(
+                    (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
+                )
+                if fill_dep is not None:
+                    # Map the original fill to the new tile-sized fill
+                    name_map[fill_dep.name] = tile_fill_name
+                    replaced.add(fill_dep.name)
             logger.debug(
                 "coarse_tile: created tile-sized fill %s (shape %s) replacing %s (shape %s)",
                 fill_name,
