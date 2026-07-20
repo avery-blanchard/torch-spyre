@@ -1173,21 +1173,28 @@ def _propagate_tiled_op(
         view_ops = []
     loop_info = getattr(op, "loop_info", None)
 
-    # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
-    # real buffer directly whose own allocated size is larger than what this
-    # op reads of it (e.g. a SpyreEmptyFallback accumulator produced by an
-    # earlier Case 1/2 rewrite, or a reduction over a constant fill). That
-    # buffer has exactly one candidate layout, sized to its full allocation,
-    # while this op's own candidates are sized to its tile — the two can
-    # never be stick-compatible. Insert a tile-sized read view for each such
-    # input before doing anything else (mirrors the write-side _insert_copy_op
-    # fix, but on the read side). This must run before the
-    # Reduction/has_tiled_reduction branch below, since
-    # _propagate_tiled_reduction_op never touches op's own reads.
-    full_deps = _full_buffer_read_deps(op)
-    if full_deps:
-        op, created_views = _insert_read_view_ops(op, full_deps, operations)
+    # A tiled op — Pointwise or Reduction, loop-internal or not — may read or
+    # write real buffers whose allocated size is larger than what this op
+    # accesses (e.g. a SpyreEmptyFallback accumulator, or a sparse tensor
+    # created by reduction outside the loop). That buffer has exactly one
+    # candidate layout, sized to its full allocation, while this op's own
+    # candidates are sized to its tile — the two can never be stick-compatible.
+    # Handle reads by patching inner_fn to remap indices. Handle writes by
+    # redirecting to a tile-sized buffer and copying back outside the loop.
+    full_read_deps = _full_buffer_read_deps(op)
+    if full_read_deps:
+        op, created_views = _insert_read_view_ops(op, full_read_deps, operations)
         view_ops.extend(created_views)
+
+    full_write_deps = _full_buffer_write_deps(op)
+    if full_write_deps:
+        # TODO: handle writes to full-size buffers by redirecting to tile-sized
+        # intermediate buffers and copying back outside the loop.
+        logger.debug(
+            "_propagate_tiled_op(%s): detected writes to full-size buffers: %s",
+            op.get_name(),
+            [d.name for d in full_write_deps],
+        )
 
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
@@ -1434,6 +1441,64 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
                 d.name,
             )
             full_deps.append(d)
+    return full_deps
+
+
+def _full_buffer_write_deps(op: ComputedBuffer) -> list[MemoryDep]:
+    """Return op's MemoryDep writes to buffers larger than what the op writes.
+
+    When a tiled op writes tile-sized data to a full-size buffer (e.g., via
+    .copy_() into a pre-allocated accumulator), the size mismatch causes layout
+    propagation to fail. Detect these and mark them for accumulator-pattern
+    handling: create a tile-sized buffer inside the loop, write into it, then
+    copy back to the full-size buffer outside the loop.
+
+    Similar logic to _full_buffer_read_deps but for writes.
+    """
+    op_loop_info = getattr(op, "loop_info", None)
+    writes = [d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)]
+    full_deps = []
+    op_name = op.get_name() if hasattr(op, "get_name") else "?"
+    for d in writes:
+        try:
+            buf = V.graph.get_buffer(d.name)
+        except Exception:
+            continue
+        if isinstance(buf, SpyreConstantFallback):
+            continue
+        buf_loop_info = getattr(buf, "loop_info", None)
+        # Size mismatch: op writes tile-sized data but buffer is full-size.
+        buf_size = buf.get_size()
+        buf_size_nontriv = [s for s in buf_size if s != 1]
+        dep_size_nontriv = [s for s in d.size if s != 1]
+        if len(dep_size_nontriv) != len(buf_size_nontriv) or any(
+            s1 != s2 for s1, s2 in zip(dep_size_nontriv, buf_size_nontriv)
+        ):
+            logger.debug(
+                "_full_buffer_write_deps(%s): write size mismatch: %s "
+                "dep.size=%s vs buf_size=%s",
+                op_name,
+                d.name,
+                d.size,
+                buf_size,
+            )
+            full_deps.append(d)
+            continue
+        # Loop-structure mismatch: op is tiled but buffer is loop-invariant.
+        if (
+            op_loop_info is not None
+            and buf_loop_info is not None
+            and op_loop_info.loop_group_id == buf_loop_info.loop_group_id
+        ):
+            op_has_tiled = any(dims for dims in op_loop_info.loop_tiled_dims)
+            buf_has_tiled = any(dims for dims in buf_loop_info.loop_tiled_dims)
+            if op_has_tiled and not buf_has_tiled:
+                logger.debug(
+                    "_full_buffer_write_deps(%s): write to loop-invariant buffer: %s",
+                    op_name,
+                    d.name,
+                )
+                full_deps.append(d)
     return full_deps
 
 
