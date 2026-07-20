@@ -850,10 +850,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         explicit running-max (real_max) formulation that updates output and
         denominator in place via copy_.
         """
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         import math
         from torch_spyre._inductor import spyre_hint
 
@@ -890,29 +886,33 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             ):  # 3 nested scopes exercises multi-hint logic
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     # TODO: re-enable once numerical error with Lk tiling is fixed
-                    # with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
-                    scaled_keys = keys * scale  # B, H, Lk, D
-                    keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
-                    scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
-                    scores = scores + mask  # B, H, Lq, Lk
+                    with spyre_hint(num_tiles_per_dim={"Lq": lk_slices}):
+                        scaled_keys = keys * scale  # B, H, Lk, D
+                        keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
+                        scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
+                        scores = scores + mask  # B, H, Lq, Lk
 
-                    block_max = torch.amax(scores, dim=-1)  # B, H, Lq sparse
-                    running_max = torch.maximum(real_max, block_max)  # B, H, Lq sparse
+                        block_max = torch.amax(scores, dim=-1)  # B, H, Lq sparse
+                        running_max = torch.maximum(
+                            real_max, block_max
+                        )  # B, H, Lq sparse
 
-                    exp_scores = torch.exp(
-                        scores - running_max.unsqueeze(-1)
-                    )  # B, H, Lq, Lk
-                    correction = torch.exp(real_max - running_max)  # B, H, Lq sparse
+                        exp_scores = torch.exp(
+                            scores - running_max.unsqueeze(-1)
+                        )  # B, H, Lq, Lk
+                        correction = torch.exp(
+                            real_max - running_max
+                        )  # B, H, Lq sparse
 
-                    denominator.copy_(
-                        denominator * correction + exp_scores.sum(dim=-1)
-                    )  # B, H, Lq sparse
-                    output.copy_(
-                        output * correction.unsqueeze(-1)
-                        + torch.matmul(exp_scores, values)
-                    )  # B, H, Lq, D
+                        denominator.copy_(
+                            denominator * correction + exp_scores.sum(dim=-1)
+                        )  # B, H, Lq sparse
+                        output.copy_(
+                            output * correction.unsqueeze(-1)
+                            + torch.matmul(exp_scores, values)
+                        )  # B, H, Lq, D
 
-                    real_max.copy_(running_max)  # B, H, Lq sparse
+                        real_max.copy_(running_max)  # B, H, Lq sparse
 
             return output / denominator.unsqueeze(-1)
 
@@ -1270,7 +1270,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
-        lk_slices = Lk // block_size  # 2
+        lq_slices = Lk // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -1310,7 +1310,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             denominator = denominator.amax(dim=-1)  # B, H, Lq sparse
             with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
                         scaled_keys = keys * scale  # B, H, Lk, D
                         keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                         scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
