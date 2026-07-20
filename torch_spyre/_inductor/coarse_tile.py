@@ -1058,10 +1058,14 @@ def coarse_tile(
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
-    insert_tiling_propagation(operations, groups)
+    view_ops_by_group = insert_tiling_propagation(operations, groups, group_idx_offset)
 
     for group_id, group_ops, retiled_infos in retiled_infos_by_group:
-        _patch_retiled_load_indexes(group_id, group_ops, retiled_infos, operations)
+        # Include view ops inserted for this group in the retiled index patching.
+        group_ops_with_views = list(group_ops) + view_ops_by_group.get(group_id, [])
+        _patch_retiled_load_indexes(
+            group_id, group_ops_with_views, retiled_infos, operations
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1076,8 @@ def coarse_tile(
 def insert_tiling_propagation(
     operations: list[Operation],
     groups: list[tuple],
-) -> None:
+    group_idx_offset: int = 0,
+) -> dict[tuple[int, ...], list[Operation]]:
     """Insert full-sized buffers and copy/mutation ops for tiled ops.
 
     Handles Pointwise and Reduction ComputedBuffers.  For Reductions, tiled
@@ -1095,14 +1100,21 @@ def insert_tiling_propagation(
 
     In both cases the existing tiled_symbols / affine.apply machinery in
     SpyreKernel and bundle.py handles the per-iteration address offset.
+
+    Returns a dict mapping stamped_group_id to list of view ops inserted for that group.
     """
-    for group_ops, _ in groups:
+    view_ops_by_group = {}
+    for group_idx, (group_ops, levels) in enumerate(groups, start=group_idx_offset):
+        group_id = (group_idx,)
+        stamped_group_id = group_id + (0,) * (len(levels) - 1)
+        view_ops_by_group[stamped_group_id] = []
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
-            _propagate_tiled_op(op, operations)
+            _propagate_tiled_op(op, operations, view_ops_by_group[stamped_group_id])
+    return view_ops_by_group
 
 
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
@@ -1154,8 +1166,11 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
+    view_ops: list[Operation] | None = None,
 ) -> None:
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
+    if view_ops is None:
+        view_ops = []
     loop_info = getattr(op, "loop_info", None)
 
     # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
@@ -1171,7 +1186,8 @@ def _propagate_tiled_op(
     # _propagate_tiled_reduction_op never touches op's own reads.
     full_deps = _full_buffer_read_deps(op)
     if full_deps:
-        op = _insert_read_view_ops(op, full_deps, operations)
+        op, created_views = _insert_read_view_ops(op, full_deps, operations)
+        view_ops.extend(created_views)
 
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
@@ -1380,6 +1396,7 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     op_loop_info = getattr(op, "loop_info", None)
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     full_deps = []
+    op_name = op.get_name() if hasattr(op, "get_name") else "?"
     for d in reads:
         buf = V.graph.get_buffer(d.name)
         if isinstance(buf, SpyreConstantFallback):
@@ -1388,9 +1405,20 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
         # Case 1: size mismatch (allocator produced a larger buffer than the
         # read spans).
         buf_size = buf.get_size()
-        if len(d.size) != len(buf_size) or any(
-            s1 != s2 for s1, s2 in zip(d.size, buf_size)
+        # Collapse size-1 dimensions when comparing (B=1 is often implicit).
+        buf_size_nontriv = [s for s in buf_size if s != 1]
+        dep_size_nontriv = [s for s in d.size if s != 1]
+        if len(dep_size_nontriv) != len(buf_size_nontriv) or any(
+            s1 != s2 for s1, s2 in zip(dep_size_nontriv, buf_size_nontriv)
         ):
+            logger.debug(
+                "_full_buffer_read_deps(%s): Case 1 detected: %s size "
+                "mismatch: dep.size=%s vs buf_size=%s",
+                op_name,
+                d.name,
+                d.size,
+                buf_size,
+            )
             full_deps.append(d)
             continue
         # Case 2: loop-structure mismatch (op is tiled but buffer is not, or
@@ -1399,6 +1427,12 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
         # which will produce a full-buffer-to-tile-access mismatch during
         # layout propagation.
         if op_loop_info is not None and buf_loop_info is None:
+            logger.debug(
+                "_full_buffer_read_deps(%s): Case 2 detected: %s "
+                "loop-structure mismatch (op has loop_info, buf does not)",
+                op_name,
+                d.name,
+            )
             full_deps.append(d)
     return full_deps
 
@@ -1671,11 +1705,14 @@ def _insert_read_view_ops(
     """
     name_map: dict[str, str] = {}
     tiled_idx = operations.index(tiled_op)
+    view_ops = []  # Track view ops created for this tiled op
 
     for dep in full_deps:
         full_buf = V.graph.get_buffer(dep.name)
 
         tile_ranges = list(dep.size)
+        # Use the dep's index coefficients as strides so that when tiled_op reads
+        # the view with its original index expression, the coordinates are correct.
         tile_strides = [dep.index.coeff(v) for v in dep.var_names]
 
         def _view_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
@@ -1714,6 +1751,7 @@ def _insert_read_view_ops(
 
         V.graph.name_to_buffer[view_name] = view_buf
         operations.insert(tiled_idx, view_buf)
+        view_ops.append(view_buf)
         tiled_idx += 1
 
         name_map[dep.name] = view_name
@@ -1735,7 +1773,23 @@ def _insert_read_view_ops(
     object.__setattr__(tiled_op.data, "inner_fn", new_inner_fn)
     new_op = replace_computed_buffer_body(tiled_op, tiled_op.data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
-    return new_op
+    logger.debug(
+        "_insert_read_view_ops(%s): patched inner_fn with NameSwapHandler "
+        "mapping %s; inserted %d view ops before tiled op in operations list",
+        new_op.get_name(),
+        name_map,
+        len(full_deps),
+    )
+    # Clear the memoized read_writes cache so future calls re-trace the
+    # patched inner_fn through the NameSwapHandler and see updated ranges.
+    from .pass_utils import invalidate_op_read_writes
+
+    invalidate_op_read_writes(new_op)
+
+    # Return both the new op and the list of view ops created.
+    # The view ops list is returned to the caller so they can be included
+    # in retiled load index patching.
+    return new_op, view_ops
 
 
 # ---------------------------------------------------------------------------
