@@ -1159,14 +1159,16 @@ def _propagate_tiled_op(
     loop_info = getattr(op, "loop_info", None)
 
     # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
-    # full-size SpyreEmptyFallback buffer directly (e.g. an accumulator
-    # produced by an earlier Case 1/2 rewrite).  That buffer has exactly one
-    # candidate layout, sized to the full buffer, while this op's own
-    # candidates are sized to its tile — the two can never be stick-compatible.
-    # Insert a tile-sized read view for each such input before doing anything
-    # else (mirrors the write-side _insert_copy_op fix, but on the read side).
-    # This must run before the Reduction/has_tiled_reduction branch below,
-    # since _propagate_tiled_reduction_op never touches op's own reads.
+    # real buffer directly whose own allocated size is larger than what this
+    # op reads of it (e.g. a SpyreEmptyFallback accumulator produced by an
+    # earlier Case 1/2 rewrite, or a reduction over a constant fill). That
+    # buffer has exactly one candidate layout, sized to its full allocation,
+    # while this op's own candidates are sized to its tile — the two can
+    # never be stick-compatible. Insert a tile-sized read view for each such
+    # input before doing anything else (mirrors the write-side _insert_copy_op
+    # fix, but on the read side). This must run before the
+    # Reduction/has_tiled_reduction branch below, since
+    # _propagate_tiled_reduction_op never touches op's own reads.
     full_deps = _full_buffer_read_deps(op)
     if full_deps:
         op = _insert_read_view_ops(op, full_deps, operations)
@@ -1353,20 +1355,33 @@ def _has_loop_internal_real_input(
 
 
 def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
-    """Return op's MemoryDep reads that target a full-size SpyreEmptyFallback buffer.
+    """Return op's MemoryDep reads whose target buffer is larger than the read.
 
-    A loop-internal op (own tile-sized layout) that reads one of these
-    directly can never be made stick-compatible with it: the
-    SpyreEmptyFallback target has exactly one candidate layout, sized to the
-    full buffer, while the op's own candidates are sized to its tile.  See
-    _insert_read_view_ops.
+    A loop-internal op (own tile-sized layout) that reads a real buffer whose
+    own allocated size is larger than what this op actually reads (dep.size)
+    can never be made stick-compatible with it: the target has exactly one
+    candidate layout, sized to its full allocation, while the op's own
+    candidates are sized to its tile.  This covers SpyreEmptyFallback
+    accumulators as well as any other full-size buffer a tiled op reads a
+    slice of (e.g. a reduction over a constant fill, which is itself a
+    regular buffer once lowered).  See _insert_read_view_ops.
+
+    SpyreConstantFallback reads are excluded: they are true scalars (rank-0,
+    a single element) handled separately by _is_constant_fill /
+    _replace_constant_fill_predecessors, not by the tile-view mechanism.
     """
-    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
-
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    return [
-        d for d in reads if isinstance(V.graph.get_buffer(d.name), SpyreEmptyFallback)
-    ]
+    full_deps = []
+    for d in reads:
+        buf = V.graph.get_buffer(d.name)
+        if isinstance(buf, SpyreConstantFallback):
+            continue
+        buf_size = buf.get_size()
+        if len(d.size) != len(buf_size) or any(
+            s1 != s2 for s1, s2 in zip(d.size, buf_size)
+        ):
+            full_deps.append(d)
+    return full_deps
 
 
 def _graph_output_names() -> set[str]:
@@ -1532,6 +1547,19 @@ def _insert_copy_op(
     pointing at full_buf so store_output writes into full_buf.  Because
     loop_tiled_dims is set, SpyreKernel stamps tiled_symbols on the OpSpec
     and bundle.mlir emits affine.apply for the per-iteration output address.
+
+    A tile-sized FixedLayout (copy_buf.tile_layout) is also stamped onto the
+    op, mirroring _insert_read_view_ops' view_layout on the read side.
+    MutationLayoutSHOULDREMOVE.get_size()/get_stride() always resolve to
+    full_buf's full size (needed elsewhere for mutation/alias bookkeeping),
+    so layout propagation would otherwise see a full-size output paired with
+    this op's tile-sized MemoryDep — the same size mismatch
+    _insert_read_view_ops avoids on the read side.  propagate_layouts.py's
+    MutationLayoutSHOULDREMOVE branch uses tile_layout, when present, as a
+    tile-sized stand-in for target_buf.get_layout() so layout propagation
+    only ever sees tile-sized layouts paired with tile-sized MemoryDeps, then
+    rescales the resulting device layout back up to full_buf's size via
+    _resize_device_layout.
     """
     copy_data = Pointwise(
         device=tiled_op.get_device(),
@@ -1551,6 +1579,18 @@ def _insert_copy_op(
 
     # Stamp with the same loop metadata so this op is inside the same loop.
     copy_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+
+    # Derive the tile-sized write layout from the copy op's own store index,
+    # the same way _insert_read_view_ops derives view_layout from a read dep
+    # (tile_ranges = dep.size, tile_strides = per-var index coefficients).
+    write_dep = next(iter(copy_buf.get_read_writes().writes))
+    tile_strides = [write_dep.index.coeff(v) for v in write_dep.var_names]
+    copy_buf.tile_layout = FixedLayout(  # type: ignore[attr-defined]
+        tiled_op.get_device(),
+        full_buf.get_dtype(),
+        list(write_dep.size),
+        tile_strides,
+    )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
 

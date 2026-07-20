@@ -60,7 +60,12 @@ from .constants import (
     STAGGERED_EAS,
     TOPK_OPS,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
+from .ir import (
+    FixedTiledLayout,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    _resize_device_layout,
+)
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -83,6 +88,37 @@ from .views import matching_dim
 # ---------------------------------------------------------------------------
 
 logger = get_inductor_logger("propagate_layouts")
+
+
+def _rescale_to_full_accum(
+    candidates: list[SpyreTensorLayout],
+    tile_layout: FixedLayout,
+    full_layout: FixedLayout,
+) -> list[SpyreTensorLayout]:
+    """Scale tile-sized device layout candidates up to full_layout's host size.
+
+    Candidates were built (by _matmul_layouts / _single_arg_op_layout /
+    _multi_arg_pointwise_layouts) from tile_layout's host size/stride, so
+    their device_size/stride_map are sized to the tile.  target_buf must end
+    up with a device layout matching its own full-size allocation, so scale
+    each candidate the same way _allocate_full_buffer scales a per-tile
+    device layout up to a full one.
+    """
+    tile_size_ints = [concretize_expr(s) for s in tile_layout.size]
+    full_size_ints = [concretize_expr(s) for s in full_layout.size]
+    rescaled = []
+    for stl in candidates:
+        try:
+            rescaled.append(_resize_device_layout(stl, tile_size_ints, full_size_ints))
+        except RuntimeError:
+            logger.debug(
+                "_rescale_to_full_accum: _resize_device_layout could not "
+                "classify %r (tile_size=%s full_size=%s); dropping candidate",
+                stl,
+                tile_size_ints,
+                full_size_ints,
+            )
+    return rescaled
 
 
 prims = torch.ops.prims
@@ -660,6 +696,7 @@ def _matmul_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
+    full_output: FixedLayout | None = None,
 ) -> list[SpyreTensorLayout]:
     """
     Matmul has fixed in/out stick requirements so handled specially.
@@ -668,6 +705,12 @@ def _matmul_layouts(
           on the free symbols of each input's index expression — no host-dim lookup needed
        2. For both input args, find a required STL with the correct stick symbol
        3. Compute the output STL and construct the FixedInOutNode cost function
+
+    full_output, when given (accumulator write-back case), is used instead of
+    output for the output STL's own size/stride: output/output_dep must stay
+    tile-sized for host_coordinates (coordinate assignment depends on the
+    dep's actual loop ranges against the layout's real numeric size/stride),
+    but the resulting out_stl must be sized to the full accumulator.
     """
     data = op.data
     _check_supported_input_sticks(args, data.reduction_type)
@@ -705,17 +748,18 @@ def _matmul_layouts(
             f"{data.reduction_type}: generated_var={generated_var} not found in output coords {out_coords}"
         )
 
-    out_dims = len(output.size)
+    size_source = full_output if full_output is not None else output
+    out_dims = len(size_source.size)
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
         out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
     else:
         out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
     # Concretize for C++ SpyreTensorLayout constructor.
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
+    c_size = [concretize_expr(s) for s in size_source.size]
+    c_stride = [concretize_expr(s) for s in size_source.stride]
 
-    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    out_stl = SpyreTensorLayout(c_size, c_stride, size_source.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y], out_stl, [x_req_stl, y_req_stl], op
@@ -1398,18 +1442,25 @@ def propagate_spyre_tensor_layouts(
                         # mirrors the non-accumulator BATCH_MATMUL_OP dispatch
                         # in compute_layouts, whose args also never include the
                         # reduction's own output buffer). _matmul_layouts
-                        # derives a single out_stl deterministically from
-                        # accum_layout and installs its own FixedInOutNode, so
-                        # the accumulator is automatically pinned to that same
-                        # out_stl -- no separate AllSameNode join is needed.
+                        # derives a single out_stl deterministically -- sized to
+                        # full_layout via full_output, but coordinate-derived
+                        # from the tile-sized accum_layout/output_dep -- and
+                        # installs its own FixedInOutNode, so the accumulator
+                        # is automatically pinned to that same out_stl -- no
+                        # separate AllSameNode join is needed.
                         assert len(new_value_args) == 2, (
                             "BATCH_MATMUL_OP accumulator op should have exactly "
                             f"two non-accumulator inputs, got {len(new_value_args)} "
                             f"for {op.get_name()}"
                         )
-                        accum_layout = target_buf.get_layout()
+                        full_layout = target_buf.get_layout()
+                        accum_layout = getattr(op, "tile_layout", None) or full_layout
                         candidates = _matmul_layouts(
-                            op, accum_layout, output_dep, new_value_args
+                            op,
+                            accum_layout,
+                            output_dep,
+                            new_value_args,
+                            full_output=full_layout,
                         )
                         target_buf.layouts = candidates
                         op.layouts = candidates
@@ -1426,7 +1477,8 @@ def propagate_spyre_tensor_layouts(
                             "Reduction op should have exactly one non-accumulator "
                             f"input, got {len(new_value_args)} for {op.get_name()}"
                         )
-                        accum_layout = target_buf.get_layout()
+                        full_layout = target_buf.get_layout()
+                        accum_layout = getattr(op, "tile_layout", None) or full_layout
                         in_arg = new_value_args[0]
                         candidates = []
                         for stl in in_arg.layouts:
@@ -1447,6 +1499,10 @@ def propagate_spyre_tensor_layouts(
                                 f"candidate input layouts; accum size="
                                 f"{accum_layout.size}"
                             )
+                        if accum_layout is not full_layout:
+                            candidates = _rescale_to_full_accum(
+                                candidates, accum_layout, full_layout
+                            )
                         # The accumulator read-back (target_name) is also a
                         # real input to this op and its stick must match the
                         # output, so build the cost function from all_args
@@ -1457,10 +1513,15 @@ def propagate_spyre_tensor_layouts(
                         target_buf.layouts = candidates
                         op.layouts = candidates
                     else:
-                        accum_layout = target_buf.get_layout()
+                        full_layout = target_buf.get_layout()
+                        accum_layout = getattr(op, "tile_layout", None) or full_layout
                         candidates = _multi_arg_pointwise_layouts(
                             op, accum_layout, output_dep, new_value_args
                         )
+                        if accum_layout is not full_layout:
+                            candidates = _rescale_to_full_accum(
+                                candidates, accum_layout, full_layout
+                            )
                         # op.restick_cost_fn was set by _multi_arg_pointwise_layouts
                         # using only new_value_args.  The accumulator read-back
                         # (target_name) is also a real input to this add and its
