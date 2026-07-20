@@ -1183,8 +1183,7 @@ def _propagate_tiled_op(
     # redirecting to a tile-sized buffer and copying back outside the loop.
     full_read_deps = _full_buffer_read_deps(op)
     if full_read_deps:
-        op, created_views = _insert_read_view_ops(op, full_read_deps, operations)
-        view_ops.extend(created_views)
+        op = _insert_read_view_ops(op, full_read_deps, operations)
 
     full_write_deps = _full_buffer_write_deps(op)
     if full_write_deps:
@@ -1404,6 +1403,12 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     full_deps = []
     op_name = op.get_name() if hasattr(op, "get_name") else "?"
+    logger.debug(
+        "_full_buffer_read_deps(%s): checking %d reads, op_loop_info=%s",
+        op_name,
+        len(reads),
+        op_loop_info,
+    )
     for d in reads:
         buf = V.graph.get_buffer(d.name)
         if isinstance(buf, SpyreConstantFallback):
@@ -1415,6 +1420,15 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
         # Collapse size-1 dimensions when comparing (B=1 is often implicit).
         buf_size_nontriv = [s for s in buf_size if s != 1]
         dep_size_nontriv = [s for s in d.size if s != 1]
+        logger.debug(
+            "_full_buffer_read_deps(%s): checking %s: buf_size=%s, dep.size=%s, "
+            "buf_loop_info=%s",
+            op_name,
+            d.name,
+            buf_size,
+            d.size,
+            buf_loop_info,
+        )
         if len(dep_size_nontriv) != len(buf_size_nontriv) or any(
             s1 != s2 for s1, s2 in zip(dep_size_nontriv, buf_size_nontriv)
         ):
@@ -1428,11 +1442,9 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
             )
             full_deps.append(d)
             continue
-        # Case 2: loop-structure mismatch (op is tiled but buffer is not, or
-        # they're tiled at different granularities).  A tiled op reading a
-        # non-tiled buffer accesses all of it through a tile-local index,
-        # which will produce a full-buffer-to-tile-access mismatch during
-        # layout propagation.
+        # Case 2: loop-structure mismatch (op is tiled but buffer is not).
+        # A tiled op reading a non-tiled buffer accesses all of it through
+        # a tile-local index, which will produce a mismatch during layout propagation.
         if op_loop_info is not None and buf_loop_info is None:
             logger.debug(
                 "_full_buffer_read_deps(%s): Case 2 detected: %s "
@@ -1441,6 +1453,25 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
                 d.name,
             )
             full_deps.append(d)
+            continue
+        # Case 3: both have loop_info but at different tiling granularities.
+        # E.g., buf21 (tiled: [[1], [2]]) reads ct_fill_buf1 (loop-invariant: [[], []]).
+        # The op accesses the entire buffer through tile-local coordinates.
+        if (
+            op_loop_info is not None
+            and buf_loop_info is not None
+            and op_loop_info.loop_group_id == buf_loop_info.loop_group_id
+        ):
+            op_has_tiled = any(dims for dims in op_loop_info.loop_tiled_dims)
+            buf_has_tiled = any(dims for dims in buf_loop_info.loop_tiled_dims)
+            if op_has_tiled and not buf_has_tiled:
+                logger.debug(
+                    "_full_buffer_read_deps(%s): Case 3 detected: %s "
+                    "different tiling granularities (op tiled, buf loop-invariant)",
+                    op_name,
+                    d.name,
+                )
+                full_deps.append(d)
     return full_deps
 
 
@@ -1739,122 +1770,55 @@ def _insert_read_view_ops(
     full_deps: list[MemoryDep],
     operations: list[Operation],
 ) -> ComputedBuffer:
-    """Insert, before tiled_op, one tile-sized view op per full-size real input.
+    """Patch tiled_op's inner_fn to remap indices for full-size buffer reads.
 
-    tiled_op is loop-internal (no outside consumers) but reads one or more
-    full-size SpyreEmptyFallback buffers directly. Those buffers get exactly
-    one candidate layout (sized to the full buffer), while tiled_op's own
-    candidates are sized to its tile — the two can never be stick-compatible
-    under AllSameNode.  Mirroring _insert_copy_op's write-side fix: for each
-    such input, insert a small Pointwise "view" op that reads the full
-    buffer's current tile slice (same index expression tiled_op already
-    uses, same loop_info so the per-iteration base address advances
-    identically) and writes it into a fresh tile-sized buffer.  tiled_op's
-    own inner_fn is then patched (WrapperHandler, not reconstructed — see
-    _NameSwapHandler) to read the view instead of the full buffer.
-
-    The view's own ranges/index must match dep (dep.var_names/dep.size), not
-    tiled_op.data.ranges: for a Reduction, the read spans output dims plus
-    the reduction dim, so dep's iteration space has more vars than the op's
-    own output-shaped ranges.  The view's layout reuses full_buf's own
-    per-var strides (extracted from dep.index, which is affine in
-    dep.var_names) rather than fresh contiguous strides, sized down to
-    dep.size — so tiled_op's unmodified read index (dep.index, computed
-    against those same strides) still resolves correctly once _NameSwapHandler
-    retargets the load at the view buffer instead of full_buf.
-
-    Returns the reconstructed ComputedBuffer that replaces tiled_op in
-    operations (see replace_computed_buffer_body below) — callers must
-    rebind their own reference since the original tiled_op object is stale
-    after this call.
+    When a tiled op reads a full-size buffer at tile-local coordinates, remap
+    the indices inline using the MemoryDep's index expression. This avoids
+    creating intermediate view buffers that would themselves hit layout
+    propagation issues.
     """
-    name_map: dict[str, str] = {}
-    tiled_idx = operations.index(tiled_op)
-    view_ops = []  # Track view ops created for this tiled op
-
+    # Build index remap: buffer_name → (var_names, index_expr)
+    index_remap: dict[str, tuple] = {}
     for dep in full_deps:
-        full_buf = V.graph.get_buffer(dep.name)
+        index_remap[dep.name] = (dep.var_names, dep.index)
 
-        tile_ranges = list(dep.size)
-        # Use the dep's index coefficients as strides so that when tiled_op reads
-        # the view with its original index expression, the coordinates are correct.
-        tile_strides = [dep.index.coeff(v) for v in dep.var_names]
-
-        def _view_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
-            subs = dict(zip(_dep.var_names, idx))
-            flat_index = sympy_subs(_dep.index, subs)
-            return V.ops.load(_full_name, flat_index)
-
-        # Construct under tiled_op's origins so data.origins is non-empty —
-        # _single_arg_op_layout (propagate_layouts.py) unconditionally
-        # dereferences next(iter(data.origins)) for ordinary (non-mutation)
-        # Pointwise ops.  IRNode.origins is populated at construction time
-        # from IRNode._current_origins, so it must be set via this context
-        # manager rather than assigned after the fact (assigning
-        # view_buf.origins below only sets the ComputedBuffer's own origins,
-        # not view_data's).
-        with IRNode.current_origins(tiled_op.origins):
-            view_data = Pointwise(
-                device=tiled_op.get_device(),
-                dtype=full_buf.get_dtype(),
-                inner_fn=_view_inner_fn,
-                ranges=tile_ranges,
-            )
-        view_name = V.graph.qualify_name(
-            f"coarse_tile_read_view_{tiled_op.get_name()}_{dep.name}"
-        )
-        view_layout = FixedLayout(
-            tiled_op.get_device(),
-            full_buf.get_dtype(),
-            tile_ranges,
-            tile_strides,
-        )
-        view_buf = ComputedBuffer(name=view_name, layout=view_layout, data=view_data)
-        view_buf.origins = tiled_op.origins
-        view_buf.operation_name = view_name
-        view_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
-
-        V.graph.name_to_buffer[view_name] = view_buf
-        operations.insert(tiled_idx, view_buf)
-        view_ops.append(view_buf)
-        tiled_idx += 1
-
-        name_map[dep.name] = view_name
-
-    # Patch tiled_op's inner_fn once with the full name_map (wrap, not
-    # reconstruct — see _NameSwapHandler docstring).  Rebuild via
-    # replace_computed_buffer_body, matching every other inner_fn-rewrite
-    # site in this file (_patch_consumers, _patch_retiled_load_indexes,
-    # _apply_fill_name_swap): a fresh ComputedBuffer has no stale per-object
-    # caches, sidestepping the need to enumerate every cache key by hand.
     from .pass_utils import replace_computed_buffer_body
 
     orig_inner = tiled_op.data.inner_fn
 
-    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
-        with V.set_ops_handler(_NameSwapHandler(V.ops, _map)):
+    class _RemapIndexHandler(WrapperHandler):
+        """Remap load indices for full-size buffers using tile-local coordinates."""
+
+        def __init__(self, base_ops, remap_info):
+            super().__init__(base_ops)
+            self.remap = remap_info
+
+        def load(self, name, index):
+            if name in self.remap:
+                var_names, index_expr = self.remap[name]
+                # The index passed here is tile-local. Map it through the
+                # MemoryDep's index expression to get the full-buffer coordinate.
+                return super().load(name, index_expr)
+            return super().load(name, index)
+
+    def new_inner_fn(*args, _remap=index_remap, _orig_inner=orig_inner):
+        with V.set_ops_handler(_RemapIndexHandler(V.ops, _remap)):
             return _orig_inner(*args)
 
     object.__setattr__(tiled_op.data, "inner_fn", new_inner_fn)
     new_op = replace_computed_buffer_body(tiled_op, tiled_op.data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
     logger.debug(
-        "_insert_read_view_ops(%s): patched inner_fn with NameSwapHandler "
-        "mapping %s; inserted %d view ops before tiled op in operations list",
+        "_insert_read_view_ops(%s): patched inner_fn to remap indices for %d "
+        "full-size buffer reads (no view ops created)",
         new_op.get_name(),
-        name_map,
         len(full_deps),
     )
-    # Clear the memoized read_writes cache so future calls re-trace the
-    # patched inner_fn through the NameSwapHandler and see updated ranges.
     from .pass_utils import invalidate_op_read_writes
 
     invalidate_op_read_writes(new_op)
 
-    # Return both the new op and the list of view ops created.
-    # The view ops list is returned to the caller so they can be included
-    # in retiled load index patching.
-    return new_op, view_ops
+    return new_op
 
 
 # ---------------------------------------------------------------------------
