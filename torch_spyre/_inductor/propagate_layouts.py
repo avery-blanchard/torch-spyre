@@ -758,37 +758,12 @@ def _indirect_write_host_dim(
 ) -> int:
     """Find the host dim an indirect write's index symbol(s) map to.
 
-    For scatter/index_put operations, the scatter dimension is determined
-    from the operation's arguments (torch.scatter(out, dim, idx, src) has
-    dim as the second argument). For index_put/advanced indexing, we fall
-    back to coefficient matching: output_dep.index contains a term like
-    ``coeff_d * tmp0`` where tmp0 is the indirect index symbol and coeff_d
-    is dim d's host stride. This resolves d so the caller can pin it to
-    device position 0 (the layout constraint scatter needs).
+    For indirect writes, output_dep.index contains a term like ``coeff_d * tmp0``
+    where tmp0 is the (out-of-loop) indirect index symbol and coeff_d is dim d's
+    host stride. This resolves d so the caller can pin it to device position 0
+    (the layout constraint scatter needs).
     """
-    # Try to extract scatter dim directly from the operation.
-    # For torch.scatter and torch.scatter_, dim is the second positional arg.
-    data = getattr(op, "data", None)
-    if data and hasattr(data, "origins") and data.origins:
-        origin_node = next(iter(data.origins))
-        aten_op = getattr(origin_node, "target", None)
-        # Check if this is a scatter operation (torch.scatter, torch.scatter_, etc.)
-        if aten_op and hasattr(aten_op, "overloadpacket"):
-            op_name = getattr(aten_op.overloadpacket, "__name__", "")
-            if op_name in ("scatter", "scatter_"):
-                # For scatter(out, dim, idx, src) or scatter(out, dim, idx, src, reduce),
-                # args are: (self, dim, index, src, [reduce])
-                # We need the dim argument (args[1])
-                if len(origin_node.args) > 1:
-                    scatter_dim = origin_node.args[1]
-                    if isinstance(scatter_dim, int):
-                        # Handle negative indices
-                        if scatter_dim < 0:
-                            scatter_dim = len(output.size) + scatter_dim
-                        if 0 <= scatter_dim < len(output.size):
-                            return scatter_dim
-
-    # Fallback: match coefficient to host stride for index_put and other indirect writes.
+    # Match coefficient to host stride for indirect writes.
     loop_vars = set(output_dep.ranges.keys())
     indirect_syms = output_dep.index.free_symbols - loop_vars
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -833,6 +808,7 @@ def _indirect_write_host_dim(
                 )
         if matched_dims:
             return next(iter(matched_dims))
+
     raise Unsupported(
         f"Scatter ({op.get_name()}): could not map indirect symbol(s) "
         f"{indirect_syms} in output index {output_dep.index!r} to a "
@@ -1044,6 +1020,11 @@ def _multi_arg_pointwise_layouts(
                 stl = SpyreTensorLayout(
                     device_size, stride_map, get_device_dtype(output.dtype), output_ea
                 )
+                # Validate that the manually-constructed pinned layout has an
+                # offset-free stick expression. If not, skip this layout candidate.
+                coords = device_coordinates(stl, output_dep, ind_sizes)
+                if not is_stick_expr_offset_free(coords[-1], stick_size):
+                    return
             else:
                 # Normal path: use dim_order constructor
                 stl = SpyreTensorLayout(
@@ -1554,8 +1535,21 @@ def propagate_spyre_tensor_layouts(
                         target_stl = _multi_arg_pointwise_layouts(
                             op, target_layout, output_dep, args, (outermost_dim,)
                         )[0]
-                        # Update the graph input's layout to use the constrained STL
-                        # so that real_layout() will use it when computing the mutation layout
+                        # Update the target buffer's device layout directly so OpSpec
+                        # generation uses the pinned layout. Also update graph input
+                        # layouts for consistency.
+                        if isinstance(target, TensorBox):
+                            if isinstance(target.data, StorageBox):
+                                if isinstance(target.data.data, InputBuffer):
+                                    # Replace the FixedLayout with a FixedTiledLayout
+                                    # that uses the pinned device layout
+                                    target.data.data.layout = FixedTiledLayout(
+                                        target_layout.device,
+                                        target_layout.dtype,
+                                        target_layout.size,
+                                        target_layout.stride,
+                                        target_stl,
+                                    )
                         graph_input = V.graph.graph_inputs.get(target_name)
                         if graph_input is not None:
                             graph_input.layouts = [target_stl]
