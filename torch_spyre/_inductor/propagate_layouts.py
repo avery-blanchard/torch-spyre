@@ -980,53 +980,29 @@ def _multi_arg_pointwise_layouts(
             return
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords, pinned_dims)
         if _is_supported_layout(dim_order):
-            if outermost_dim is not None:
-                # With a pinned dim, manually construct device_size and
-                # stride_map to place it at device position 0.
-                device_size = []
-                stride_map = []
-
-                def _non_stick_stride(d):
-                    return -1 if c_size[d] == 1 else c_stride[d]
-
-                # First, add outermost_dim at device position 0
-                device_size.append(c_size[outermost_dim])
-                stride_map.append(_non_stick_stride(outermost_dim))
-
-                # Then, add other host dims in the order specified by dim_order
-                # (excluding outermost_dim and stick_dim, which we handle separately)
-                for d in dim_order:
-                    if d != outermost_dim and d != stick_dim:
-                        device_size.append(c_size[d])
-                        stride_map.append(_non_stick_stride(d))
-
-                # Finally, add stick_dim split into stick_count + elems_per_stick.
-                # The stick dim's host stride need not be 1 (stick_dim is not
-                # necessarily the innermost host dim once outermost_dim has
-                # claimed device position 0), so the two device slots must be
-                # derived from the host stride rather than hardcoded to
-                # stick_size/1. This mirrors dim_map_to_stride_map in
-                # spyre_tensor_impl.cpp and restickify_stride_map in
-                # pass_utils.py: the elems-per-stick slot takes the stick dim's
-                # host stride, and the stick-count slot takes that stride
-                # scaled by stick_size.
-                stick_host_stride = c_stride[stick_dim]
+            if outermost_dim is not None and len(c_size) == 2:
+                # For 2D tensors with pinning, construct device_size/stride_map directly
+                # following the generic_stick_layout pattern from spyre_tensor_impl.cpp.
+                # For rank 2: dim_map = [dim_order[1], dim_order[0], dim_order[1]]
+                # To put outermost_dim at device position 0, we construct:
+                # device_size = [c_size[outermost_dim], stick_count, c_size[outermost_dim]]
+                # This matches the pattern [outermost_dim, stick_dim, outermost_dim]
                 stick_count = (c_size[stick_dim] + stick_size - 1) // stick_size
-                device_size.append(stick_count)
-                stride_map.append(stick_host_stride * stick_size)
-                device_size.append(stick_size)
-                stride_map.append(stick_host_stride)
-
+                device_size = [
+                    c_size[outermost_dim],
+                    stick_count,
+                    stick_size,
+                ]
+                stride_map = [
+                    c_stride[outermost_dim],
+                    c_stride[stick_dim] * stick_size,
+                    c_stride[stick_dim],
+                ]
                 stl = SpyreTensorLayout(
                     device_size, stride_map, get_device_dtype(output.dtype), output_ea
                 )
-                # Validate that the manually-constructed pinned layout has an
-                # offset-free stick expression. If not, skip this layout candidate.
-                coords = device_coordinates(stl, output_dep, ind_sizes)
-                if not is_stick_expr_offset_free(coords[-1], stick_size):
-                    return
             else:
-                # Normal path: use dim_order constructor
+                # Use the normal dim_order constructor for non-pinned or higher-dim cases.
                 stl = SpyreTensorLayout(
                     c_size, c_stride, output.dtype, dim_order, output_ea
                 )
@@ -1218,7 +1194,18 @@ def compute_layouts(
                     )
 
     if len(args) > 1 and isinstance(data, Pointwise):
-        return _multi_arg_pointwise_layouts(op, output, output_dep, args)
+        # For scatter/index_put operations, detect the indirect write dimension
+        # and pin it to device position 0
+        pinned_dims: tuple[int, ...] = ()
+        if output_dep.is_indirect():
+            # This is an indirect write operation (scatter/index_put)
+            try:
+                indirect_dim = _indirect_write_host_dim(op, output, output_dep)
+                pinned_dims = (indirect_dim,)
+            except Unsupported:
+                # If we can't determine the indirect dimension, proceed without pinning
+                pass
+        return _multi_arg_pointwise_layouts(op, output, output_dep, args, pinned_dims)
 
     if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
         return _matmul_layouts(op, output, output_dep, args)
