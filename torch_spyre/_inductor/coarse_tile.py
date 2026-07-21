@@ -1045,12 +1045,16 @@ def coarse_tile(
         # Returns name_map without patching group ops (patching is deferred to
         # phase 2 so replace_computed_buffer_body runs after _stamp_group and
         # therefore copies the already-stamped loop_info onto the new object).
-        name_map = _replace_constant_fill_predecessors(
+        # fill_retiled_infos carries the new fills' own old->new stride so
+        # _patch_retiled_load_indexes can fix up any consumer whose load index
+        # into the replaced fill still uses the pre-replacement coefficient.
+        name_map, fill_retiled_infos = _replace_constant_fill_predecessors(
             group_ops, levels, operations, group_id
         )
         # Rebuild op_to_position after potential insertions from fill replacement.
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
+        retiled_infos.update(fill_retiled_infos)
         # Phase 2: patch group ops to read tile-sized fills.  Done after
         # _stamp_group so loop_info is already present on each op when
         # replace_computed_buffer_body copies metadata to the reconstructed object.
@@ -2232,7 +2236,7 @@ def _replace_constant_fill_predecessors(
     levels: list[tuple],
     operations: list[Operation],
     group_id: tuple[int, ...],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, _RetiledBufferInfo]]:
     """Create tile-sized constant-fill buffers for full-size fills feeding the group.
 
     full.default / zeros_like / zeros ops are often created outside a
@@ -2251,12 +2255,26 @@ def _replace_constant_fill_predecessors(
     is semantically equivalent to slicing a per-iteration fill.  Because it
     sits outside the loop it is also a candidate for LX scratchpad allocation.
 
-    Returns a name_map {old_fill_name: new_tile_fill_name} for the caller to
-    apply via _apply_fill_name_swap after _stamp_group has run (so that
-    replace_computed_buffer_body preserves the loop_info already stamped on
-    each group op).
+    Returns a (name_map, retiled_infos) pair:
+      - name_map {old_fill_name: new_tile_fill_name} for the caller to apply
+        via _apply_fill_name_swap after _stamp_group has run (so that
+        replace_computed_buffer_body preserves the loop_info already stamped
+        on each group op).
+      - retiled_infos {new_tile_fill_name: _RetiledBufferInfo(old_stride,
+        new_stride)}, in the same shape _stamp_group returns for buffers it
+        divides in place.  The new fill has a different, freshly-computed
+        contiguous stride from the original fill it replaces (the original
+        was never divided — it's excluded from group_ops), so any consumer
+        whose load index into the old fill was generated against the
+        original stride would otherwise keep that now-stale coefficient
+        after _apply_fill_name_swap renames the read.  Merging this into the
+        caller's retiled_infos lets the existing _patch_retiled_load_indexes
+        machinery rewrite it, the same way it already does for buffers
+        _stamp_group retiles directly.
     """
     from torch._inductor.dependencies import MemoryDep
+
+    retiled_infos: dict[str, _RetiledBufferInfo] = {}
 
     # Build a reference dim_hints list from the first op in the group that has them.
     ref_dim_hints: list[DimHint] = []
@@ -2267,7 +2285,7 @@ def _replace_constant_fill_predecessors(
             break
 
     if not ref_dim_hints:
-        return {}
+        return {}, {}
 
     # Collect the set of buffer names already in the group so we don't confuse
     # intra-group data-flow edges with inter-group constant-fill edges.
@@ -2280,7 +2298,7 @@ def _replace_constant_fill_predecessors(
         (i for i, op in enumerate(operations) if op is group_ops[0]), None
     )
     if first_group_idx is None:
-        return {}
+        return {}, {}
 
     # name_map collects old_fill_name → new_tile_fill_name for the NameSwapHandler.
     name_map: dict[str, str] = {}
@@ -2308,18 +2326,41 @@ def _replace_constant_fill_predecessors(
             if not _is_constant_fill(buf):
                 continue
 
-            # Read the constant value from the SpyreConstantFallback scalar
-            # that is the fill's only input.
-            fill_rw = buf.get_read_writes()
-            scalar_dep = next(
-                (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
-            )
-            if scalar_dep is None:
+            # Read the constant value from the SpyreConstantFallback scalar.
+            # For a plain constant-fill Pointwise, that scalar is buf's own
+            # only input.  For a Reduction over a constant fill (e.g.
+            # torch.full(...).amax(dim=-1) — every reduction input is
+            # identical, so the reduced value is fixed too), the scalar is
+            # usually buf's own only input too: Inductor doesn't force the
+            # fill's Pointwise wrapper to realize, so it's inlined straight
+            # into the Reduction's inner_fn and the Reduction reads the
+            # scalar directly.  Only hop through an intermediate fill buffer
+            # if one actually exists (e.g. the fill is also read elsewhere).
+            buf_rw = buf.get_read_writes()
+            buf_dep = next((d for d in buf_rw.reads if isinstance(d, MemoryDep)), None)
+            if buf_dep is None:
                 continue
-            scalar_buf = V.graph.get_buffer(scalar_dep.name)
+            read_buf = V.graph.get_buffer(buf_dep.name)
+            if isinstance(read_buf, ComputedBuffer):
+                fill_rw = read_buf.get_read_writes()
+                scalar_dep = next(
+                    (d for d in fill_rw.reads if isinstance(d, MemoryDep)), None
+                )
+                if scalar_dep is None:
+                    continue
+                scalar_buf = V.graph.get_buffer(scalar_dep.name)
+            else:
+                scalar_buf = read_buf
             if not isinstance(scalar_buf, SpyreConstantFallback):
                 continue
             const_value = scalar_buf.constant_args[0]
+            if isinstance(buf.data, Reduction):
+                reduce_count = 1
+                for r in buf.data.reduction_ranges:
+                    reduce_count *= int(r)
+                const_value = _reduce_constant(
+                    buf.data.reduction_type, const_value, reduce_count
+                )
 
             # Compute the tile-sized shape using the consumer op's authoritative
             # loop_var→ranges_pos mapping.  Size-based matching (_constant_fill_
@@ -2331,6 +2372,14 @@ def _replace_constant_fill_predecessors(
             # have that dimension and should not be divided on it).
             old_size = [int(r) for r in buf.data.ranges]
             tile_size = list(old_size)
+            old_buf_layout = getattr(buf, "layout", None)
+            old_buf_stride = (
+                tuple(old_buf_layout.stride)
+                if isinstance(old_buf_layout, FixedLayout)
+                and len(old_buf_layout.stride) == len(old_size)
+                else None
+            )
+            divided_positions: set[int] = set()
             consumer_out = op_out_coords(op)
             for h in getattr(op, "dim_hints", None) or []:
                 if h.loop_var is None or h.is_reduction or h.split_count <= 1:
@@ -2355,9 +2404,37 @@ def _replace_constant_fill_predecessors(
                     tile_size = None  # type: ignore[assignment]
                     break
                 tile_size[consumer_pos] = tile_size[consumer_pos] // int(h.split_count)
+                divided_positions.add(consumer_pos)
 
             if tile_size is None:
                 continue
+
+            # Any dimension that is genuinely a reduction axis of the
+            # consumer, and that no hint touched, doesn't need its original
+            # size — the consumer only ever reads across it to reduce it, so
+            # every value the fill returns along that axis is discarded into
+            # the same accumulation regardless of which one is read.
+            # Collapse it to a true broadcast dimension of size 1 rather
+            # than leaving it at its original full size, which is what
+            # made it look like a free (and ambiguous) stick-dim candidate
+            # to _all_constant_layouts.  This mapping is only valid when
+            # the reduced dims are trailing in the fill's own shape — i.e.
+            # op.data.ranges (kept dims) lines up with the leading entries
+            # of old_size — which is the same alignment the consumer_pos
+            # check above already implicitly relies on.  For a general
+            # (interleaved) reduction this can't be inferred here, so it's
+            # left untouched rather than guessed at.
+            if isinstance(op.data, Reduction):
+                kept = [int(r) for r in op.data.ranges]
+                reduced = [int(r) for r in op.data.reduction_ranges]
+                trailing_aligned = (
+                    len(old_size) - len(kept) == len(reduced)
+                    and old_size[: len(kept)] == kept
+                )
+                if trailing_aligned:
+                    for i in range(len(kept), len(old_size)):
+                        if i not in divided_positions:
+                            tile_size[i] = 1
 
             dtype = buf.get_dtype()
             device = buf.get_device()
@@ -2416,6 +2493,12 @@ def _replace_constant_fill_predecessors(
 
             name_map[old_name] = fill_name
             replaced.add(old_name)
+            if old_buf_stride is not None:
+                new_stride = tuple(tile_strides)
+                if old_buf_stride != new_stride:
+                    retiled_infos[fill_name] = _RetiledBufferInfo(
+                        old_buf_stride, new_stride
+                    )
             logger.debug(
                 "coarse_tile: created tile-sized fill %s (shape %s) replacing %s (shape %s)",
                 fill_name,
@@ -2424,7 +2507,7 @@ def _replace_constant_fill_predecessors(
                 old_size,
             )
 
-    return name_map
+    return name_map, retiled_infos
 
 
 def _apply_fill_name_swap(
@@ -2468,20 +2551,51 @@ def _apply_fill_name_swap(
 
 
 def _is_constant_fill(op: ComputedBuffer) -> bool:
-    """True if op is a Pointwise whose only reads come from SpyreConstantFallback.
+    """True if op is a Pointwise whose only reads come from SpyreConstantFallback,
+    or a Reduction over such a constant fill.
 
     full.default / zeros_like / zeros lower to a SpyreConstantFallback scalar
     broadcast through a thin Pointwise wrapper.  These ops are position-
     independent, so shrinking their per-tile range to match the tiled group
     is semantically equivalent to slicing a full-sized fill.
+
+    A reduction (e.g. amax/sum) over a uniform constant is itself a constant —
+    every element of its input is identical, so the reduced value is fixed
+    regardless of the reduction range.  Patterns like
+    ``torch.full((...), -inf).amax(dim=-1)`` (used to build a sparse
+    running-max/denominator seed) lower to exactly this.  Inductor doesn't
+    force the fill's Pointwise wrapper to realize as its own buffer (unlike
+    e.g. restickify), so the Reduction's inner_fn typically inlines it and
+    reads the SpyreConstantFallback scalar directly — the intermediate
+    Pointwise ComputedBuffer never appears in the graph at all.  Both that
+    inlined shape and an (unlikely but possible, e.g. if the fill is also
+    read elsewhere) realized-Pointwise-in-between shape are recognized here,
+    so ``_replace_constant_fill_predecessors`` can retile the reduction's
+    output directly instead of leaving it at its full, untiled shape.
     """
+    from torch._inductor.dependencies import MemoryDep
+
+    if isinstance(op.data, Reduction):
+        try:
+            rw = op.get_read_writes()
+        except Exception:
+            return False
+        reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        if len(reads) != 1:
+            return False
+        inner_buf = V.graph.get_buffer(reads[0].name)
+        if isinstance(inner_buf, SpyreConstantFallback):
+            return True
+        if isinstance(inner_buf, ComputedBuffer):
+            return _is_constant_fill(inner_buf)
+        return False
+
     if not isinstance(op.data, Pointwise):
         return False
     try:
         rw = op.get_read_writes()
     except Exception:
         return False
-    from torch._inductor.dependencies import MemoryDep
 
     reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
     if not reads:
@@ -2809,6 +2923,32 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
     # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
+
+
+def _reduce_constant(
+    reduction_type: str, value: "float | int", count: int
+) -> "float | int":
+    """Return the result of reducing `count` copies of a uniform constant.
+
+    Used when a Reduction's sole input is itself a constant fill: every
+    element being reduced is the same ``value``, so the reduction's own
+    result is a fixed function of ``value``, ``count``, and
+    ``reduction_type`` alone — it does not depend on which elements are
+    actually read, only on how many.
+    """
+    if reduction_type in ("max", "min", "any"):
+        return value
+    if reduction_type == "sum":
+        return value * count
+    if reduction_type == "prod":
+        return value**count
+    if reduction_type == "xor_sum":
+        # XOR of an even number of copies of the same value is 0.
+        return value if count % 2 else 0
+    raise RuntimeError(
+        f"coarse_tile: unsupported reduction_type {reduction_type!r} for a "
+        "reduction over a constant fill."
+    )
 
 
 def _reduction_identity_value(
