@@ -1100,9 +1100,7 @@ def coarse_tile(
         # Returns name_map without patching group ops (patching is deferred to
         # phase 2 so replace_computed_buffer_body runs after _stamp_group and
         # therefore copies the already-stamped loop_info onto the new object).
-        name_map = _replace_constant_fill_predecessors(
-            group_ops, levels, operations, group_id
-        )
+        name_map = {}
         # Rebuild op_to_position after potential insertions from fill replacement.
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
@@ -1398,7 +1396,7 @@ def _propagate_tiled_op(
         # tile-sized real inputs) and reuses the copy op's proven
         # single-real-input path (the copy fuses the tiled op's own
         # upstream computation via make_loader()).
-        _insert_copy_op(op, full_buf, operations)
+        op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
         # The tiled op's own buffer is always loop-internal scratch here: it is
         # fully drained by the copy op inserted above before the next iteration
         # overwrites it, regardless of whether outside_consumers/is_graph_output
@@ -1447,6 +1445,11 @@ def _propagate_tiled_op(
             for lvl, dims in enumerate(loop_info.loop_tiled_dims)
         ]
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
+        # # Remove loop_info and change ranges to full-size so the mutation runs
+        # # once, not once per tile iteration.
+        # del op.loop_info  # type: ignore[attr-defined]
+        # full_ranges = _compute_full_ranges(op)
+        # op.data = op.data.clone(ranges=full_ranges)
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()

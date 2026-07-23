@@ -29,7 +29,7 @@ Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
 import sys
 import os
 import regex as re
-
+import math
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -866,6 +866,106 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
+    def test_hint_flash_attention_v3(self):
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, D = 1, 32, 128
+        Lq = 4096
+        Lk = 4096
+
+        q_block_size = Lq // 4  # replace by 'Lq // 2' for faster compilation time
+
+        # FIXME: current limitation disallows coarse tiling in Lk
+        kv_block_size = Lk // 1
+
+        h_block_size = 4  # replace by 'H // 2' for faster compilation time
+        b_block_size = 1
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+        mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+        mask_t.masked_fill_(~causal, float("-inf"))
+
+        def flash(queries, keys, values, mask):
+            scale = 1.0 / math.sqrt(math.sqrt(D))
+
+            output = torch.zeros_like(queries)
+
+            # FIXME: create a sparse real_max tensor via reduction
+            real_max = torch.full(
+                (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
+            )
+
+            denominator = torch.zeros(
+                (B, H, Lq), device=queries.device, dtype=torch.float16
+            )
+
+            with spyre_hint(tiles={"B": B // b_block_size}):
+                with spyre_hint(tiles={"H": H // h_block_size}):
+                    with spyre_hint(tiles={"Lq": Lq // q_block_size}):
+                        with spyre_hint(tiles={"Lk": Lk // kv_block_size}):
+                            # with spyre_hint(work_div={"H": 4, "Lq": 8, "Lk": 8}):
+                            scaled_keys = keys * scale  # B, H, Lk, D
+                            keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
+                            scores = torch.matmul(
+                                queries * scale, keys_T
+                            )  # B, H, Lq, Lk
+                            scores = scores + mask  # B, H, Lq, Lk
+                            scores = scores.transpose(-1, -2).contiguous()
+                            block_max = torch.amax(scores, dim=-2)  # B, H, Lq sparse
+                            running_max = torch.maximum(
+                                real_max, block_max
+                            )  # B, H, Lq sparse
+
+                            exp_scores = torch.exp(
+                                scores - running_max.unsqueeze(-2)
+                            )  # B, H, Lq, Lk
+                            correction = torch.exp(
+                                real_max - running_max
+                            )  # B, H, Lq sparse
+
+                            denominator.copy_(
+                                denominator * correction + exp_scores.sum(dim=-2)
+                            )  # B, H, Lq sparse
+                            output.copy_(
+                                output * correction.unsqueeze(-1)
+                                + torch.matmul(exp_scores.transpose(-1, -2), values)
+                            )  # B, H, Lq, D
+
+                            real_max.copy_(running_max)  # B, H, Lq sparse
+            return output / denominator.unsqueeze(-1)
+
+        queries_t_spyre = queries_t.to(device="spyre")
+        keys_t_spyre = keys_t.to(device="spyre")
+        values_t_spyre = values_t.to(device="spyre")
+        mask_t_spyre = mask_t.to(device="spyre")
+
+        ref = flash(queries_t, keys_t, values_t, mask_t)
+
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+
+        _name_tensor_dims(queries_t_spyre, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_t_spyre, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_t_spyre, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(mask_t_spyre, ["B", "H", "Lq", "Lk"])
+        result = torch.compile(flash)(
+            queries_t_spyre, keys_t_spyre, values_t_spyre, mask_t_spyre
+        ).cpu()
+        torch.testing.assert_close(
+            result,
+            ref,
+            equal_nan=True,
+            atol=0.1,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
     def test_hint_mixed_coverage_loopspec(self):
         """Union-across-ops: B level not dropped when first op has no B dimension.
 
