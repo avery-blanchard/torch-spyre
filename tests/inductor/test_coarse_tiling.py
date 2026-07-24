@@ -686,7 +686,13 @@ class TestCoarseTileInfo(unittest.TestCase):
 
 
 class TestTileAdvanceExprFromDep(unittest.TestCase):
-    """Unit tests for _tile_advance_expr_from_dep's coefficient extraction."""
+    """Unit tests for _tile_advance_expr_from_dep's coefficient extraction.
+
+    The result stays symbolic in each tiled dim's d{i}: a term is
+    coefficient * extent * d{i}, not the evaluated coefficient * extent
+    alone -- it is only resolved once a later compilation stage substitutes
+    a concrete tile-index value for each d{i}.
+    """
 
     def _dep(self, index_expr, ranges):
         return inductor_deps.MemoryDep(
@@ -700,7 +706,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d1 = sympy_index_symbol("d1")
         dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
         expr = _tile_advance_expr_from_dep(dep, {0: Integer(512)})
-        self.assertEqual(simplify(expr - Integer(4096) * Integer(512)), 0)
+        self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_untiled_dim_contributes_zero(self):
         from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
@@ -719,7 +725,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         # dep does not depend on d1 at all (broadcast along that dim).
         dep = self._dep(Integer(4096) * d0, {d0: 512, d1: 1024})
         expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
-        self.assertEqual(simplify(expr - Integer(4096) * Integer(512)), 0)
+        self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_sums_multiple_tiled_dims(self):
         from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
@@ -728,7 +734,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d1 = sympy_index_symbol("d1")
         dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
         expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
-        expected = Integer(4096) * Integer(512) + Integer(1) * Integer(1024)
+        expected = Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
         self.assertEqual(simplify(expr - expected), 0)
 
     def test_non_polynomial_index_does_not_raise(self):
@@ -749,13 +755,14 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         dep = self._dep(Integer(4096) * sympy.Mod(d0, 8) + d1, {d0: 512, d1: 1024})
         expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
         # d0's contribution is skipped (documented Stage-1 imprecision);
-        # d1's polynomial term is still extracted normally.
-        self.assertEqual(simplify(expr - Integer(1) * Integer(1024)), 0)
+        # d1's polynomial term is still extracted normally, staying
+        # symbolic in d1.
+        self.assertEqual(simplify(expr - Integer(1) * Integer(1024) * d1), 0)
 
         # FloorDiv (a//b) is likewise non-polynomial in the wrapped symbol.
         dep2 = self._dep(Integer(4096) * (d0 // Integer(8)) + d1, {d0: 512, d1: 1024})
         expr2 = _tile_advance_expr_from_dep(dep2, {0: Integer(512), 1: Integer(1024)})
-        self.assertEqual(simplify(expr2 - Integer(1) * Integer(1024)), 0)
+        self.assertEqual(simplify(expr2 - Integer(1) * Integer(1024) * d1), 0)
 
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):
@@ -1516,12 +1523,17 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
             [(1, Integer(2)), (2, Integer(4))],
             {op.get_operation_name(): 0},
         )
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
         # Output: buf0's own pre-division stride is [4096, 1]; one outer
         # (K=2) step covers 512 rows, one inner (M=4) step covers 1024 cols.
-        # _tile_advance_expr_from_dep returns a plain coefficient x extent
-        # sum (see TestTileAdvanceExprFromDep) -- no d0/d1 symbol remains in
-        # the result itself, those only appear in dep.index pre-extraction.
-        expected_output = Integer(4096) * Integer(512) + Integer(1) * Integer(1024)
+        # _tile_advance_expr_from_dep keeps each term symbolic in d{i} (see
+        # TestTileAdvanceExprFromDep) -- the expression is only resolved
+        # once a later compilation stage substitutes a concrete tile-index
+        # value for each d{i}.
+        expected_output = (
+            Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
+        )
         self.assertEqual(
             simplify(op.loop_info.output_tile_advance_expr - expected_output), 0
         )
@@ -1550,13 +1562,11 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
             [(1, Integer(2)), (2, Integer(4))],
             {op.get_operation_name(): 0},
         )
+        d1 = sympy_index_symbol("d1")
         broadcast_expr = op.loop_info.tile_advance_exprs[1]
         # Broadcast along dim 0 (stride 0): only the dim-1 (M=4, extent
-        # 1024) term survives, coefficient 1.  The extracted advance
-        # expression is coefficient x extent, a plain constant per dim,
-        # summed -- no d0/d1 symbol remains in the result itself (those
-        # symbols only appear in dep.index before extraction).
-        self.assertEqual(simplify(broadcast_expr - Integer(1024)), 0)
+        # 1024) term survives, coefficient 1, staying symbolic in d1.
+        self.assertEqual(simplify(broadcast_expr - Integer(1024) * d1), 0)
 
     def test_reduction_dim_advance_is_offset_by_output_dims(self):
         # out[d0] = sum_{d1} in[d0, d1].  in is [8, 16], row-major
@@ -1580,9 +1590,11 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
             {op.get_operation_name(): 0},
         )
         # Input's read index is 16*d0 + d1: d0 (output dim, extent 4 -- 8
-        # rows / K=2 outer steps) contributes 16*4; d1 (reduction dim,
-        # extent 4 -- the R=4 tile step itself) contributes 1*4.
-        expected_input = Integer(16) * Integer(4) + Integer(1) * Integer(4)
+        # rows / K=2 outer steps) contributes 16*4*d0; d1 (reduction dim,
+        # extent 4 -- the R=4 tile step itself) contributes 1*4*d1.
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        expected_input = Integer(16) * Integer(4) * d0 + Integer(1) * Integer(4) * d1
         self.assertEqual(len(op.loop_info.tile_advance_exprs), 1)
         self.assertEqual(
             simplify(op.loop_info.tile_advance_exprs[0] - expected_input), 0

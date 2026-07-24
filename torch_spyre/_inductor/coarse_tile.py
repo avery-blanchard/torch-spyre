@@ -1253,9 +1253,13 @@ def _tile_advance_expr_from_dep(
 
     For each ``(dim, extent)`` pair, extracts ``d{dim}``'s coefficient from
     ``dep.index`` (0 if ``dep`` does not depend on that symbol -- e.g. a
-    broadcast input) and multiplies by ``extent``, then sums across all
-    tiled dims.  Returns ``sympy.Integer(0)`` when ``tiled_dim_extents`` is
-    empty or every coefficient is 0 (this dependency never advances).
+    broadcast input), multiplies by ``extent``, and keeps the result
+    symbolic in ``d{dim}`` (multiplies by the symbol itself rather than
+    evaluating it away) -- the expression is meant to stay unevaluated
+    until a later compilation stage substitutes a concrete tile-index value
+    for each ``d{dim}``.  Terms are then summed across all tiled dims.
+    Returns ``sympy.Integer(0)`` when ``tiled_dim_extents`` is empty or
+    every coefficient is 0 (this dependency never advances).
 
     Mirrors the coefficient-extraction idiom ``_level_stride_from_expr`` in
     ``codegen/compute_ops.py`` uses for the unrelated ``_ct_lvl{n}``-symbol
@@ -1294,7 +1298,7 @@ def _tile_advance_expr_from_dep(
                 e,
             )
             continue
-        terms.append(coeff * extent)
+        terms.append(coeff * extent * sym)
     if not terms:
         return sympy.Integer(0)
     return sympy.Add(*terms)

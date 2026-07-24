@@ -56,12 +56,16 @@ class CoarseTileInfo:
         ``op.get_read_writes().reads`` (in that iteration order, filtered to
         ``MemoryDep``), giving the element offset -- in that input tensor's
         *original, undivided* flat layout -- that one unit step of each
-        tiled dim contributes, summed over every tiled dim.  Expressed in
-        Inductor's own iteration-space symbols (``d0, d1, ...``, continuous
-        across output dims then reduction dims, matching
-        ``Loops.get_reads()``'s own numbering).  ``sympy.Integer(0)`` means
-        that input does not advance (broadcast, or none of its dims are
-        ever tiled).  This is a parallel, more general mechanism to
+        tiled dim contributes, summed over every tiled dim.  Each term
+        stays symbolic in Inductor's own iteration-space symbols (``d0,
+        d1, ...``, continuous across output dims then reduction dims,
+        matching ``Loops.get_reads()``'s own numbering): a tiled dim's
+        term is ``coefficient * extent * d{i}``, left unevaluated rather
+        than reduced to a plain number, so the expression is only resolved
+        once a later compilation stage substitutes a concrete tile-index
+        value for each ``d{i}``.  ``sympy.Integer(0)`` means that input
+        does not advance (broadcast, or none of its dims are ever tiled).
+        This is a parallel, more general mechanism to
         ``_coarse_tile_advance_expr`` (unconditional, host-element-offset,
         dim-indexed) -- it does not replace it.
     output_tile_advance_expr:
