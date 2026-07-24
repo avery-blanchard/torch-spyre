@@ -23,8 +23,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import sympy
+
 if TYPE_CHECKING:
-    import sympy
     from torch._inductor.ir import ComputedBuffer
 
 
@@ -50,12 +51,33 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
+    tile_advance_exprs:
+        One sympy ``Expr`` per read dependency in
+        ``op.get_read_writes().reads`` (in that iteration order, filtered to
+        ``MemoryDep``), giving the element offset -- in that input tensor's
+        *original, undivided* flat layout -- that one unit step of each
+        tiled dim contributes, summed over every tiled dim.  Expressed in
+        Inductor's own iteration-space symbols (``d0, d1, ...``, continuous
+        across output dims then reduction dims, matching
+        ``Loops.get_reads()``'s own numbering).  ``sympy.Integer(0)`` means
+        that input does not advance (broadcast, or none of its dims are
+        ever tiled).  This is a parallel, more general mechanism to
+        ``_coarse_tile_advance_expr`` (unconditional, host-element-offset,
+        dim-indexed) -- it does not replace it.
+    output_tile_advance_expr:
+        The analogous single ``Expr`` for this op's own output/write side,
+        derived the same way from this op's pre-division write
+        ``MemoryDep``.  Defaults to ``sympy.Integer(0)``.
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    tile_advance_exprs: list[sympy.Expr] = field(default_factory=list)
+    output_tile_advance_expr: sympy.Expr = field(
+        default_factory=lambda: sympy.Integer(0)
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -462,6 +462,34 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(info.loop_tiled_dims, [[0], [1]])
 
+    def test_tile_advance_defaults(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        self.assertEqual(info.tile_advance_exprs, [])
+        self.assertEqual(info.output_tile_advance_expr, Integer(0))
+
+    def test_tile_advance_explicit(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], [1]],
+            tile_advance_exprs=[Integer(4096) * Integer(512) * d0 + Integer(1024) * d1],
+            output_tile_advance_expr=Integer(1024) * Integer(512) * d0
+            + Integer(1024) * d1,
+        )
+        self.assertEqual(
+            info.tile_advance_exprs,
+            [Integer(4096) * Integer(512) * d0 + Integer(1024) * d1],
+        )
+        self.assertEqual(
+            info.output_tile_advance_expr,
+            Integer(1024) * Integer(512) * d0 + Integer(1024) * d1,
+        )
+
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):
     """Unit tests for converting stale full-buffer load indexes to tile indexes."""
