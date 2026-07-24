@@ -48,7 +48,7 @@ from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 import torch
 from torch import fx
 from torch._inductor import dependencies as inductor_deps
-from torch._inductor.utils import IndentedBuffer
+from torch._inductor.utils import IndentedBuffer, sympy_index_symbol
 from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import DataFormats
@@ -489,6 +489,53 @@ class TestCoarseTileInfo(unittest.TestCase):
             info.output_tile_advance_expr,
             Integer(1024) * Integer(512) * d0 + Integer(1024) * d1,
         )
+
+
+class TestTileAdvanceExprFromDep(unittest.TestCase):
+    """Unit tests for _tile_advance_expr_from_dep's coefficient extraction."""
+
+    def _dep(self, index_expr, ranges):
+        return inductor_deps.MemoryDep(
+            "t0", index_expr, ranges, size=list(ranges.values())
+        )
+
+    def test_extracts_coefficient_for_tiled_dim(self):
+        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512)})
+        self.assertEqual(simplify(expr - Integer(4096) * Integer(512)), 0)
+
+    def test_untiled_dim_contributes_zero(self):
+        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
+        expr = _tile_advance_expr_from_dep(dep, {})
+        self.assertEqual(expr, Integer(0))
+
+    def test_broadcast_dim_not_in_index_contributes_zero(self):
+        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        # dep does not depend on d1 at all (broadcast along that dim).
+        dep = self._dep(Integer(4096) * d0, {d0: 512, d1: 1024})
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
+        self.assertEqual(simplify(expr - Integer(4096) * Integer(512)), 0)
+
+    def test_sums_multiple_tiled_dims(self):
+        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        dep = self._dep(Integer(4096) * d0 + d1, {d0: 512, d1: 1024})
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
+        expected = Integer(4096) * Integer(512) + Integer(1) * Integer(1024)
+        self.assertEqual(simplify(expr - expected), 0)
 
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):

@@ -66,7 +66,7 @@ import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
-from torch._inductor.utils import sympy_subs
+from torch._inductor.utils import sympy_index_symbol, sympy_subs
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -1238,6 +1238,40 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
                 f"reduction dims {red_dims} (tiling more than one reduction "
                 "dim per level is not yet implemented — Stage 2)."
             )
+
+
+def _tile_advance_expr_from_dep(
+    dep: MemoryDep,
+    tiled_dim_extents: dict[int, Expr],
+) -> Expr:
+    """Element-offset advance of ``dep`` for one step of each tiled dim.
+
+    ``tiled_dim_extents`` maps a host-range positional index (the same
+    indices used in ``loop_tiled_dims`` / ``loop_tiled_reduction_dims``) to
+    the tile extent one loop step advances that dim's ``d{i}`` symbol by
+    (the product of ``loop_count`` for every level tiling that dim).
+
+    For each ``(dim, extent)`` pair, extracts ``d{dim}``'s coefficient from
+    ``dep.index`` (0 if ``dep`` does not depend on that symbol -- e.g. a
+    broadcast input) and multiplies by ``extent``, then sums across all
+    tiled dims.  Returns ``sympy.Integer(0)`` when ``tiled_dim_extents`` is
+    empty or every coefficient is 0 (this dependency never advances).
+
+    Mirrors the coefficient-extraction idiom ``_level_stride_from_expr`` in
+    ``codegen/compute_ops.py`` uses for the unrelated ``_ct_lvl{n}``-symbol
+    mechanism, applied here to Inductor's real ``d{i}`` iteration-space
+    symbols instead.
+    """
+    terms: list[Expr] = []
+    for dim, extent in tiled_dim_extents.items():
+        sym = sympy_index_symbol(f"d{dim}")
+        if sym not in dep.index.free_symbols:
+            continue
+        coeff = sympy.Poly(dep.index, sym).coeff_monomial(sym)
+        terms.append(coeff * extent)
+    if not terms:
+        return sympy.Integer(0)
+    return sympy.Add(*terms)
 
 
 def _build_advance_expr(loop_info: CoarseTileInfo, op: ComputedBuffer) -> Expr | None:
