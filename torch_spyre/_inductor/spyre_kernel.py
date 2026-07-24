@@ -951,7 +951,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
-        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
+        if not is_reduction and op != "ReStickifyOpHBM":
             stick_vars = {
                 next(iter(arg.device_coordinates[-1].free_symbols))
                 for arg in args
