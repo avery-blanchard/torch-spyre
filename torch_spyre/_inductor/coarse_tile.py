@@ -1105,7 +1105,20 @@ def coarse_tile(
         )
         # Rebuild op_to_position after potential insertions from fill replacement.
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
-        retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
+        # Identify carry ops (will be handled by _propagate_carry_op with special
+        # copy-op insertion) so _stamp_group can skip retiling them. Carry ops have
+        # their buffers wrapped in copy ops later, and those copy ops read the
+        # original (non-retiled) layout. Including carry ops in retiled_infos would
+        # cause double-rewrites in _patch_retiled_load_indexes.
+        carry_op_names = set()
+        for op in group_ops:
+            if isinstance(op, ComputedBuffer):
+                seed_buf = _seed_buffer_for_carry(op, group_id, operations)
+                if seed_buf is not None:
+                    carry_op_names.add(op.get_name())
+        retiled_infos = _stamp_group(
+            group_ops, group_id, levels, op_to_position, carry_op_names
+        )
         # Phase 2: patch group ops to read tile-sized fills.  Done after
         # _stamp_group so loop_info is already present on each op when
         # replace_computed_buffer_body copies metadata to the reconstructed object.
@@ -1455,8 +1468,7 @@ def _propagate_tiled_op(
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
-    retile_info = _RetiledBufferInfo(old_stride, tuple(full_buf.layout.stride))
-    _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
+    _patch_consumers(outside_consumers, buf_name, full_name, operations)
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
 
@@ -2205,7 +2217,10 @@ def _propagate_carry_op(
 
     buf_name = op.get_name()
     seed_name = accum_full.get_name()
-    _patch_consumers(outside_consumers, buf_name, seed_name, operations, retile_info)
+    # Outside consumers read the terminal carry value after loop completion.
+    # That index is not a per-iteration coordinate, so affine stride rewriting
+    # doesn't apply. Plain name swap only.
+    _patch_consumers(outside_consumers, buf_name, seed_name, operations)
     if is_graph_output:
         _patch_graph_outputs(buf_name, accum_full)
 
@@ -2896,10 +2911,10 @@ def _propagate_tiled_reduction_op(
         buf_name, loop_group_id, operations
     )
     accum_name = accum_full.get_name()
-    retile_info = _RetiledBufferInfo(
-        tuple(op.layout.stride), tuple(accum_full.layout.stride)
-    )
-    _patch_consumers(outside_consumers, buf_name, accum_name, operations, retile_info)
+    # For reduction ops, op's per-tile output and accum_full are structurally
+    # different (reduction changes dimensions), not just different-sized views.
+    # Stride scaling via affine rewriting doesn't apply. Plain name swap only.
+    _patch_consumers(outside_consumers, buf_name, accum_name, operations)
     if is_graph_output:
         _patch_graph_outputs(buf_name, accum_full)
 
@@ -2966,6 +2981,9 @@ def _patch_consumers(
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
+        # Mark this consumer as patched by _patch_consumers so
+        # _patch_retiled_load_indexes skips it (avoid double-patching).
+        consumer._patch_consumers_skip_retile = True  # type: ignore[attr-defined]
         replace_computed_buffer_body(consumer, consumer.data, operations)
         V.graph.name_to_buffer[consumer.get_name()] = operations[
             next(
@@ -3158,6 +3176,10 @@ def _patch_retiled_load_indexes(
     retiled_names = set(rewrites_by_name)
     for op in list(group_ops):
         if not _should_patch_retiled_load_indexes(op, group_id, retiled_names):
+            continue
+        # Skip ops already patched by _patch_consumers to avoid double-patching
+        # (e.g., consumers of Case 1 copy ops that were redirected to full_buf).
+        if getattr(op, "_patch_consumers_skip_retile", False):
             continue
 
         orig_inner = op.data.inner_fn
@@ -3522,6 +3544,7 @@ def _stamp_group(
     group_id: tuple[int, ...],
     levels: list[tuple],
     op_to_position: dict[str, int],
+    carry_op_names: set[str] | None = None,
 ) -> dict[str, _RetiledBufferInfo]:
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
@@ -3537,6 +3560,11 @@ def _stamp_group(
     - These are mutually exclusive per op (enforced by _validate_reduction_tiling).
     - If hint_id is in neither (broadcast op): both lists get [] for this level.
 
+    carry_op_names: set of op names that will be handled as carries by
+    _propagate_carry_op. These ops' buffers are excluded from retiling to avoid
+    double-rewrites in _patch_retiled_load_indexes (carry ops' copy handlers
+    read the original non-retiled layout).
+
     End-to-end correctness of the reduction path is covered by
     TestCoarseTileReductionDim0E2E in tests/inductor/test_coarse_tile_e2e.py.
     """
@@ -3548,6 +3576,7 @@ def _stamp_group(
     nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
     counts = [count for _, count in levels]
     retiled_infos: dict[str, _RetiledBufferInfo] = {}
+    carry_op_names = carry_op_names or set()
 
     for op in ops:
         if not isinstance(op, ComputedBuffer):
@@ -3591,12 +3620,17 @@ def _stamp_group(
             retiled_info = _divide_ranges(op, count, [opos] if opos is not None else [])
             if retiled_info is not None:
                 name = op.get_name()
-                prior = retiled_infos.get(name)
-                retiled_infos[name] = (
-                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
-                    if prior is not None
-                    else retiled_info
-                )
+                # Skip retiling for carry ops: their buffers will be wrapped in
+                # copy ops by _propagate_carry_op, and those copy ops read the
+                # original (non-retiled) layout. Including them in retiled_infos
+                # causes double-rewrites in _patch_retiled_load_indexes.
+                if name not in carry_op_names:
+                    prior = retiled_infos.get(name)
+                    retiled_infos[name] = (
+                        _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                        if prior is not None
+                        else retiled_info
+                    )
             if isinstance(op.data, Reduction):
                 # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                 # before _validate_reduction_tiling runs in the later
