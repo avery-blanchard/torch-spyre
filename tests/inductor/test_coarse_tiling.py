@@ -48,7 +48,9 @@ from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 import torch
 from torch import fx
 from torch._inductor import dependencies as inductor_deps
+from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol
+from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import DataFormats
@@ -77,6 +79,7 @@ from torch_spyre._inductor.coarse_tile import (
     _replace_group_op,
     _retile_load_index_from_strides,
     _should_patch_retiled_load_indexes,
+    _stamp_group,
     _stride_rewrite_map,
     coarse_tile,
 )
@@ -229,6 +232,197 @@ def _make_hinted_op(data, name="op0", hints=((0, 0),)):
         for hint_id, dim_index in hints
     ]
     return op
+
+
+def _make_real_pointwise_op(
+    ranges,
+    input_shapes_strides,
+    name="op0",
+    hints=((0, 0),),
+):
+    """Build a genuine ComputedBuffer(Pointwise) reading real InputBuffers.
+
+    ``input_shapes_strides`` is a list of (shape, stride) pairs, one per
+    input; the returned op's inner_fn sums a load from each input at the
+    op's own iteration index, so every input's MemoryDep.index reflects
+    that input's own (never-divided-by-this-op) stride.  Unlike
+    ``_make_op``, ``op.get_read_writes()`` on the returned op produces real
+    MemoryDep objects with genuine d0, d1, ... index expressions.
+
+    ``hints`` follows the same (hint_id, dim_index) convention as
+    ``_make_hinted_op``.  The caller must have an active graph handler
+    (``V.set_graph_handler(...)``) around both this call and any later
+    ``op.get_read_writes()`` / ``_stamp_group(...)`` call on the returned
+    op -- ``InputBuffer.make_loader()`` reads ``V.graph.sizevars`` lazily,
+    not just at construction time.  ``_stamp_group`` itself additionally
+    requires the op to have a real ``operation_name`` (normally assigned by
+    ``GraphLowering.register_operation``) for its internal
+    ``_validate_contiguous`` position lookup -- set directly below rather
+    than going through the full ``register_operation`` machinery (which
+    auto-generates its own ``op{N}``-style name instead of using the name
+    we pass in).  Each input ``InputBuffer`` is also registered on
+    ``V.graph.name_to_buffer`` for consistency with real IR, though
+    ``_stamp_group`` does not itself resolve buffers by name (that only
+    happens in the buffer-propagation pass, which these tests bypass by
+    calling ``_stamp_group`` directly instead of the full ``coarse_tile()``
+    entry point -- see ``TestCoarseTileTileAdvanceExprs``'s docstring).
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        InputBuffer,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    input_boxes = []
+    for i, (shape, stride) in enumerate(input_shapes_strides):
+        inp = InputBuffer(
+            name=f"in{i}_{name}",
+            layout=FixedLayout(torch.device("cpu"), torch.float32, shape, stride),
+        )
+        V.graph.name_to_buffer[inp.get_name()] = inp
+        input_boxes.append(TensorBox(StorageBox(inp)))
+
+    def inner_fn(index):
+        loaders = [box.make_loader()(index) for box in input_boxes]
+        result = loaders[0]
+        for loader in loaders[1:]:
+            result = result + loader
+        return result
+
+    pw = Pointwise.create(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        inner_fn=inner_fn,
+        ranges=list(ranges),
+    )
+    pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
+    buf = ComputedBuffer(
+        name=name,
+        layout=FixedLayout(torch.device("cpu"), torch.float32, list(ranges), None),
+        data=pw_data,
+    )
+    buf.operation_name = name
+    V.graph.name_to_buffer[name] = buf
+    n_ranges = len(ranges)
+    buf._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_ranges)]
+    buf.dim_hints = [
+        DimHint(
+            dim_names=[f"dim{dim_index}"],
+            split_count=1,
+            loop_var=sympy.Symbol(f"c{dim_index}"),
+            is_reduction=False,
+            hint_id=hint_id,
+        )
+        for hint_id, dim_index in hints
+    ]
+    return buf
+
+
+def _make_real_reduction_op(
+    ranges,
+    reduction_ranges,
+    input_shape_stride,
+    name="op0",
+    hints=((0, 0),),
+):
+    """Build a genuine ComputedBuffer(Reduction) reading one real InputBuffer.
+
+    Mirrors ``_make_real_pointwise_op`` but for a ``Reduction`` op, so the
+    resulting op's ``get_read_writes()`` produces a read ``MemoryDep`` whose
+    index depends on BOTH output-dim d{i} symbols and reduction-dim d{i}
+    symbols (numbered continuously after the output dims, per Inductor's own
+    ``Loops.get_reads()`` convention) -- exercising the
+    ``n_output_dims``-offset path in ``_stamp_group`` that the two
+    ``Pointwise``-only tests above never touch (both have zero reduction
+    dims).
+
+    ``hints`` follows the same (hint_id, dim_index) convention as
+    ``_make_hinted_op``, with ``dim_index >= len(ranges)`` denoting a
+    reduction dim (position ``dim_index - len(ranges)`` in
+    ``reduction_ranges``).
+
+    Unlike the non-reduction ``DimHint``s (matched against
+    ``_test_out_coords`` via the patched ``op_out_coords``, so any synthetic
+    symbol works), ``_stamp_group``'s reduction-dim lookup
+    (``_loop_var_to_reduction_ranges_pos``) matches ``dim_hint.loop_var``
+    directly against the *real* ``d{i}`` symbols found in the op's own
+    ``get_read_writes()`` reduction dep -- it does not go through
+    ``op_out_coords`` at all. So reduction ``DimHint``s here MUST use the
+    real ``sympy_index_symbol(f"d{{i}}")`` (imported from
+    ``torch._inductor.utils``, same import as elsewhere in this file) as
+    their ``loop_var``, not a synthetic ``c{{i}}`` placeholder -- a synthetic
+    symbol would never match and the reduction dim would silently fail to
+    tile (``op_tiled_reduction_dims`` would stay ``[[]]``).
+
+    Like ``_make_real_pointwise_op``, the caller must have an active graph
+    handler around both this call and any later ``get_read_writes()`` /
+    ``_stamp_group(...)`` call on the returned op, and this helper likewise
+    registers the input and output buffers directly on
+    ``V.graph.name_to_buffer`` (see ``_make_real_pointwise_op``'s docstring
+    for why ``register_buffer``/``register_operation`` aren't used here,
+    and why ``_stamp_group`` -- unlike the full ``coarse_tile()`` -- never
+    needs to resolve them by name).
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        InputBuffer,
+        Reduction,
+        StorageBox,
+        TensorBox,
+    )
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    shape, stride = input_shape_stride
+    inp = InputBuffer(
+        name=f"in0_{name}",
+        layout=FixedLayout(torch.device("cpu"), torch.float32, shape, stride),
+    )
+    V.graph.name_to_buffer[inp.get_name()] = inp
+    input_box = TensorBox(StorageBox(inp))
+
+    def inner_fn(index, reduction_index):
+        full_index = list(index) + list(reduction_index)
+        return input_box.make_loader()(full_index)
+
+    red = Reduction.create(
+        device=torch.device("cpu"),
+        dst_dtype=torch.float32,
+        src_dtype=torch.float32,
+        inner_fn=inner_fn,
+        ranges=list(ranges),
+        reduction_ranges=list(reduction_ranges),
+        reduction_type="sum",
+    )
+    red_data = red.data.data  # TensorBox -> StorageBox -> Reduction
+    buf = ComputedBuffer(
+        name=name,
+        layout=FixedLayout(torch.device("cpu"), torch.float32, list(ranges), None),
+        data=red_data,
+    )
+    buf.operation_name = name
+    V.graph.name_to_buffer[name] = buf
+    n_ranges = len(ranges)
+    buf._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_ranges)]
+    buf.dim_hints = [
+        DimHint(
+            dim_names=[f"dim{dim_index}"],
+            split_count=1,
+            loop_var=(
+                sympy_index_symbol(f"d{dim_index}")
+                if dim_index >= n_ranges
+                else sympy.Symbol(f"c{dim_index}")
+            ),
+            is_reduction=(dim_index >= n_ranges),
+            hint_id=hint_id,
+        )
+        for hint_id, dim_index in hints
+    ]
+    return buf
 
 
 def _make_non_computed_op(name="extern0"):
@@ -1232,6 +1426,141 @@ class TestCoarseTileNested(unittest.TestCase):
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
+
+
+class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
+    """Real-IR tests for CoarseTileInfo.tile_advance_exprs /
+    output_tile_advance_expr, using the small example from
+    docs/source/compiler/coarse_tiling_loops.md (1024x4096, outer K=2 over
+    dim 0, inner M=4 over dim 1).
+
+    _stamp_group's new code calls op.get_read_writes() on real IR (Task 3),
+    which internally calls InputBuffer.make_loader() -> checks
+    V.graph.sizevars -- this requires an active graph handler at the time
+    _stamp_group runs, not just while the op is built.  setUp/tearDown keep
+    one open for the whole test body; a fresh GraphLowering (distinct from
+    the one _make_real_pointwise_op/_make_real_reduction_op build their op
+    under, internally, to construct the IR) is sufficient --
+    get_read_writes() has no dependency on graph-handler identity, only on
+    one being active.
+
+    These tests call _stamp_group directly rather than the full
+    coarse_tile() entry point.  coarse_tile() unconditionally also runs
+    insert_tiling_propagation after stamping every group, which for a
+    Reduction op with an actually-tiled reduction dim drives
+    _propagate_tiled_reduction_op -> _allocate_full_buffer ->
+    graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
+    FX-dispatch/lowering machinery this lightweight harness does not
+    provide (confirmed live: raises LoweringException /
+    "'NullHandler' object does not support the context manager protocol").
+    _stamp_group is the layer that actually populates tile_advance_exprs /
+    output_tile_advance_expr (see Task 3 Step 3), so calling it directly
+    exercises exactly what Stage 1 needs without pulling in buffer
+    propagation, which Stage 1 does not touch.
+    """
+
+    def setUp(self):
+        self._patch = patch(
+            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            side_effect=_mock_op_out_coords,
+        )
+        self._patch.start()
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+        self._patch.stop()
+
+    def test_small_example_output_and_input_advance(self):
+        # a + b -> buf0.  a, b are [1024, 4096], row-major (stride [4096, 1]).
+        op = _make_real_pointwise_op(
+            ranges=[Integer(1024), Integer(4096)],
+            input_shapes_strides=[
+                ([1024, 4096], [4096, 1]),
+                ([1024, 4096], [4096, 1]),
+            ],
+            name="buf0",
+            hints=((1, 0), (2, 1)),
+        )
+        _stamp_group(
+            [op],
+            (0,),
+            [(1, Integer(2)), (2, Integer(4))],
+            {op.get_operation_name(): 0},
+        )
+        # Output: buf0's own pre-division stride is [4096, 1]; one outer
+        # (K=2) step covers 512 rows, one inner (M=4) step covers 1024 cols.
+        # _tile_advance_expr_from_dep returns a plain coefficient x extent
+        # sum (see TestTileAdvanceExprFromDep) -- no d0/d1 symbol remains in
+        # the result itself, those only appear in dep.index pre-extraction.
+        expected_output = Integer(4096) * Integer(512) + Integer(1) * Integer(1024)
+        self.assertEqual(
+            simplify(op.loop_info.output_tile_advance_expr - expected_output), 0
+        )
+        # Inputs: a and b are never divided (buf0's own division doesn't
+        # touch them), so both reads have the same original [4096, 1]
+        # stride -> same advance expression as the output would have had
+        # pre-division (same coefficients, same formula).
+        self.assertEqual(len(op.loop_info.tile_advance_exprs), 2)
+        for expr in op.loop_info.tile_advance_exprs:
+            self.assertEqual(simplify(expr - expected_output), 0)
+
+    def test_broadcast_input_has_zero_advance(self):
+        # a (tiled input) + b (broadcast scalar-row input, stride [0, 1]).
+        op = _make_real_pointwise_op(
+            ranges=[Integer(1024), Integer(4096)],
+            input_shapes_strides=[
+                ([1024, 4096], [4096, 1]),
+                ([1024, 4096], [0, 1]),
+            ],
+            name="buf0",
+            hints=((1, 0), (2, 1)),
+        )
+        _stamp_group(
+            [op],
+            (0,),
+            [(1, Integer(2)), (2, Integer(4))],
+            {op.get_operation_name(): 0},
+        )
+        broadcast_expr = op.loop_info.tile_advance_exprs[1]
+        # Broadcast along dim 0 (stride 0): only the dim-1 (M=4, extent
+        # 1024) term survives, coefficient 1.  The extracted advance
+        # expression is coefficient x extent, a plain constant per dim,
+        # summed -- no d0/d1 symbol remains in the result itself (those
+        # symbols only appear in dep.index before extraction).
+        self.assertEqual(simplify(broadcast_expr - Integer(1024)), 0)
+
+    def test_reduction_dim_advance_is_offset_by_output_dims(self):
+        # out[d0] = sum_{d1} in[d0, d1].  in is [8, 16], row-major
+        # (stride [16, 1]).  Output dim 0 (K=2 outer) is a real output dim;
+        # reduction dim 1 (R=4) is a reduction dim, numbered continuously
+        # after output dims per Inductor's own d{i} convention -- so inside
+        # in.index it appears as d1 (n_output_dims=1 + reduction pos 0),
+        # not d0.  hints: hint_id 1 tiles output dim 0 (K=2); hint_id 2
+        # tiles reduction dim 0 (numbered 1 == len(ranges) + 0), R=4.
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0), (2, 1)),
+        )
+        _stamp_group(
+            [op],
+            (0,),
+            [(1, Integer(2)), (2, Integer(4))],
+            {op.get_operation_name(): 0},
+        )
+        # Input's read index is 16*d0 + d1: d0 (output dim, extent 4 -- 8
+        # rows / K=2 outer steps) contributes 16*4; d1 (reduction dim,
+        # extent 4 -- the R=4 tile step itself) contributes 1*4.
+        expected_input = Integer(16) * Integer(4) + Integer(1) * Integer(4)
+        self.assertEqual(len(op.loop_info.tile_advance_exprs), 1)
+        self.assertEqual(
+            simplify(op.loop_info.tile_advance_exprs[0] - expected_input), 0
+        )
 
 
 # ===========================================================================

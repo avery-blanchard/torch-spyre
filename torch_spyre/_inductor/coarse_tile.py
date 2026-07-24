@@ -3527,6 +3527,17 @@ def _stamp_group(
 
         op_out = op_out_coords(op)
 
+        # Snapshot pre-division read/write MemoryDeps for tile_advance_exprs /
+        # output_tile_advance_expr.  Must happen before the division loop
+        # below: get_read_writes() recomputes from data.ranges live, and
+        # _divide_ranges shrinks this op's own write stride in place (though
+        # it never touches another buffer's layout, so input coefficients
+        # would be correct either way -- snapshotting once up front is
+        # simplest and correct for both).
+        rw = op.get_read_writes()
+        read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
+
         # Build lookup: hint_id → output-ranges position (non-reduction dims).
         hint_id_to_ranges_pos: dict[int, int] = {
             h.hint_id: pos
@@ -3573,11 +3584,51 @@ def _stamp_group(
                 # the pass runner and aborts compilation.
                 _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
 
+        # tiled_dim_extents maps a host-range positional index to the tile
+        # extent one loop step advances that dim's d{i} symbol by in the
+        # pre-division index space: the dim's own post-division size (i.e.
+        # op.data.ranges[d] / op.data.reduction_ranges[d] as already left by
+        # the division loop above), since one tile step advances the
+        # original iteration variable by exactly one post-division tile's
+        # worth. When a dim is tiled at 2+ levels, _divide_ranges /
+        # _divide_reduction_ranges already divided it cumulatively by every
+        # level's count, so this single post-division read captures all of
+        # them at once -- matching _build_advance_expr's analogous
+        # host_stride unit for the innermost level tiling a given dim.
+        tiled_dim_extents: dict[int, Expr] = {
+            d: op.data.ranges[d] for level_dims in op_tiled_dims for d in level_dims
+        }
+        reduction_dim_extents: dict[int, Expr] = {}
+        if isinstance(op.data, Reduction):
+            reduction_dim_extents = {
+                d: op.data.reduction_ranges[d]
+                for level_dims in op_tiled_reduction_dims
+                for d in level_dims
+            }
+        n_output_dims = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+        # Reduction dims are numbered continuously after output dims in
+        # Inductor's own d{i} convention (Loops.get_reads()), so offset by
+        # n_output_dims before combining with the output-dim extents.
+        combined_extents = dict(tiled_dim_extents)
+        for d, extent in reduction_dim_extents.items():
+            combined_extents[n_output_dims + d] = extent
+
+        tile_advance_exprs = [
+            _tile_advance_expr_from_dep(dep, combined_extents) for dep in read_deps
+        ]
+        output_tile_advance_expr = (
+            _tile_advance_expr_from_dep(write_deps[0], combined_extents)
+            if write_deps
+            else sympy.Integer(0)
+        )
+
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
             loop_count=counts,
             loop_tiled_dims=op_tiled_dims,
             loop_tiled_reduction_dims=op_tiled_reduction_dims,
+            tile_advance_exprs=tile_advance_exprs,
+            output_tile_advance_expr=output_tile_advance_expr,
         )
 
         logger.debug(
