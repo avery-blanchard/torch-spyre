@@ -731,6 +731,32 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         expected = Integer(4096) * Integer(512) + Integer(1) * Integer(1024)
         self.assertEqual(simplify(expr - expected), 0)
 
+    def test_non_polynomial_index_does_not_raise(self):
+        """A Mod/FloorDiv-wrapped tiled-dim symbol must degrade, not crash.
+
+        Reshape-split and gather/indirect-indexing dims can leave a tiled
+        dim's d{i} symbol wrapped in Mod/FloorDiv/ModularIndexing --
+        non-polynomial forms that sympy.Poly(...) cannot handle.
+        _loop_var_to_ranges_pos only checks for a single free symbol, so
+        such a dim is still accepted as "tiled" upstream and this function
+        must not crash the whole coarse-tiling pass when it sees one.
+        """
+        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        # d0 only ever appears wrapped in Mod -- non-polynomial in d0.
+        dep = self._dep(Integer(4096) * sympy.Mod(d0, 8) + d1, {d0: 512, d1: 1024})
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
+        # d0's contribution is skipped (documented Stage-1 imprecision);
+        # d1's polynomial term is still extracted normally.
+        self.assertEqual(simplify(expr - Integer(1) * Integer(1024)), 0)
+
+        # FloorDiv (a//b) is likewise non-polynomial in the wrapped symbol.
+        dep2 = self._dep(Integer(4096) * (d0 // Integer(8)) + d1, {d0: 512, d1: 1024})
+        expr2 = _tile_advance_expr_from_dep(dep2, {0: Integer(512), 1: Integer(1024)})
+        self.assertEqual(simplify(expr2 - Integer(1) * Integer(1024)), 0)
+
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):
     """Unit tests for converting stale full-buffer load indexes to tile indexes."""

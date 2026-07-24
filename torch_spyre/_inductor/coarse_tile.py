@@ -1261,13 +1261,39 @@ def _tile_advance_expr_from_dep(
     ``codegen/compute_ops.py`` uses for the unrelated ``_ct_lvl{n}``-symbol
     mechanism, applied here to Inductor's real ``d{i}`` iteration-space
     symbols instead.
+
+    ``dep.index`` is not guaranteed to be polynomial in ``d{dim}`` --
+    reshape-split dims and gather/indirect-indexing dims (the same patterns
+    ``views.py``'s ``convert_modular_indexing``/``compute_coordinates``
+    exist to handle elsewhere) can wrap a tiled dim's symbol in
+    ``Mod``/``FloorDiv``/``ModularIndexing``. ``_loop_var_to_ranges_pos``
+    only checks that a coordinate has exactly one free symbol, so such a
+    dim is still accepted as "tiled" upstream and reaches this function.
+    ``sympy.Poly(...)`` raises ``PolynomialError`` on those forms. Since
+    nothing downstream consumes ``tile_advance_exprs`` /
+    ``output_tile_advance_expr`` yet (Stage 1: construct + test the
+    representation only), we degrade conservatively -- skip that dim's
+    contribution (treat it as 0) rather than crash the whole coarse-tiling
+    pass, which would be a regression relative to today (this field is new
+    and nothing relied on it before). This is a known imprecision to
+    revisit once a consumer needs an exact answer for such dims.
     """
     terms: list[Expr] = []
     for dim, extent in tiled_dim_extents.items():
         sym = sympy_index_symbol(f"d{dim}")
         if sym not in dep.index.free_symbols:
             continue
-        coeff = sympy.Poly(dep.index, sym).coeff_monomial(sym)
+        try:
+            coeff = sympy.Poly(dep.index, sym).coeff_monomial(sym)
+        except sympy.PolynomialError as e:
+            logger.debug(
+                "_tile_advance_expr_from_dep: non-polynomial dep.index for "
+                "d%d (%s); treating this dim's contribution as 0: %s",
+                dim,
+                dep.index,
+                e,
+            )
+            continue
         terms.append(coeff * extent)
     if not terms:
         return sympy.Integer(0)
