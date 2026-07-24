@@ -1398,6 +1398,11 @@ def _propagate_tiled_op(
         op, loop_group_id, operations
     )
 
+    # Captured before either branch below overwrites op.layout, so outside
+    # consumers redirected to full_buf can have their load index rewritten
+    # from this tile-local stride to full_buf's full-size stride.
+    old_stride = tuple(op.layout.stride)
+
     if has_inside or has_loop_internal_input:
         # Case 1: keep tiled op writing to small buffer; insert copy op.
         # Ops with a loop-internal real input must take this path even with
@@ -1450,7 +1455,8 @@ def _propagate_tiled_op(
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
-    _patch_consumers(outside_consumers, buf_name, full_name, operations)
+    retile_info = _RetiledBufferInfo(old_stride, tuple(full_buf.layout.stride))
+    _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
 
@@ -1938,6 +1944,9 @@ def _propagate_carry_op(
         # op's own buffer already spans the full extent, so it can carry
         # directly in accum_full with no per-tile scratch needed.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_full)))
+        # No stride change: op already owned accum_full-shaped storage before
+        # this mutation, so outside consumers' load index needs no rewrite.
+        retile_info = None
     else:
         per_tile_ranges = list(op.data.ranges)
         outer_key = op_loop_info.loop_group_id[0]
@@ -2154,8 +2163,13 @@ def _propagate_carry_op(
         # directly at all (e.g. buf17 reads buf13/buf16, neither of which is
         # the seed), so no inner_fn rewrite is needed here — only the layout
         # mutation.
+        # Captured before the mutation below, so outside consumers redirected
+        # to accum_full (not accum_tile) can have their load index rewritten
+        # from this tile-local stride to accum_full's full-size stride.
+        old_stride = tuple(op.layout.stride)
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_tile)))
         V.graph.name_to_buffer[op.get_name()] = op
+        retile_info = _RetiledBufferInfo(old_stride, tuple(accum_full.layout.stride))
 
         # The copy-out must run once per outer tile after the inner loop's
         # LAST iteration — i.e. after every op sharing op's own (full,
@@ -2191,7 +2205,7 @@ def _propagate_carry_op(
 
     buf_name = op.get_name()
     seed_name = accum_full.get_name()
-    _patch_consumers(outside_consumers, buf_name, seed_name, operations)
+    _patch_consumers(outside_consumers, buf_name, seed_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, accum_full)
 
@@ -2882,7 +2896,10 @@ def _propagate_tiled_reduction_op(
         buf_name, loop_group_id, operations
     )
     accum_name = accum_full.get_name()
-    _patch_consumers(outside_consumers, buf_name, accum_name, operations)
+    retile_info = _RetiledBufferInfo(
+        tuple(op.layout.stride), tuple(accum_full.layout.stride)
+    )
+    _patch_consumers(outside_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, accum_full)
 
@@ -2907,11 +2924,21 @@ def _patch_consumers(
     old_name: str,
     new_name: str,
     operations: list[Operation],
+    retile_info: _RetiledBufferInfo | None = None,
 ) -> None:
     """Redirect outside consumers from old_name to new_name.
 
-    Patches each consumer's inner_fn via NameSwapHandler and reconstructs
-    the ComputedBuffer to invalidate the sizes cache.
+    Patches each consumer's inner_fn via NameSwapHandler (or, when
+    retile_info is given and old/new strides actually differ,
+    _NameAndIndexSwapHandler) and reconstructs the ComputedBuffer to
+    invalidate the sizes cache.
+
+    retile_info, when provided, carries the tile-local (old) and full-size
+    (new) host strides of the buffer being renamed -- required whenever
+    new_name's buffer is not addressing-equivalent to old_name's (e.g. a
+    coarse-tiled dimension's stride was scaled up for the full buffer). Plain
+    NameSwapHandler forwards the load index unmodified, which silently
+    computes wrong addresses whenever the two buffers' strides differ.
     """
     if not consumers or old_name == new_name:
         return
@@ -2920,11 +2947,22 @@ def _patch_consumers(
     from .pass_utils import replace_computed_buffer_body
 
     name_map = {old_name: new_name}
+    rewrites = _stride_rewrite_map(retile_info) if retile_info is not None else {}
+
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
 
-        def new_inner_fn(*args, _map=name_map, _orig=orig_inner):
-            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+        def new_inner_fn(
+            *args,
+            _map=name_map,
+            _rewrites_by_old_name={old_name: rewrites} if rewrites else {},
+            _orig=orig_inner,
+        ):
+            if _rewrites_by_old_name:
+                handler = _NameAndIndexSwapHandler(V.ops, _map, _rewrites_by_old_name)
+            else:
+                handler = NameSwapHandler(V.ops, _map)
+            with V.set_ops_handler(handler):
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
@@ -3036,6 +3074,35 @@ class _RetileLoadIndexHandler(WrapperHandler):
                 name, index, self._rewrites_by_name[name]
             )
         return super().load(name, index)
+
+
+class _NameAndIndexSwapHandler(WrapperHandler):
+    """Redirect ops.load(name, index) to a new buffer name AND rewrite index
+    for the corresponding stride change.
+
+    Combines NameSwapHandler's name-swap semantics (insert_restickify.py) with
+    _RetileLoadIndexHandler's index-rewrite semantics: rewrite index while
+    `name` is still the old name (index's coefficients are expressed in the
+    old buffer's strides), then swap the name. Reuses
+    _retile_load_index_from_strides -- no new index math.
+    """
+
+    def __init__(
+        self,
+        inner,
+        name_map: dict[str, str],
+        rewrites_by_old_name: dict[str, dict[Expr, Expr]],
+    ):
+        super().__init__(inner)
+        self._name_map = name_map
+        self._rewrites_by_old_name = rewrites_by_old_name
+
+    def load(self, name, index):
+        if name in self._rewrites_by_old_name:
+            index = _retile_load_index_from_strides(
+                name, index, self._rewrites_by_old_name[name]
+            )
+        return super().load(self._name_map.get(name, name), index)
 
 
 def _should_patch_retiled_load_indexes(
