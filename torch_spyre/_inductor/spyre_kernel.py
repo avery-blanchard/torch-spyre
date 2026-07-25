@@ -48,6 +48,7 @@ from .pass_utils import (
     concretize_index,
     compute_symbolic_bounds,
     finite_upper_or_none,
+    apply_slice_from_index_coeff,
     apply_splits_from_index_coeff,
     iteration_space,
     indirect_access_subs_from_kernel,
@@ -568,6 +569,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         ir_node = self.current_node.node  # ComputedBuffer
         work_division: dict[sympy.Symbol, int] = {}
+        core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
         if hasattr(ir_node, "op_it_space_splits"):
             write_index = next(iter(self.current_node.read_writes.writes)).index
             read_index = next(iter(self.current_node.read_writes.reads)).index
@@ -577,6 +579,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                 read_index,
                 it_space,
             )
+            if hasattr(ir_node, "core_id_to_work_slice"):
+                core_id_to_work_slice = apply_slice_from_index_coeff(
+                    ir_node.core_id_to_work_slice,
+                    write_index,
+                    read_index,
+                    it_space,
+                )
 
         it_space_extended = {
             k: (v, work_division.get(k, 1)) for k, v in it_space.items()
@@ -711,6 +720,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             args,
             op_info,
             tiled_symbols=tiled_syms,
+            core_id_to_work_slice=core_id_to_work_slice,
             symbolic_dim_bounds=symbolic_dim_bounds,
             debug_handle=debug_handle,
         )
@@ -1118,6 +1128,15 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             for level in op_spec.tiled_symbols
                         )
                         + "],"
+                    )
+                if op_spec.core_id_to_work_slice:
+                    buf.writeline(
+                        "core_id_to_work_slice={"
+                        + ", ".join(
+                            sympy_str(k) + ": " + sympy_str(v)
+                            for k, v in op_spec.core_id_to_work_slice.items()
+                        )
+                        + "},"
                     )
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"

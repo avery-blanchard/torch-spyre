@@ -16,7 +16,9 @@ from torch.fx.graph import Graph
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch_spyre._inductor.pass_utils import (
+    _is_matmul_op,
     apply_splits_from_index_coeff,
+    commit_core_mapping,
     copy_op_metadata,
     iteration_space_from_op,
     splits_by_index_coeff,
@@ -220,6 +222,31 @@ class GraphEditor:
         # An output clone copies the produced buffer 1:1 (same shape/layout), so
         # the consumer's output splits transfer directly without re-keying.
         new_com_buf.op_it_space_splits = (clone_out_splits, {})
+
+        # The clone is a fresh op with its own write/read index and iteration
+        # space, so recompute core_id_to_work_slice against those directly
+        # (via clone_out_splits, already re-keyed above) rather than trying to
+        # re-key first_user's core_id_to_work_slice.
+        if any(n > 1 for n in clone_out_splits.values()):
+            clone_rw = op_read_writes(new_com_buf)
+            clone_write_index = next(iter(clone_rw.writes)).index
+            clone_read_index = next(
+                (d.index for d in clone_rw.reads), clone_write_index
+            )
+            clone_it_space = iteration_space_from_op(new_com_buf)
+            clone_dim_splits = apply_splits_from_index_coeff(
+                (clone_out_splits, {}),
+                clone_write_index,
+                clone_read_index,
+                clone_it_space,
+            )
+            commit_core_mapping(
+                new_com_buf,
+                clone_dim_splits,
+                clone_write_index,
+                clone_read_index,
+                is_matmul=_is_matmul_op(new_com_buf),
+            )
 
         if input:
             # Step 3: Update self.graph.name_to_users (a list of TensorBox), e.g., existing users of

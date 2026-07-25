@@ -34,6 +34,7 @@ from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
+    commit_core_mapping,
     concretize_expr,
     iteration_space_from_op,
     splits_by_index_coeff,
@@ -705,6 +706,30 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return CoreDivision(output_splits=dict(seed[0]), reduction_splits=dict(seed[1]))
 
 
+def _commit_op_core_mapping(op: Operation, coeff_splits: tuple[dict, dict]) -> None:
+    """Decode a coeff-keyed ``(output_splits, reduction_splits)`` division for
+    ``op`` and recompute+stash ``op.core_id_to_work_slice`` for it.
+
+    Mirrors ``work_division.apply_splits``'s call to ``commit_core_mapping``,
+    for the LX-planning commit sites that write ``op.op_it_space_splits``
+    directly instead of going through ``apply_splits``.
+    """
+    rw = op_read_writes(op)
+    write = next(iter(rw.writes), None)
+    if write is None:
+        return
+    write_index = write.index
+    first_read = next(iter(rw.reads), None)
+    read_index = first_read.index if first_read is not None else write_index
+    it_space = iteration_space_from_op(op)
+    dim_splits = apply_splits_from_index_coeff(
+        coeff_splits, write_index, read_index, it_space
+    )
+    commit_core_mapping(
+        op, dim_splits, write_index, read_index, is_matmul=_is_matmul_op(op)
+    )
+
+
 def _op_short_name(op: Any) -> str:
     """Resolve an op's short name from its ``origin_node`` target, falling back
     to each fused fx node in ``op.origins``; ``"None"`` when unresolvable.
@@ -1146,6 +1171,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             chosen = options[opt_idx]
             if chosen != getattr(op, "op_it_space_splits", ({}, {})):
                 op.op_it_space_splits = chosen
+                _commit_op_core_mapping(op, chosen)
 
         n_paths = math.prod(len(o) for o in options_per_op)
         winner = {
@@ -1460,10 +1486,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op is None or buf.chosen_division is None:
                 continue
             cd = buf.core_divisions[buf.chosen_division]
-            op.op_it_space_splits = (
-                dict(cd.output_splits),
-                dict(cd.reduction_splits),
-            )
+            coeff_splits = (dict(cd.output_splits), dict(cd.reduction_splits))
+            op.op_it_space_splits = coeff_splits
+            _commit_op_core_mapping(op, coeff_splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering

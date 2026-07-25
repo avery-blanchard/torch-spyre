@@ -137,6 +137,11 @@ class OpSpec:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
         iteration_space: The iteration space of the operation. The values are tuples of (range, work_division).
+        core_id_to_work_slice: Maps each iteration-space symbol to a sympy
+            expression in Symbol("core_id") giving the logical work-slice
+            that core owns along that dim. Computed once by work division /
+            LX planning (pass_utils.commit_core_mapping) and threaded
+            through to codegen rather than recomputed there.
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
         tiled_symbols: Per-loop-level iteration-space symbols, innermost first.
@@ -161,6 +166,7 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
+    core_id_to_work_slice: dict[Symbol, Expr] = dataclasses.field(default_factory=dict)
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
     # Populated by compute_symbolic_bounds during
     # create_op_spec; empty for concrete dims.

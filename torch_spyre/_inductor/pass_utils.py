@@ -895,6 +895,93 @@ def apply_splits_from_index_coeff(
     return result
 
 
+# Type alias for the two-namespace core-slice storage: (output_slice,
+# reduction_slice), mirroring ItSpaceSplits.  Each dict maps a symbol's
+# coefficient in the write/read index to the sympy Expr (in terms of
+# Symbol("core_id")) describing which slice a given physical core owns along
+# that dim.  Coefficients survive the scheduler's symbol renaming; the Expr
+# values themselves (unlike ItSpaceSplits' int values) are always kept, since
+# an unsplit dim's Integer(0) slice is still meaningful and must round-trip.
+ItSpaceSlice = tuple[dict[sympy.Expr, sympy.Expr], dict[sympy.Expr, sympy.Expr]]
+
+
+def slice_by_index_coeff(
+    slice_by_symbol: dict[sympy.Symbol, sympy.Expr],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> ItSpaceSlice:
+    """Encode a symbol→core-slice-expr dict as a pair of coeff-keyed dicts.
+
+    Same output/reduction namespace split as splits_by_index_coeff, but for
+    core_id_to_work_slice's Expr values instead of split ints.
+    """
+    output_slice = _coeff_splits_from_index(slice_by_symbol, write_index)
+    reduction_only = {
+        sym: val for sym, val in slice_by_symbol.items() if write_index.coeff(sym) == 0
+    }
+    reduction_slice = _coeff_splits_from_index(reduction_only, read_index)
+    return output_slice, reduction_slice
+
+
+def apply_slice_from_index_coeff(
+    coeff_slice: ItSpaceSlice,
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+    sched_it_space: dict[sympy.Symbol, sympy.Expr],
+) -> dict[sympy.Symbol, sympy.Expr]:
+    """Reconstruct a scheduler-symbol→core-slice-expr dict from an
+    ItSpaceSlice pair, mirroring apply_splits_from_index_coeff.
+
+    Symbols not found in either dict default to Integer(0) (unsplit dim ->
+    every core owns slice 0).
+    """
+    output_coeff_slice, reduction_coeff_slice = coeff_slice
+    result: dict[sympy.Symbol, sympy.Expr] = {
+        sym: sympy.Integer(0) for sym in sched_it_space
+    }
+    for sym in sched_it_space:
+        wc = write_index.coeff(sym)
+        if wc != 0:
+            if wc in output_coeff_slice:
+                result[sym] = output_coeff_slice[wc]
+        else:
+            rc = read_index.coeff(sym)
+            if rc != 0 and rc in reduction_coeff_slice:
+                result[sym] = reduction_coeff_slice[rc]
+    return result
+
+
+def commit_core_mapping(
+    op: Operation,
+    dim_splits: dict[sympy.Symbol, int],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+    *,
+    is_matmul: bool = False,
+) -> None:
+    """Compute core_id_to_work_slice for ``op`` and stash it, coeff-keyed.
+
+    Call this at every site that commits a final ``op.op_it_space_splits``
+    (work division and every LX-planning re-division site) so the mapping
+    never goes stale relative to the split it was derived from.  ``dim_splits``
+    should cover every non-trivial iteration-space symbol for the op (i.e. the
+    same symbol→split dict passed to ``splits_by_index_coeff``), in iteration
+    order (K/reduction dim last for matmuls, matching
+    ``iteration_space_from_op``/``iteration_space``).
+    """
+    dims = tuple(dim_splits)
+    splits = tuple(dim_splits.values())
+    num_cores = math.prod(splits)
+    contiguous_dim = (
+        len(dims) - 1 if is_matmul and config.core_id_k_fast_emission else None
+    )
+    by_name = core_to_slice_mapping(
+        dims, splits, num_cores, contiguous_dim=contiguous_dim
+    )
+    by_symbol = {sym: by_name[str(sym)] for sym in dims}
+    op.core_id_to_work_slice = slice_by_index_coeff(by_symbol, write_index, read_index)
+
+
 # The following restickify helpers are used only by the restickify
 # but are here to avoid circular dependences in those files
 
@@ -1362,8 +1449,16 @@ def _is_matmul_op(op: Operation) -> bool:
     )
 
 
-# TODO: Select and store the core mapping before LX planning, then pass the
-# winning mapping to codegen.
+# NOTE: core_id_to_work_slice (the codegen-facing core mapping) is now
+# selected once and committed via commit_core_mapping() at every site that
+# commits op.op_it_space_splits (work division and every LX-planning
+# re-division site), then read directly by codegen instead of being
+# recomputed there -- see superdsc.py::parse_op_spec. The core_to_slice_mapping
+# call inside _per_core_view_from_prep (below) is a separate, necessary use:
+# it evaluates a *candidate* division still under consideration during LX
+# planning's search, before any division is committed, so it cannot read
+# op.core_id_to_work_slice (which only reflects the already-committed
+# division). Only the winning candidate's mapping gets committed.
 class _ViewPrep(NamedTuple):
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.

@@ -43,9 +43,11 @@ from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
+    _is_matmul_op,
     finite_upper_or_none,
     compute_granularity,
     compute_max_size,
+    commit_core_mapping,
     concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
@@ -650,6 +652,9 @@ def apply_splits(
     first_read = next(iter(rw.reads), None)
     read_index = first_read.index if first_read is not None else write_index
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+    commit_core_mapping(
+        op, splits, write_index, read_index, is_matmul=_is_matmul_op(op)
+    )
 
 
 def enumerate_work_division_candidates(
@@ -848,6 +853,8 @@ def _commit_user_splits(
     if math.prod(splits.values()) <= 1:
         if hasattr(op, "op_it_space_splits"):
             delattr(op, "op_it_space_splits")
+        if hasattr(op, "core_id_to_work_slice"):
+            delattr(op, "core_id_to_work_slice")
         return
     apply_splits(op, splits, output_td)
 

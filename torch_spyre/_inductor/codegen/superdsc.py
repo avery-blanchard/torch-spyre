@@ -31,8 +31,6 @@ from torch_spyre._inductor.constants import (
     RESTICKIFY_OP,
     TOPK_OPS,
 )
-from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -748,6 +746,21 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
+    # core_id_to_work_slice is computed once, before LX planning, by whichever
+    # pass last committed op.op_it_space_splits (work division, or LX
+    # planning's re-division) -- see pass_utils.commit_core_mapping. Translate
+    # it from scheduler symbols to SDSC-renamed symbols via symbol_mapping.
+    # Indirect access forces every dim_splits/work_slices entry to 1 above, so
+    # mirror that here rather than trusting a mapping computed against real
+    # splits.
+    if has_indirect_access:
+        core_id_to_work_slice = dict.fromkeys(symbol_mapping.values(), Integer(0))
+    else:
+        core_id_to_work_slice = {
+            symbol_mapping[sym]: slice_expr
+            for sym, slice_expr in op_spec.core_id_to_work_slice.items()
+        }
+
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
@@ -765,6 +778,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
         work_slices = {mb_sym: 1, **work_slices}
+        core_id_to_work_slice = {mb_sym: Integer(0), **core_id_to_work_slice}
         op_dim_order = [mb_sym] + op_dim_order
 
     if op_stick_dim is None:
@@ -772,6 +786,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
+        core_id_to_work_slice[stick_sym] = Integer(0)
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
@@ -788,6 +803,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # A dimension was added to the iteration space, update splits and work slices
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
+        core_id_to_work_slice[missing_dim] = Integer(0)
 
     # In case of same type conversion (identity op) user gets compile time error & avoid
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.
@@ -847,6 +863,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         for dim in padding:
             dim_splits[dim] = 1
             work_slices[dim] = 1
+            core_id_to_work_slice[dim] = Integer(0)
         num_cores = math.prod(dim_splits.values())
 
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
@@ -861,24 +878,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
-    # Project dim_splits into final SDSC iteration-space order; normalization
-    # can add unit axes to either mapping independently.
-    mapping_dims = tuple(sdsc_iteration_space)
-    mapping_splits = tuple(int(dim_splits[dim]) for dim in mapping_dims)
-    # Generic reductions do not yet define the same physical cohort contract as
-    # matmul partial sums.
-    contiguous_dim = (
-        len(mapping_splits) - 1
-        if is_matmul and _spyre_config.core_id_k_fast_emission
-        else None
-    )
-    # TODO: Choose the mapping before LX planning and pass it through to codegen.
-    core_id_to_work_slice = core_to_slice_mapping(
-        mapping_dims,
-        mapping_splits,
-        num_cores,
-        contiguous_dim=contiguous_dim,
-    )
+    # Defensive: every sdsc_iteration_space dim must have a slice entry. All
+    # known injection sites (mb_sym, stick_sym, missing_dim, RESTICKIFY
+    # padding) set one explicitly above; this only guards against a future
+    # site being added without a matching core_id_to_work_slice update.
+    for sdsc_dim in sdsc_iteration_space:
+        core_id_to_work_slice.setdefault(sdsc_dim, Integer(0))
 
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
