@@ -1419,6 +1419,11 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(
                                     f"tile_advance_expr={sympy_str(arg.tile_advance_expr)},"
                                 )
+                            if arg.device_tile_advance_expr is not None:
+                                buf.writeline(
+                                    "device_tile_advance_expr="
+                                    f"{sympy_str(arg.device_tile_advance_expr)},"
+                                )
                             if arg.full_tiled_extent:
                                 buf.writeline(
                                     "full_tiled_extent={"
