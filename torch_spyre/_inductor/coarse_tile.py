@@ -3635,12 +3635,15 @@ def _stamp_group(
 
         logger.debug(
             "coarse_tile: stamped %s loop_group_id=%s loop_count=%s "
-            "loop_tiled_dims=%s loop_tiled_reduction_dims=%s",
+            "loop_tiled_dims=%s loop_tiled_reduction_dims=%s"
+            "tile_advance_exprs=%s output_tile_advance_expr=%s",
             op.get_operation_name(),
             nested_group_id,
             counts,
             op_tiled_dims,
             op_tiled_reduction_dims,
+            tile_advance_exprs,
+            output_tile_advance_expr,
         )
 
     return retiled_infos
