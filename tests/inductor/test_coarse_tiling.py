@@ -771,6 +771,27 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         )
         self.assertEqual(simplify(expr2 - expected2), 0)
 
+    def test_transposed_index_keeps_its_own_coefficient_per_dim(self):
+        """A dep whose stride is transposed relative to the "usual" d0-major
+        layout must keep each dim's own coefficient, not the row-major one.
+
+        Coefficient extraction is per-dependency (this dep's own .index),
+        so a transposed dep (here d1's coefficient, 4096, is larger than
+        d0's, 1) must produce that exact pairing rather than assuming d0
+        always carries the larger stride.
+        """
+        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        # Transposed: d0's coefficient (1) is smaller than d1's (4096),
+        # the opposite of the row-major convention used elsewhere in this
+        # test class.
+        dep = self._dep(d0 + Integer(4096) * d1, {d0: 512, d1: 1024})
+        expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
+        expected = Integer(1) * Integer(512) * d0 + Integer(4096) * Integer(1024) * d1
+        self.assertEqual(simplify(expr - expected), 0)
+
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):
     """Unit tests for converting stale full-buffer load indexes to tile indexes."""
@@ -1606,6 +1627,75 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         self.assertEqual(
             simplify(op.loop_info.tile_advance_exprs[0] - expected_input), 0
         )
+
+    def test_subset_of_dims_tiled_on_3d_tensor(self):
+        # a is [8, 16, 32], row-major (stride [512, 32, 1]).  Only dims 0
+        # and 2 are tiled (levels use hint_id 1 -> dim 0, hint_id 2 ->
+        # dim 2); dim 1 is genuinely present in the index but never tiled
+        # at any level -- it must contribute 0, while dims 0 and 2 keep
+        # their own coefficients.
+        op = _make_real_pointwise_op(
+            ranges=[Integer(8), Integer(16), Integer(32)],
+            input_shapes_strides=[
+                ([8, 16, 32], [512, 32, 1]),
+            ],
+            name="buf0",
+            hints=((1, 0), (2, 2)),
+        )
+        _stamp_group(
+            [op],
+            (0,),
+            [(1, Integer(2)), (2, Integer(4))],
+            {op.get_operation_name(): 0},
+        )
+        d0 = sympy_index_symbol("d0")
+        d2 = sympy_index_symbol("d2")
+        # Output stride [512, 32, 1]; outer (hint 1, count=2) tiles dim 0
+        # with extent 4 (8 rows / 2 steps); inner (hint 2, count=4) tiles
+        # dim 2 with extent 8 (32 cols / 4 steps).  Dim 1 (untiled) drops
+        # out entirely -- no d1 term at all, not even a zero-coefficient
+        # one, since it is substituted with 0.
+        expected = Integer(512) * Integer(4) * d0 + Integer(1) * Integer(8) * d2
+        self.assertEqual(len(op.loop_info.tile_advance_exprs), 1)
+        self.assertEqual(simplify(op.loop_info.tile_advance_exprs[0] - expected), 0)
+        self.assertEqual(simplify(op.loop_info.output_tile_advance_expr - expected), 0)
+
+    def test_transposed_input_advance_uses_its_own_stride_order(self):
+        # a is row-major [1024, 4096] (stride [4096, 1]); b is the
+        # *transposed* layout of the same logical shape -- stride
+        # [1, 1024] instead of [4096, 1] -- while both share the same
+        # op-level ranges=[1024, 4096] and the same tiled dims (K=2 over
+        # dim 0, M=4 over dim 1).  Each input's advance expression must use
+        # its OWN stride's coefficient-to-dim mapping, not the op's/other
+        # input's, so b's dim-0 term (coefficient 1) and dim-1 term
+        # (coefficient 1024) land opposite of a's.
+        op = _make_real_pointwise_op(
+            ranges=[Integer(1024), Integer(4096)],
+            input_shapes_strides=[
+                ([1024, 4096], [4096, 1]),
+                ([1024, 4096], [1, 1024]),
+            ],
+            name="buf0",
+            hints=((1, 0), (2, 1)),
+        )
+        _stamp_group(
+            [op],
+            (0,),
+            [(1, Integer(2)), (2, Integer(4))],
+            {op.get_operation_name(): 0},
+        )
+        d0 = sympy_index_symbol("d0")
+        d1 = sympy_index_symbol("d1")
+        self.assertEqual(len(op.loop_info.tile_advance_exprs), 2)
+        # a: row-major -- dim 0 (extent 512) keeps coefficient 4096, dim 1
+        # (extent 1024) keeps coefficient 1.
+        expected_a = Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
+        self.assertEqual(simplify(op.loop_info.tile_advance_exprs[0] - expected_a), 0)
+        # b: transposed -- dim 0 (extent 512) keeps coefficient 1, dim 1
+        # (extent 1024) keeps coefficient 1024 -- the opposite pairing from
+        # a, because b's own stride is transposed relative to a's.
+        expected_b = Integer(1) * Integer(512) * d0 + Integer(1024) * Integer(1024) * d1
+        self.assertEqual(simplify(op.loop_info.tile_advance_exprs[1] - expected_b), 0)
 
 
 # ===========================================================================
