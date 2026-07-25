@@ -271,6 +271,7 @@ def format_op_spec_list(specs: list, indent: int = 0) -> str:
                     f"arg_index={arg.arg_index}, "
                     f"device_size={arg.device_size}, "
                     f"device_coordinates={arg.device_coordinates}, "
+                    f"device_tile_advance_expr={arg.device_tile_advance_expr}, "
                     f"allocation={arg.allocation})"
                 )
             if item.tiled_symbols:
