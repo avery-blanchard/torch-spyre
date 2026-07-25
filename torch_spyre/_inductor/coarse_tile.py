@@ -1481,9 +1481,7 @@ def _propagate_tiled_op(
         op, loop_group_id, operations
     )
 
-    # Captured before either branch below overwrites op.layout, so outside
-    # consumers redirected to full_buf can have their load index rewritten
-    # from this tile-local stride to full_buf's full-size stride.
+    # Capture before either branch below overwrites op.layout.
     old_stride = tuple(op.layout.stride)
 
     if has_inside or has_loop_internal_input:
@@ -2027,8 +2025,7 @@ def _propagate_carry_op(
         # op's own buffer already spans the full extent, so it can carry
         # directly in accum_full with no per-tile scratch needed.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_full)))
-        # No stride change: op already owned accum_full-shaped storage before
-        # this mutation, so outside consumers' load index needs no rewrite.
+        # No stride change, so no consumer index rewrite needed.
         retile_info = None
     else:
         per_tile_ranges = list(op.data.ranges)
@@ -2246,9 +2243,7 @@ def _propagate_carry_op(
         # directly at all (e.g. buf17 reads buf13/buf16, neither of which is
         # the seed), so no inner_fn rewrite is needed here — only the layout
         # mutation.
-        # Captured before the mutation below, so outside consumers redirected
-        # to accum_full (not accum_tile) can have their load index rewritten
-        # from this tile-local stride to accum_full's full-size stride.
+        # Capture before the mutation below overwrites op.layout.
         old_stride = tuple(op.layout.stride)
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_tile)))
         V.graph.name_to_buffer[op.get_name()] = op
@@ -2491,14 +2486,14 @@ def _insert_copy_op(
 ) -> None:
     """Insert a copy op after tiled_op that writes each tile into full_buf.
 
-    The copy op carries the same loop geometry (loop_group_id, loop_count,
-    loop_tiled_dims) as tiled_op so it executes inside the same loop body,
-    but its own tile_advance_exprs/output_tile_advance_expr, freshly
-    derived from its own reads/write (see below) rather than tiled_op's.
-    Its layout is MutationLayoutSHOULDREMOVE pointing at full_buf so
-    store_output writes into full_buf.  Because loop_tiled_dims is set,
-    SpyreKernel stamps tiled_symbols on the OpSpec and bundle.mlir emits
-    affine.apply for the per-iteration output address.
+    The copy op carries the same loop metadata as tiled_op (so it executes
+    inside the same loop body) but its own freshly-derived
+    tile_advance_exprs/output_tile_advance_expr, since its reads/write don't
+    correspond positionally to tiled_op's. Its layout is
+    MutationLayoutSHOULDREMOVE pointing at full_buf so store_output writes
+    into full_buf; loop_tiled_dims being set makes SpyreKernel stamp
+    tiled_symbols on the OpSpec and bundle.mlir emit affine.apply for the
+    per-iteration output address.
     """
     copy_data = Pointwise(
         device=tiled_op.get_device(),
@@ -2516,17 +2511,11 @@ def _insert_copy_op(
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
 
-    # Stamp with the same loop geometry as tiled_op so this op is inside the
-    # same loop, but with FRESH tile_advance_exprs/output_tile_advance_expr
-    # computed from copy_buf's own reads/write: copy_buf's single read
-    # (tiled_op) and its write (into full_buf) do not correspond
-    # positionally to tiled_op's own reads/write, so tiled_op.loop_info's
-    # lists cannot be reused verbatim. Must be a fresh CoarseTileInfo with
-    # its own list objects, not a shared reference to (or shallow copy of)
-    # tiled_op.loop_info -- a later pass (_zero_fixed_tile_advance_exprs)
-    # mutates output_tile_advance_expr and tile_advance_exprs[i] in place
-    # for per-tile-fixed ops like tiled_op, and any aliasing here would leak
-    # those mutations onto copy_buf's unrelated advance expressions.
+    # Fresh tile_advance_exprs/output_tile_advance_expr from copy_buf's own
+    # reads/write (positionally different from tiled_op's). Use
+    # dataclasses.replace, not a shared/shallow-copied loop_info: a later
+    # pass (_zero_fixed_tile_advance_exprs) mutates these fields in place,
+    # and aliasing would leak those mutations onto copy_buf.
     tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
     tiled_dim_extents = {
         d: copy_buf.data.ranges[d]
@@ -3048,17 +3037,15 @@ def _patch_consumers(
 ) -> None:
     """Redirect outside consumers from old_name to new_name.
 
-    Patches each consumer's inner_fn via NameSwapHandler (or, when
-    retile_info is given and old/new strides actually differ,
-    _NameAndIndexSwapHandler) and reconstructs the ComputedBuffer to
-    invalidate the sizes cache.
+    Patches each consumer's inner_fn via NameSwapHandler (or
+    _NameAndIndexSwapHandler, when retile_info's old/new strides differ) and
+    reconstructs the ComputedBuffer to invalidate the sizes cache.
 
-    retile_info, when provided, carries the tile-local (old) and full-size
-    (new) host strides of the buffer being renamed -- required whenever
-    new_name's buffer is not addressing-equivalent to old_name's (e.g. a
-    coarse-tiled dimension's stride was scaled up for the full buffer). Plain
-    NameSwapHandler forwards the load index unmodified, which silently
-    computes wrong addresses whenever the two buffers' strides differ.
+    retile_info carries the old (tile-local) and new (full-size) strides of
+    the renamed buffer, needed whenever new_name isn't addressing-equivalent
+    to old_name (e.g. a coarse-tiled dim's stride scaled up for the full
+    buffer) — plain NameSwapHandler forwards the load index unmodified,
+    which computes wrong addresses when the strides differ.
     """
     if not consumers or old_name == new_name:
         return
@@ -3197,14 +3184,11 @@ class _RetileLoadIndexHandler(WrapperHandler):
 
 
 class _NameAndIndexSwapHandler(WrapperHandler):
-    """Redirect ops.load(name, index) to a new buffer name AND rewrite index
-    for the corresponding stride change.
+    """Redirect ops.load(name, index) to a new name and rewrite its index.
 
-    Combines NameSwapHandler's name-swap semantics (insert_restickify.py) with
-    _RetileLoadIndexHandler's index-rewrite semantics: rewrite index while
-    `name` is still the old name (index's coefficients are expressed in the
-    old buffer's strides), then swap the name. Reuses
-    _retile_load_index_from_strides -- no new index math.
+    Rewrites index while `name` is still the old name (its coefficients are
+    in the old buffer's strides), then swaps the name. Reuses
+    _retile_load_index_from_strides.
     """
 
     def __init__(
