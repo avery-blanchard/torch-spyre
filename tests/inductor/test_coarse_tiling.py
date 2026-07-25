@@ -686,12 +686,13 @@ class TestCoarseTileInfo(unittest.TestCase):
 
 
 class TestTileAdvanceExprFromDep(unittest.TestCase):
-    """Unit tests for _tile_advance_expr_from_dep's coefficient extraction.
+    """Unit tests for _tile_advance_expr_from_dep's symbolic substitution.
 
-    The result stays symbolic in each tiled dim's d{i}: a term is
-    coefficient * extent * d{i}, not the evaluated coefficient * extent
-    alone -- it is only resolved once a later compilation stage substitutes
-    a concrete tile-index value for each d{i}.
+    _tile_advance_expr_from_dep substitutes extent * d{i} for each tiled
+    dim's d{i} in dep.index, and 0 for every other free symbol, then
+    returns the result as-is -- it is only resolved once a later
+    compilation stage substitutes a concrete tile-index value for each
+    d{i}.
     """
 
     def _dep(self, index_expr, ranges):
@@ -737,15 +738,20 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         expected = Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
         self.assertEqual(simplify(expr - expected), 0)
 
-    def test_non_polynomial_index_does_not_raise(self):
-        """A Mod/FloorDiv-wrapped tiled-dim symbol must degrade, not crash.
+    def test_non_polynomial_index_substitutes_exactly(self):
+        """A Mod/FloorDiv-wrapped tiled-dim symbol must not crash, and the
+        substitution should produce the exact (non-linear) term rather than
+        an approximation.
 
         Reshape-split and gather/indirect-indexing dims can leave a tiled
-        dim's d{i} symbol wrapped in Mod/FloorDiv/ModularIndexing --
-        non-polynomial forms that sympy.Poly(...) cannot handle.
+        dim's d{i} symbol wrapped in Mod/FloorDiv/ModularIndexing.
         _loop_var_to_ranges_pos only checks for a single free symbol, so
         such a dim is still accepted as "tiled" upstream and this function
         must not crash the whole coarse-tiling pass when it sees one.
+        Because the implementation substitutes directly into dep.index
+        rather than extracting a linear coefficient, it needs no special
+        casing for non-affine forms: it produces the exact substituted
+        expression.
         """
         from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
 
@@ -754,15 +760,16 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         # d0 only ever appears wrapped in Mod -- non-polynomial in d0.
         dep = self._dep(Integer(4096) * sympy.Mod(d0, 8) + d1, {d0: 512, d1: 1024})
         expr = _tile_advance_expr_from_dep(dep, {0: Integer(512), 1: Integer(1024)})
-        # d0's contribution is skipped (documented Stage-1 imprecision);
-        # d1's polynomial term is still extracted normally, staying
-        # symbolic in d1.
-        self.assertEqual(simplify(expr - Integer(1) * Integer(1024) * d1), 0)
+        expected = Integer(4096) * sympy.Mod(Integer(512) * d0, 8) + Integer(1024) * d1
+        self.assertEqual(simplify(expr - expected), 0)
 
         # FloorDiv (a//b) is likewise non-polynomial in the wrapped symbol.
         dep2 = self._dep(Integer(4096) * (d0 // Integer(8)) + d1, {d0: 512, d1: 1024})
         expr2 = _tile_advance_expr_from_dep(dep2, {0: Integer(512), 1: Integer(1024)})
-        self.assertEqual(simplify(expr2 - Integer(1) * Integer(1024) * d1), 0)
+        expected2 = (
+            Integer(4096) * ((Integer(512) * d0) // Integer(8)) + Integer(1024) * d1
+        )
+        self.assertEqual(simplify(expr2 - expected2), 0)
 
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):

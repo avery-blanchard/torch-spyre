@@ -1251,57 +1251,29 @@ def _tile_advance_expr_from_dep(
     the tile extent one loop step advances that dim's ``d{i}`` symbol by
     (the product of ``loop_count`` for every level tiling that dim).
 
-    For each ``(dim, extent)`` pair, extracts ``d{dim}``'s coefficient from
-    ``dep.index`` (0 if ``dep`` does not depend on that symbol -- e.g. a
-    broadcast input), multiplies by ``extent``, and keeps the result
-    symbolic in ``d{dim}`` (multiplies by the symbol itself rather than
-    evaluating it away) -- the expression is meant to stay unevaluated
-    until a later compilation stage substitutes a concrete tile-index value
-    for each ``d{dim}``.  Terms are then summed across all tiled dims.
-    Returns ``sympy.Integer(0)`` when ``tiled_dim_extents`` is empty or
-    every coefficient is 0 (this dependency never advances).
-
-    Mirrors the coefficient-extraction idiom ``_level_stride_from_expr`` in
-    ``codegen/compute_ops.py`` uses for the unrelated ``_ct_lvl{n}``-symbol
-    mechanism, applied here to Inductor's real ``d{i}`` iteration-space
-    symbols instead.
-
-    ``dep.index`` is not guaranteed to be polynomial in ``d{dim}`` --
-    reshape-split dims and gather/indirect-indexing dims (the same patterns
-    ``views.py``'s ``convert_modular_indexing``/``compute_coordinates``
-    exist to handle elsewhere) can wrap a tiled dim's symbol in
-    ``Mod``/``FloorDiv``/``ModularIndexing``. ``_loop_var_to_ranges_pos``
-    only checks that a coordinate has exactly one free symbol, so such a
-    dim is still accepted as "tiled" upstream and reaches this function.
-    ``sympy.Poly(...)`` raises ``PolynomialError`` on those forms. Since
-    nothing downstream consumes ``tile_advance_exprs`` /
-    ``output_tile_advance_expr`` yet (Stage 1: construct + test the
-    representation only), we degrade conservatively -- skip that dim's
-    contribution (treat it as 0) rather than crash the whole coarse-tiling
-    pass, which would be a regression relative to today (this field is new
-    and nothing relied on it before). This is a known imprecision to
-    revisit once a consumer needs an exact answer for such dims.
+    Built by substituting, in ``dep.index``, each tiled dim's ``d{dim}``
+    with ``extent * d{dim}`` (staying symbolic in ``d{dim}`` -- the
+    expression is meant to stay unevaluated until a later compilation stage
+    substitutes a concrete tile-index value for each ``d{dim}``) and every
+    other free symbol in ``dep.index`` with ``0`` (dims that never advance:
+    untiled dims, and broadcast dims ``dep`` does not depend on).  Because
+    this is a direct substitution rather than coefficient extraction,
+    ``dep.index`` need not be affine in the tiled symbols -- a tiled dim
+    wrapped in ``Mod``/``FloorDiv``/``ModularIndexing`` (reshape-split or
+    gather/indirect-indexing dims; ``_loop_var_to_ranges_pos`` only checks
+    for a single free symbol, so such a dim still reaches this function)
+    produces the exact non-linear term rather than an approximation.
+    Returns ``sympy.Integer(0)`` when every tiled dim's substituted term
+    also evaluates to ``0`` (this dependency never advances).
     """
-    terms: list[Expr] = []
-    for dim, extent in tiled_dim_extents.items():
-        sym = sympy_index_symbol(f"d{dim}")
-        if sym not in dep.index.free_symbols:
-            continue
-        try:
-            coeff = sympy.Poly(dep.index, sym).coeff_monomial(sym)
-        except sympy.PolynomialError as e:
-            logger.debug(
-                "_tile_advance_expr_from_dep: non-polynomial dep.index for "
-                "d%d (%s); treating this dim's contribution as 0: %s",
-                dim,
-                dep.index,
-                e,
-            )
-            continue
-        terms.append(coeff * extent * sym)
-    if not terms:
-        return sympy.Integer(0)
-    return sympy.Add(*terms)
+    subs = {
+        sympy_index_symbol(f"d{dim}"): extent * sympy_index_symbol(f"d{dim}")
+        for dim, extent in tiled_dim_extents.items()
+    }
+    subs.update(
+        {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
+    )
+    return dep.index.subs(subs)
 
 
 def _build_advance_expr(loop_info: CoarseTileInfo, op: ComputedBuffer) -> Expr | None:
