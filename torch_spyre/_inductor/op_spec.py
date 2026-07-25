@@ -124,6 +124,14 @@ class TensorArg:
         full_tiled_extent: This arg's own full (untiled) element extent of each coarse-tiled
             dim, keyed by the same Inductor symbol as OpSpec.iteration_space. Empty for args
             without coarse-tiled dims.
+        device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
+            unit step of each tiled Inductor iteration symbol (d0, d1, ...), derived from
+            CoarseTileInfo.tile_advance_exprs / output_tile_advance_expr (host-element-offset,
+            unconditional across every tiled op/Case) via
+            views.tiling_expr_to_device_expr, using this arg's own device_size/stride_map.
+            A parallel, more general mechanism to tile_advance_expr above (which is
+            device-byte, Case-2/MutationLayoutSHOULDREMOVE-only, and _ct_lvl{n}-keyed) --
+            it does not replace it. ``None`` for ops without loop_info/coarse tiling.
     """
 
     is_input: bool
@@ -136,6 +144,7 @@ class TensorArg:
     name: str | None = None
     tile_advance_expr: Expr | None = None
     full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
+    device_tile_advance_expr: Expr | None = None
 
 
 @dataclasses.dataclass

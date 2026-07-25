@@ -53,7 +53,8 @@ from .pass_utils import (
     iteration_space,
     indirect_access_subs_from_kernel,
 )
-from .views import compute_coordinates, align_tensors
+from .views import compute_coordinates, align_tensors, tiling_expr_to_device_expr
+from torch._inductor.dependencies import MemoryDep
 from .logging_utils import get_inductor_logger
 from .op_spec import (
     IndirectAccess,
@@ -480,6 +481,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_vars: dict[sympy.Symbol, TensorAccess] = {}
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
+        self._general_tile_advance_seen: dict[str, int] = {}
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -696,6 +698,57 @@ class SpyreKernel(Kernel[CSEVariable]):
         tile_advance_expr = sympy.Add(*terms) if terms else None
         return tile_advance_expr, full_tiled_extent
 
+    def _general_tile_advance(
+        self, tensor: TensorAccess, is_input: bool, name: str
+    ) -> "sympy.Expr | None":
+        """This arg's device-element tile-advance expr, derived from
+        CoarseTileInfo.tile_advance_exprs / output_tile_advance_expr (the
+        general, unconditional, host-element-offset mechanism -- see
+        loop_info.py) via views.tiling_expr_to_device_expr, using this
+        arg's own device_size/stride_map.
+
+        A parallel, more general mechanism to _per_arg_tile_advance above
+        (Case-3-only, device-byte, _ct_lvl{n}-keyed); it does not replace
+        it. Returns None for ops without loop_info/coarse tiling.
+        """
+        ir_node = self.current_node.node
+        loop_info = getattr(ir_node, "loop_info", None)
+        if loop_info is None:
+            return None
+
+        if is_input:
+            read_deps = [
+                dep
+                for dep in ir_node.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            matching_idx = [i for i, dep in enumerate(read_deps) if dep.name == name]
+            if not matching_idx:
+                return None
+            # Positional tie-break: if this buffer is read more than once,
+            # consume matches in order across successive calls for the same
+            # name within this op's TensorArg construction. store()/
+            # store_reduction() reset this dict at the start of each op.
+            consumed = self._general_tile_advance_seen.get(name, 0)
+            if consumed >= len(matching_idx):
+                return None
+            self._general_tile_advance_seen[name] = consumed + 1
+            dep_idx = matching_idx[consumed]
+            if dep_idx >= len(loop_info.tile_advance_exprs):
+                return None
+            host_expr = loop_info.tile_advance_exprs[dep_idx]
+        else:
+            host_expr = loop_info.output_tile_advance_expr
+
+        if host_expr is None:
+            return None
+
+        return tiling_expr_to_device_expr(
+            tensor.layout.device_layout.device_size,
+            tensor.layout.device_layout.stride_map,
+            host_expr,
+        )
+
     def create_tensor_arg(
         self,
         is_input: bool,
@@ -727,6 +780,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         tile_advance_expr, full_tiled_extent = self._per_arg_tile_advance(
             tensor, device_coords, index
         )
+        device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         tensor_arg = TensorArg(
             is_input,
             -1,
@@ -738,6 +792,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             name=opspec_name,
             tile_advance_expr=tile_advance_expr,
             full_tiled_extent=full_tiled_extent,
+            device_tile_advance_expr=device_tile_advance_expr,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -964,6 +1019,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
+        self._general_tile_advance_seen = {}
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
         # and mark the buf name as removed so the wrapper does not allocate it separately.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -1075,6 +1131,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
     ) -> None:
         """Convert an RValue"""
+        self._general_tile_advance_seen = {}
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
