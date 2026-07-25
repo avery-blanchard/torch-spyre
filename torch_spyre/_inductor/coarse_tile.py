@@ -1114,6 +1114,7 @@ def coarse_tile(
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
     insert_tiling_propagation(operations, groups)
+    _zero_fixed_tile_advance_exprs(operations)
 
     for group_id, group_ops, retiled_infos in retiled_infos_by_group:
         _patch_retiled_load_indexes(group_id, group_ops, retiled_infos, operations)
@@ -1192,6 +1193,51 @@ def insert_tiling_propagation(
             )
             if current is not None and current is not op:
                 group_ops[idx] = current
+
+
+def _zero_fixed_tile_advance_exprs(operations: list[Operation]) -> None:
+    """Zero tile_advance_exprs / output_tile_advance_expr for fixed tiles.
+
+    A per-tile-fixed buffer (flagged by insert_tiling_propagation, above, via
+    either the pre-stickify _pending_per_tile_fixed or an already-committed
+    post-stickify FixedTiledLayout.per_tile_fixed) is reused in place every
+    tile iteration -- it never actually advances, regardless of what its
+    dependency's index arithmetic would otherwise compute. Replace that
+    mathematically-correct-but-semantically-useless real expression with a
+    real 0, both for the op's own output (if its own buffer is fixed) and
+    for any op reading a fixed buffer as an input.
+
+    This is the only place tile_advance_exprs/output_tile_advance_expr reads
+    per_tile_fixed/_pending_per_tile_fixed -- a deliberate one-way bridge
+    kept isolated here so it can be deleted once a later stage derives
+    per_tile_fixed from a zero advance expr instead of the reverse.
+    """
+    fixed_names = {
+        op.get_name()
+        for op in operations
+        if isinstance(op, ComputedBuffer)
+        and (
+            getattr(op, "_pending_per_tile_fixed", False)
+            or getattr(op.layout, "per_tile_fixed", False)
+        )
+    }
+    if not fixed_names:
+        return
+
+    for op in operations:
+        loop_info = getattr(op, "loop_info", None)
+        if loop_info is None:
+            continue
+        if op.get_name() in fixed_names:
+            loop_info.output_tile_advance_expr = sympy.Integer(0)
+        if not loop_info.tile_advance_exprs:
+            continue
+        reads = [
+            dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
+        ]
+        for i, dep in enumerate(reads):
+            if dep.name in fixed_names:
+                loop_info.tile_advance_exprs[i] = sympy.Integer(0)
 
 
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:

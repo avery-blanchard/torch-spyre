@@ -1698,6 +1698,143 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         self.assertEqual(simplify(op.loop_info.tile_advance_exprs[1] - expected_b), 0)
 
 
+def _make_fixed_flag_op(
+    name,
+    tile_advance_exprs,
+    output_tile_advance_expr,
+    pending_per_tile_fixed=False,
+    layout_per_tile_fixed=False,
+    read_names=(),
+):
+    """Return a ComputedBuffer mock carrying loop_info + a fixed-tile signal.
+
+    Mirrors _make_tiled_op/_make_consumer_op's MagicMock(spec=...) pattern
+    (see _make_rw_with_reads above) so isinstance(op, ComputedBuffer) and
+    isinstance(dep, MemoryDep) both hold without needing real IR.
+    """
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = [Integer(16)]
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=(0,),
+        loop_count=[Integer(4)],
+        loop_tiled_dims=[[0]],
+        tile_advance_exprs=list(tile_advance_exprs),
+        output_tile_advance_expr=output_tile_advance_expr,
+    )
+    op.get_read_writes.return_value = _make_rw_with_reads(*read_names)
+    if layout_per_tile_fixed:
+        layout = MagicMock(spec=FixedLayout)
+        layout.per_tile_fixed = True
+        op.layout = layout
+    else:
+        op.layout = MagicMock(spec=FixedLayout)
+        del op.layout.per_tile_fixed
+    if pending_per_tile_fixed:
+        op._pending_per_tile_fixed = True
+    else:
+        del op._pending_per_tile_fixed
+    op.origins = OrderedSet()
+    return op
+
+
+class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
+    """Unit tests for _zero_fixed_tile_advance_exprs."""
+
+    def test_no_fixed_ops_is_noop(self):
+        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+
+        d0 = sympy_index_symbol("d0")
+        op = _make_fixed_flag_op(
+            "op0",
+            tile_advance_exprs=[Integer(4) * d0],
+            output_tile_advance_expr=Integer(4) * d0,
+        )
+        _zero_fixed_tile_advance_exprs([op])
+        self.assertEqual(
+            simplify(op.loop_info.tile_advance_exprs[0] - Integer(4) * d0), 0
+        )
+        self.assertEqual(
+            simplify(op.loop_info.output_tile_advance_expr - Integer(4) * d0), 0
+        )
+
+    def test_pending_per_tile_fixed_zeros_own_output(self):
+        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+
+        d0 = sympy_index_symbol("d0")
+        op = _make_fixed_flag_op(
+            "op0",
+            tile_advance_exprs=[],
+            output_tile_advance_expr=Integer(4) * d0,
+            pending_per_tile_fixed=True,
+        )
+        _zero_fixed_tile_advance_exprs([op])
+        self.assertEqual(op.loop_info.output_tile_advance_expr, Integer(0))
+
+    def test_committed_layout_per_tile_fixed_zeros_own_output(self):
+        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+
+        d0 = sympy_index_symbol("d0")
+        op = _make_fixed_flag_op(
+            "op0",
+            tile_advance_exprs=[],
+            output_tile_advance_expr=Integer(4) * d0,
+            layout_per_tile_fixed=True,
+        )
+        _zero_fixed_tile_advance_exprs([op])
+        self.assertEqual(op.loop_info.output_tile_advance_expr, Integer(0))
+
+    def test_reader_of_fixed_buffer_has_its_read_advance_zeroed(self):
+        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+
+        d0 = sympy_index_symbol("d0")
+        fixed_op = _make_fixed_flag_op(
+            "fixed0",
+            tile_advance_exprs=[],
+            output_tile_advance_expr=Integer(4) * d0,
+            pending_per_tile_fixed=True,
+        )
+        reader = _make_fixed_flag_op(
+            "reader0",
+            tile_advance_exprs=[Integer(4) * d0, Integer(8) * d0],
+            output_tile_advance_expr=Integer(8) * d0,
+            read_names=["fixed0", "other_buf"],
+        )
+        _zero_fixed_tile_advance_exprs([fixed_op, reader])
+        # fixed0's own read entry (index 0, matching read_names[0]) is
+        # zeroed; other_buf's (index 1) is untouched.
+        self.assertEqual(reader.loop_info.tile_advance_exprs[0], Integer(0))
+        self.assertEqual(
+            simplify(reader.loop_info.tile_advance_exprs[1] - Integer(8) * d0), 0
+        )
+        # reader's own output is unaffected -- reader0 itself isn't fixed.
+        self.assertEqual(
+            simplify(reader.loop_info.output_tile_advance_expr - Integer(8) * d0), 0
+        )
+
+    def test_op_without_loop_info_is_skipped(self):
+        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+
+        fixed_op = _make_fixed_flag_op(
+            "fixed0",
+            tile_advance_exprs=[],
+            output_tile_advance_expr=Integer(0),
+            pending_per_tile_fixed=True,
+        )
+        no_loop_info_op = _make_fixed_flag_op(
+            "other0", tile_advance_exprs=[], output_tile_advance_expr=Integer(0)
+        )
+        del no_loop_info_op.loop_info
+        # Must not raise despite the second op having no loop_info at all.
+        _zero_fixed_tile_advance_exprs([fixed_op, no_loop_info_op])
+
+
 # ===========================================================================
 # 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
 # ===========================================================================
