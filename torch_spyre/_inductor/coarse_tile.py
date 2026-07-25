@@ -55,6 +55,7 @@ sites depend on.
 from __future__ import annotations
 
 
+import dataclasses
 import logging
 from collections import Counter
 from typing import NamedTuple
@@ -2490,11 +2491,14 @@ def _insert_copy_op(
 ) -> None:
     """Insert a copy op after tiled_op that writes each tile into full_buf.
 
-    The copy op carries the same loop metadata as tiled_op so it executes
-    inside the same loop body.  Its layout is MutationLayoutSHOULDREMOVE
-    pointing at full_buf so store_output writes into full_buf.  Because
-    loop_tiled_dims is set, SpyreKernel stamps tiled_symbols on the OpSpec
-    and bundle.mlir emits affine.apply for the per-iteration output address.
+    The copy op carries the same loop geometry (loop_group_id, loop_count,
+    loop_tiled_dims) as tiled_op so it executes inside the same loop body,
+    but its own tile_advance_exprs/output_tile_advance_expr, freshly
+    derived from its own reads/write (see below) rather than tiled_op's.
+    Its layout is MutationLayoutSHOULDREMOVE pointing at full_buf so
+    store_output writes into full_buf.  Because loop_tiled_dims is set,
+    SpyreKernel stamps tiled_symbols on the OpSpec and bundle.mlir emits
+    affine.apply for the per-iteration output address.
     """
     copy_data = Pointwise(
         device=tiled_op.get_device(),
@@ -2512,8 +2516,42 @@ def _insert_copy_op(
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
 
-    # Stamp with the same loop metadata so this op is inside the same loop.
-    copy_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+    # Stamp with the same loop geometry as tiled_op so this op is inside the
+    # same loop, but with FRESH tile_advance_exprs/output_tile_advance_expr
+    # computed from copy_buf's own reads/write: copy_buf's single read
+    # (tiled_op) and its write (into full_buf) do not correspond
+    # positionally to tiled_op's own reads/write, so tiled_op.loop_info's
+    # lists cannot be reused verbatim. Must be a fresh CoarseTileInfo with
+    # its own list objects, not a shared reference to (or shallow copy of)
+    # tiled_op.loop_info -- a later pass (_zero_fixed_tile_advance_exprs)
+    # mutates output_tile_advance_expr and tile_advance_exprs[i] in place
+    # for per-tile-fixed ops like tiled_op, and any aliasing here would leak
+    # those mutations onto copy_buf's unrelated advance expressions.
+    tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
+    tiled_dim_extents = {
+        d: copy_buf.data.ranges[d]
+        for level_dims in tiled_op_info.loop_tiled_dims
+        for d in level_dims
+    }
+    copy_reads = [
+        dep for dep in copy_buf.get_read_writes().reads if isinstance(dep, MemoryDep)
+    ]
+    copy_writes = [
+        dep for dep in copy_buf.get_read_writes().writes if isinstance(dep, MemoryDep)
+    ]
+    tile_advance_exprs = [
+        _tile_advance_expr_from_dep(dep, tiled_dim_extents) for dep in copy_reads
+    ]
+    output_tile_advance_expr = (
+        _tile_advance_expr_from_dep(copy_writes[0], tiled_dim_extents)
+        if copy_writes
+        else sympy.Integer(0)
+    )
+    copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+        tiled_op_info,
+        tile_advance_exprs=tile_advance_exprs,
+        output_tile_advance_expr=output_tile_advance_expr,
+    )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
 
