@@ -1010,48 +1010,6 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
-def _indirect_source_dim_order_restickify(
-    in_stl: SpyreTensorLayout,
-    idc: "list[sympy.Expr]",
-    access_subs: "dict",
-) -> "SpyreTensorLayout | None":
-    """Target layout that puts a gather source's indexed dim outermost, or None.
-
-    ``access_subs`` maps each data-dependent index symbol to its IndirectAccess
-    (from ``indirect_info_from_op``). The indexed dim is the device coordinate
-    that depends on the index *alone* -- e.g. ``floor(idx/k)`` or ``idx``. A
-    coordinate that mixes the index with an iteration variable (e.g.
-    ``4*Mod(idx,4) + floor(d1/64)``) is the stick-count dim the index bleeds into
-    under tiling, not the indexed dim itself; picking it would rotate the wrong
-    dim (and leave a reshape gather in the layout that fails to lower). The stick
-    coordinate (last) is never a rotation target.
-
-    If the indexed dim sits behind a non-degenerate dim, return a layout with it
-    rotated to the front -- a pure dim permutation (same sticks), so it lowers as
-    a whole-stick move. Returns None when there is no pure-index dim, it is
-    already outermost, or only size-1 dims precede it (rotation is a no-op).
-    """
-    indirect_syms = frozenset(access_subs)
-    if not indirect_syms:
-        return None
-
-    def _is_pure_index(coord) -> bool:
-        fs: frozenset = getattr(coord, "free_symbols", frozenset())
-        return bool(fs & indirect_syms) and not (fs - indirect_syms)
-
-    # Search all but the stick coordinate (idc[-1]); the stick is never rotated.
-    idx_pos = next((i for i, c in enumerate(idc[:-1]) if _is_pure_index(c)), None)
-    if idx_pos is None or all(d == 1 for d in list(in_stl.device_size)[:idx_pos]):
-        return None
-    size, strides = list(in_stl.device_size), list(in_stl.stride_map)
-    order = [idx_pos] + [i for i in range(len(size)) if i != idx_pos]
-    return SpyreTensorLayout(
-        device_size=[size[i] for i in order],
-        stride_map=[strides[i] for i in order],
-        device_dtype=in_stl.device_dtype,
-    )
-
-
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -1073,7 +1031,7 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    ind_names, access_subs, ind_sizes = indirect_info_from_op(op)
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
@@ -1091,15 +1049,6 @@ def compute_restickify_needed(
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    # Gather data source: the indexed dim (its coordinate is a data-dependent
-    # IndirectAccess symbol) must be the outermost non-degenerate device dim, so
-    # the gather addresses whole indexed-dim strides. If it is not, the gather
-    # reads only the first stick of each indexed row and strides wrong for the
-    # rest. This is a dim-order requirement, orthogonal to the stick check below
-    # (the rotation keeps the same stick), so it must be handled before it.
-    restick = _indirect_source_dim_order_restickify(in_stl, idc, access_subs)
-    if restick is not None:
-        return True, restick
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
