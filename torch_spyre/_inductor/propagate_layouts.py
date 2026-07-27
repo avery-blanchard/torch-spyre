@@ -249,7 +249,7 @@ def _check_supported_input_layout(
     ind_names: set,
     op_label: str,
 ) -> None:
-    """Reject or augment gather sources to place indexed dim outermost.
+    """Filter gather sources to place indexed dim outermost.
 
     This is a dim-order constraint, not a stick-dim one (contrast
     ``_check_supported_input_sticks``): a gather source's indexed dim -- the
@@ -257,8 +257,10 @@ def _check_supported_input_layout(
     e.g. ``floor(idx/k)`` or ``idx`` -- must be the outermost non-degenerate
     device dim, or the gather addresses only the first stick of each indexed
     row and strides wrong for the rest. This follows the topk pattern: reject
-    mixed-coordinate cases, and add rotated layout candidates for pure-index
-    coordinates not already outermost.
+    mixed-coordinate cases that cannot be rotated, and replace input layout
+    candidates with their rotated versions when the indexed dim is not already
+    outermost. This ensures the beam search can only pick layouts satisfying
+    the constraint.
     """
     indirect_syms = frozenset(access_subs)
     if not indirect_syms:
@@ -274,30 +276,41 @@ def _check_supported_input_layout(
     for i, arg in enumerate(args):
         if arg.dep.name in ind_names:
             continue
-        rotated_candidates = []
+        valid_layouts = []
         for stl in arg.layouts:
             coords = try_device_coordinates(stl, arg.dep, None)
             if coords is None:
+                valid_layouts.append(stl)
                 continue
             # The stick coordinate (last) is never a rotation target.
             idx_pos = next(
                 (j for j, c in enumerate(coords[:-1]) if _is_pure_index(c)), None
             )
             # Check for mixed coordinates that cannot be rotated.
-            for pos, coord in enumerate(coords[:-1]):
-                if _touches_index(coord) and not _is_pure_index(coord):
-                    raise Unsupported(
-                        f"{op_label}: input arg{i} has indexed dim at device "
-                        f"coord {pos} mixed with an iteration variable "
-                        f"({coord!r}); this gather source layout cannot be "
-                        f"rotated to place the indexed dim outermost"
-                    )
-            # Generate rotated candidate if indexed dim is not already outermost.
+            mixed_pos = next(
+                (
+                    pos
+                    for pos, c in enumerate(coords[:-1])
+                    if _touches_index(c) and not _is_pure_index(c)
+                ),
+                None,
+            )
+            if mixed_pos is not None:
+                raise Unsupported(
+                    f"{op_label}: input arg{i} has indexed dim at device "
+                    f"coord {mixed_pos} mixed with an iteration variable "
+                    f"({coords[mixed_pos]!r}); this gather source layout cannot be "
+                    f"placed with the indexed dim outermost"
+                )
+            # Keep layout if indexed dim is already outermost or doesn't exist.
             if (
-                idx_pos is not None
-                and idx_pos > 0
-                and not all(d == 1 for d in list(stl.device_size)[:idx_pos])
+                idx_pos is None
+                or idx_pos == 0
+                or all(d == 1 for d in list(stl.device_size)[:idx_pos])
             ):
+                valid_layouts.append(stl)
+            # Otherwise, generate rotated version.
+            else:
                 order = [idx_pos] + [
                     j for j in range(len(stl.device_size)) if j != idx_pos
                 ]
@@ -306,8 +319,8 @@ def _check_supported_input_layout(
                     stride_map=[stl.stride_map[j] for j in order],
                     device_dtype=stl.device_dtype,
                 )
-                rotated_candidates.append(rotated)
-        arg.layouts.extend(rotated_candidates)
+                valid_layouts.append(rotated)
+        arg.layouts[:] = valid_layouts
 
 
 def _rescale_stl_for_dtype(
