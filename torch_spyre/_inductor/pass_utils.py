@@ -1049,33 +1049,6 @@ def compute_restickify_needed(
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-
-    # Gather data source dim-order rotation: if the indexed dim is not already
-    # outermost, rotate it there. The indexed dim (the device coordinate that
-    # depends on the data-dependent index symbol alone) must be outermost, or the
-    # gather addresses only the first stick of each indexed row and strides wrong
-    # for the rest. Mixed-coordinate candidates are rejected upstream by
-    # _check_supported_input_layout, so only pure-index coordinates reach here.
-    indirect_syms = frozenset(access_subs)
-
-    def _is_pure_index(coord) -> bool:
-        fs: frozenset = getattr(coord, "free_symbols", frozenset())
-        return bool(fs & indirect_syms) and not (fs - indirect_syms)
-
-    idx_pos = next((i for i, c in enumerate(idc[:-1]) if _is_pure_index(c)), None)
-    if (
-        idx_pos is not None
-        and idx_pos > 0
-        and not all(d == 1 for d in list(in_stl.device_size)[:idx_pos])
-    ):
-        order = [idx_pos] + [i for i in range(len(in_stl.device_size)) if i != idx_pos]
-        rotated = SpyreTensorLayout(
-            device_size=[in_stl.device_size[i] for i in order],
-            stride_map=[in_stl.stride_map[i] for i in order],
-            device_dtype=in_stl.device_dtype,
-        )
-        return True, rotated
-
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):

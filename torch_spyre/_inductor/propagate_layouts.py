@@ -246,23 +246,19 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
 def _check_supported_input_layout(
     args: list[PropArg],
     access_subs: "dict[sympy.Symbol, sympy.Expr]",
+    ind_names: set,
     op_label: str,
 ) -> None:
-    """Reject gather sources whose indexed dim cannot be placed outermost.
+    """Reject or augment gather sources to place indexed dim outermost.
 
     This is a dim-order constraint, not a stick-dim one (contrast
     ``_check_supported_input_sticks``): a gather source's indexed dim -- the
     device coordinate that depends on the data-dependent index symbol alone,
-    e.g. ``floor(idx/k)`` or ``idx`` -- must end up the outermost non-degenerate
+    e.g. ``floor(idx/k)`` or ``idx`` -- must be the outermost non-degenerate
     device dim, or the gather addresses only the first stick of each indexed
-    row and strides wrong for the rest. ``compute_restickify_needed`` rotates
-    it there automatically when it can, so this only needs to catch the case it
-    can't: the indexed dim's coordinate mixes the index with an iteration
-    variable (e.g. ``4*Mod(idx,4) + floor(d1/64)``, the stick-count dim the
-    index bleeds into under tiling). Picking that dim to rotate would move the
-    wrong one, so ``compute_restickify_needed`` silently does nothing for it --
-    catch it here instead of letting it reach the beam search as a false
-    "no restickify needed".
+    row and strides wrong for the rest. This follows the topk pattern: reject
+    mixed-coordinate cases, and add rotated layout candidates for pure-index
+    coordinates not already outermost.
     """
     indirect_syms = frozenset(access_subs)
     if not indirect_syms:
@@ -276,13 +272,18 @@ def _check_supported_input_layout(
         return bool(fs & indirect_syms) and not (fs - indirect_syms)
 
     for i, arg in enumerate(args):
+        if arg.dep.name in ind_names:
+            continue
+        rotated_candidates = []
         for stl in arg.layouts:
             coords = try_device_coordinates(stl, arg.dep, None)
             if coords is None:
                 continue
-            # The stick coordinate (last) is never a rotation target -- a
-            # gather source's stick dim carries no data-dependent symbol in
-            # any supported layout, so it is excluded from this check.
+            # The stick coordinate (last) is never a rotation target.
+            idx_pos = next(
+                (j for j, c in enumerate(coords[:-1]) if _is_pure_index(c)), None
+            )
+            # Check for mixed coordinates that cannot be rotated.
             for pos, coord in enumerate(coords[:-1]):
                 if _touches_index(coord) and not _is_pure_index(coord):
                     raise Unsupported(
@@ -291,6 +292,22 @@ def _check_supported_input_layout(
                         f"({coord!r}); this gather source layout cannot be "
                         f"rotated to place the indexed dim outermost"
                     )
+            # Generate rotated candidate if indexed dim is not already outermost.
+            if (
+                idx_pos is not None
+                and idx_pos > 0
+                and not all(d == 1 for d in list(stl.device_size)[:idx_pos])
+            ):
+                order = [idx_pos] + [
+                    j for j in range(len(stl.device_size)) if j != idx_pos
+                ]
+                rotated = SpyreTensorLayout(
+                    device_size=[stl.device_size[j] for j in order],
+                    stride_map=[stl.stride_map[j] for j in order],
+                    device_dtype=stl.device_dtype,
+                )
+                rotated_candidates.append(rotated)
+        arg.layouts.extend(rotated_candidates)
 
 
 def _rescale_stl_for_dtype(
@@ -867,7 +884,7 @@ def _multi_arg_pointwise_layouts(
         output_ea = ElementArrangement.STANDARD
 
     ind_names, access_subs, ind_sizes = indirect_info_from_op(op)
-    _check_supported_input_layout(args, access_subs, "gather")
+    _check_supported_input_layout(args, access_subs, ind_names, "gather")
     stick_exprs = {
         device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
