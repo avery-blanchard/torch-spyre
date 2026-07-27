@@ -243,6 +243,56 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
+def _check_supported_input_layout(
+    args: list[PropArg],
+    access_subs: "dict[sympy.Symbol, sympy.Expr]",
+    op_label: str,
+) -> None:
+    """Reject gather sources whose indexed dim cannot be placed outermost.
+
+    This is a dim-order constraint, not a stick-dim one (contrast
+    ``_check_supported_input_sticks``): a gather source's indexed dim -- the
+    device coordinate that depends on the data-dependent index symbol alone,
+    e.g. ``floor(idx/k)`` or ``idx`` -- must end up the outermost non-degenerate
+    device dim, or the gather addresses only the first stick of each indexed
+    row and strides wrong for the rest. ``compute_restickify_needed`` rotates
+    it there automatically when it can, so this only needs to catch the case it
+    can't: the indexed dim's coordinate mixes the index with an iteration
+    variable (e.g. ``4*Mod(idx,4) + floor(d1/64)``, the stick-count dim the
+    index bleeds into under tiling). Picking that dim to rotate would move the
+    wrong one, so ``compute_restickify_needed`` silently does nothing for it --
+    catch it here instead of letting it reach the beam search as a false
+    "no restickify needed".
+    """
+    indirect_syms = frozenset(access_subs)
+    if not indirect_syms:
+        return
+
+    def _touches_index(coord) -> bool:
+        return bool(getattr(coord, "free_symbols", frozenset()) & indirect_syms)
+
+    def _is_pure_index(coord) -> bool:
+        fs: frozenset = getattr(coord, "free_symbols", frozenset())
+        return bool(fs & indirect_syms) and not (fs - indirect_syms)
+
+    for i, arg in enumerate(args):
+        for stl in arg.layouts:
+            coords = try_device_coordinates(stl, arg.dep, None)
+            if coords is None:
+                continue
+            # The stick coordinate (last) is never a rotation target -- a
+            # gather source's stick dim carries no data-dependent symbol in
+            # any supported layout, so it is excluded from this check.
+            for pos, coord in enumerate(coords[:-1]):
+                if _touches_index(coord) and not _is_pure_index(coord):
+                    raise Unsupported(
+                        f"{op_label}: input arg{i} has indexed dim at device "
+                        f"coord {pos} mixed with an iteration variable "
+                        f"({coord!r}); this gather source layout cannot be "
+                        f"rotated to place the indexed dim outermost"
+                    )
+
+
 def _rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
@@ -816,7 +866,8 @@ def _multi_arg_pointwise_layouts(
         # All STANDARD or other EAs - use STANDARD
         output_ea = ElementArrangement.STANDARD
 
-    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    ind_names, access_subs, ind_sizes = indirect_info_from_op(op)
+    _check_supported_input_layout(args, access_subs, "gather")
     stick_exprs = {
         device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
