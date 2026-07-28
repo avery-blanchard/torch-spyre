@@ -145,6 +145,59 @@ def _stride_map_to_host_dim(
     return next((d for d, s in enumerate(host_stride) if int(s) == sm), None)
 
 
+def _build_required_stl(
+    value_layout,
+    required_dim_order: list[int],
+) -> SpyreTensorLayout:
+    """Build a new STL with required_dim_order.
+
+    For 2D tensors with indirect access, the device layout must be [0, 1, 1]
+    (non_stick, outer_stick, inner_stick) to match indirect access requirements.
+    For other cases, use the standard host-side constructor which handles the
+    generic tiling via get_generic_stick_layout().
+    """
+    host_rank = len(value_layout.size)
+
+    # Special case: 2D indirect access requires device layout [0, 1, 1]
+    # (non_stick, outer_stick, inner_stick) following dim_map_to_stride_map logic
+    if host_rank == 2:
+        # Compute device layout as if dim_map=[0, 1, 1] were passed to
+        # dim_map_to_stride_map(dim_map=[0,1,1], host_size, host_stride, device_size).
+        # For 2D indirect: device_size=[host_size[0], ceil(host_size[1]/eps), eps]
+        # where eps = elems_per_stick from device_dtype.
+        from torch_spyre._C import get_elem_in_stick
+
+        eps = get_elem_in_stick(value_layout.dtype)
+        host_size_0 = int(value_layout.size[0])
+        host_size_1 = int(value_layout.size[1])
+        host_stride_0 = int(value_layout.stride[0])
+        host_stride_1 = int(value_layout.stride[1])
+
+        device_size = [
+            host_size_0,
+            (host_size_1 + eps - 1) // eps,
+            eps,
+        ]
+        # stride_map follows dim_map=[0, 1, 1] backward traversal:
+        # j=2: d=1, first → stride_map[2]=host_stride[1], last_stride[1]=h_s[1]*eps
+        # j=1: d=1, second → stride_map[1]=last_stride[1]=h_s[1]*eps
+        # j=0: d=0, first → stride_map[0]=host_stride[0]
+        stride_map = [
+            host_stride_0,
+            host_stride_1 * eps,
+            host_stride_1,
+        ]
+        return SpyreTensorLayout(device_size, stride_map, value_layout.dtype)
+
+    # For non-2D cases, use the standard host-side constructor
+    return SpyreTensorLayout(
+        value_layout.size,
+        value_layout.stride,
+        value_layout.dtype,
+        required_dim_order,
+    )
+
+
 def _required_dim_order(
     value_stl: SpyreTensorLayout,
     value_layout,
@@ -341,11 +394,14 @@ def _get_nonstick_dim_order_requirements(
     Currently checks: indirect-access requirements (via indirect_info_from_op).
     Future: extend to check other requirement sources.
     """
-    # Check indirect-access requirements
     dep_names, access_subs, sizes = indirect_info_from_op(op)
     if dep_names:
+        logger.debug(
+            "reorder_nonstick_dims: op %s has nonstick-dim requirements from %d deps",
+            op.get_name(),
+            len(dep_names),
+        )
         return dep_names, access_subs, sizes
-    # Future: check other requirement sources here
     return None
 
 
@@ -430,6 +486,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             if _dim_order_is_compliant(
                 value_coords, index_coords, access_subs, stride_idx
             ):
+                logger.debug(
+                    "reorder_nonstick_dims: op %s value_buf %s already compliant",
+                    op.get_name(),
+                    resolved_value_buf.get_name(),
+                )
                 continue
 
             required_dim_order = _required_dim_order(
@@ -440,12 +501,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 access_subs,
                 stride_idx,
             )
-            required_stl = SpyreTensorLayout(
-                value_layout.size,
-                value_layout.stride,
-                value_layout.dtype,
-                required_dim_order,
-            )
+            required_stl = _build_required_stl(value_layout, required_dim_order)
 
             if not is_own_output and _can_mutate_producer_in_place(
                 graph, resolved_value_buf
