@@ -92,6 +92,9 @@ def _indirect_dim_symbols(
             if sym not in seen:
                 seen.add(sym)
                 ordered.append(sym)
+    logger.debug(
+        "_indirect_dim_symbols: index_coords=%s, ordered=%s", index_coords, ordered
+    )
     return ordered
 
 
@@ -112,6 +115,12 @@ def _value_dim_symbols(
             if sym not in seen:
                 seen.add(sym)
                 ordered.append(sym)
+    logger.debug(
+        "_value_dim_symbols: value_coords=%s, indirect_pos=%d, ordered=%s",
+        value_coords,
+        indirect_pos,
+        ordered,
+    )
     return ordered
 
 
@@ -124,7 +133,14 @@ def _dim_order_is_compliant(
     """Check that value's non-stick dim order (right-to-left) matches index's."""
     index_syms = _indirect_dim_symbols(index_coords, access_subs)
     value_syms = _value_dim_symbols(value_coords, access_subs, stride_idx)
-    return value_syms[: len(index_syms)] == index_syms
+    compliant = value_syms[: len(index_syms)] == index_syms
+    logger.debug(
+        "_dim_order_is_compliant: index_syms=%s, value_syms=%s, compliant=%s",
+        index_syms,
+        value_syms,
+        compliant,
+    )
+    return compliant
 
 
 def _stride_map_to_host_dim(
