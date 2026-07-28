@@ -374,19 +374,37 @@ def _value_bufs_for_op(
     """
     value_bufs: list = []
     rw = op.get_read_writes()
+    logger.info(
+        "reorder_nonstick_dims: _value_bufs_for_op checking %d read deps, %d in dep_names",
+        len(rw.reads),
+        len(dep_names),
+    )
     for dep in rw.reads:
         if not isinstance(dep, MemoryDep):
+            logger.debug("reorder_nonstick_dims: dep %s is not MemoryDep", dep)
             continue
         buf = graph.get_buffer(dep.name)
         layout = _real_layout(buf)
         if not isinstance(layout, FixedTiledLayout):
+            logger.debug(
+                "reorder_nonstick_dims: dep %s buf %s layout is not FixedTiledLayout",
+                dep.name,
+                buf.get_name(),
+            )
             continue
         coords = device_coordinates(layout.device_layout, dep, None)
-        if any(
+        has_indirect = any(
             hasattr(c.xreplace(access_subs), "has")
             and c.xreplace(access_subs).has(IndirectAccess)
             for c in coords
-        ):
+        )
+        logger.info(
+            "reorder_nonstick_dims: dep %s coords=%s, has_indirect=%s",
+            dep.name,
+            coords,
+            has_indirect,
+        )
+        if has_indirect:
             value_bufs.append(buf)
 
     scatter_index_names = _find_scatter_index_buf_names(op)
@@ -446,6 +464,11 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
         # already-patched reads/writes rather than a stale snapshot.
         op = original_op
         value_bufs = _value_bufs_for_op(graph, op, dep_names, access_subs)
+        logger.info(
+            "reorder_nonstick_dims: op %s found %d value_bufs to check",
+            op.get_name(),
+            len(value_bufs),
+        )
         for value_buf in value_bufs:
             is_own_output = value_buf is _OWN_OUTPUT
             resolved_value_buf = op if is_own_output else value_buf
@@ -468,7 +491,19 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             value_coords = device_coordinates(value_stl, value_dep, sizes)
             stride_idx = _indirect_stride_idx(value_coords, access_subs)
             if stride_idx is None:
+                logger.info(
+                    "reorder_nonstick_dims: op %s value_buf %s has no indirect stride, skipping",
+                    op.get_name(),
+                    resolved_value_buf.get_name(),
+                )
                 continue
+            logger.info(
+                "reorder_nonstick_dims: op %s value_buf %s stride_idx=%d, value_coords=%s",
+                op.get_name(),
+                resolved_value_buf.get_name(),
+                stride_idx,
+                value_coords,
+            )
 
             index_names = {
                 sym.args[0].name
