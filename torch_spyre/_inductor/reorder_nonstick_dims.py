@@ -16,14 +16,15 @@
 
 The three-pass restickify pipeline (propagate_layouts -> optimize_restickify ->
 insert_restickify) resolves stick-dimension layout constraints. Some operations
-impose additional requirements on non-stick dimension ordering.
+impose additional requirements on non-stick dimension ordering based on their
+coordinate access patterns.
 
 This pass runs after insert_restickify, once every op has a committed
 FixedTiledLayout. For operations with nonstick-dim-order requirements, it checks
 whether the value tensor's current dim_order matches; if not, either rewrites the
-producer's output layout in place (single-consumer case) or inserts a copy in
- the required layout. New requirement sources can be added by extending
-_get_nonstick_dim_order_requirements().
+producer's output layout in place (if the producer is a ComputedBuffer and not a
+graph output) or inserts a spyre.restickify copy in the required layout. New
+requirement sources can be added by extending _get_nonstick_dim_order_requirements().
 """
 
 import sympy
@@ -181,28 +182,21 @@ def _required_dim_order(
     return dim_order
 
 
-def _consumer_count(graph: GraphLowering, name: str) -> int:
-    """Count read+write references to buffer `name` across graph.operations."""
-    count = 0
-    for op in graph.operations:
-        rw = op.get_read_writes()
-        for dep in rw.reads:
-            if isinstance(dep, MemoryDep) and dep.name == name:
-                count += 1
-        for dep in rw.writes:
-            if isinstance(dep, MemoryDep) and dep.name == name:
-                count += 1
-    return count
+def _can_mutate_producer_in_place(value_buf, output_names: set[str]) -> bool:
+    """Check if a value buffer's producer layout can be rewritten in place.
 
-
-def _can_mutate_producer_in_place(graph: GraphLowering, value_buf) -> bool:
+    Producer layout can be rewritten if the buffer is a ComputedBuffer (not
+    a graph input), not a mutation layout, and not a graph output. Multiple
+    consumers are fine — we're rewriting the producer's output, which all
+    consumers will see.
+    """
     if not isinstance(value_buf, ComputedBuffer):
         return False
     if isinstance(value_buf.layout, MutationLayoutSHOULDREMOVE):
         return False
-    if value_buf.get_name() in graph.get_output_names():
+    if value_buf.get_name() in output_names:
         return False
-    return _consumer_count(graph, value_buf.get_name()) <= 1
+    return True
 
 
 def _rewrite_producer_layout(value_buf, required_stl: SpyreTensorLayout) -> None:
@@ -363,7 +357,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             )
             required_stl = _build_required_stl(value_layout, required_dim_order)
 
-            if _can_mutate_producer_in_place(graph, value_buf):
+            if _can_mutate_producer_in_place(value_buf, graph.get_output_names()):
                 _rewrite_producer_layout(value_buf, required_stl)
             else:
                 required_layout = _fixed_tiled(value_layout, required_stl)
