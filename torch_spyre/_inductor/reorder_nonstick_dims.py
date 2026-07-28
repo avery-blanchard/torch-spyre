@@ -234,6 +234,13 @@ def _required_dim_order(
 
     stick_dim = _host_dim(n - 1)
     indirect_dim = _host_dim(n - 1 - stride_idx)
+    logger.debug(
+        "reorder_nonstick_dims: computed stick_dim=%d, indirect_dim=%d, stride_idx=%d, n=%d",
+        stick_dim,
+        indirect_dim,
+        stride_idx,
+        n,
+    )
 
     index_syms = _indirect_dim_symbols(index_coords, access_subs)
     # Map each host free symbol in value_coords back to its host dim index.
@@ -269,6 +276,12 @@ def _required_dim_order(
             f"indirect layout: could not construct a valid dim_order from "
             f"index symbols {index_syms!r} and value rank {n}"
         )
+    logger.debug(
+        "reorder_nonstick_dims: required_dim_order=%s (ordered_dims=%s, remaining=%s)",
+        dim_order,
+        ordered_dims,
+        remaining,
+    )
     return dim_order
 
 
