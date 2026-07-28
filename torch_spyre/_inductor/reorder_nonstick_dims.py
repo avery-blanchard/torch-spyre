@@ -365,6 +365,7 @@ def _value_bufs_for_op(
     op: ComputedBuffer,
     dep_names: set,
     access_subs: dict,
+    sizes: dict | None,
 ) -> list:
     """Return the value-tensor buffers this op indirectly accesses.
 
@@ -392,16 +393,16 @@ def _value_bufs_for_op(
                 buf.get_name(),
             )
             continue
-        coords = device_coordinates(layout.device_layout, dep, None)
+        coords = device_coordinates(layout.device_layout, dep, sizes)
+        coords_with_indirect = [c.xreplace(access_subs) for c in coords]
         has_indirect = any(
-            hasattr(c.xreplace(access_subs), "has")
-            and c.xreplace(access_subs).has(IndirectAccess)
-            for c in coords
+            hasattr(c, "has") and c.has(IndirectAccess) for c in coords_with_indirect
         )
         logger.info(
-            "reorder_nonstick_dims: dep %s coords=%s, has_indirect=%s",
+            "reorder_nonstick_dims: dep %s coords=%s, coords_with_indirect=%s, has_indirect=%s",
             dep.name,
             coords,
+            coords_with_indirect,
             has_indirect,
         )
         if has_indirect:
@@ -463,7 +464,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
         # live instance so a second value_buf in this same op sees the
         # already-patched reads/writes rather than a stale snapshot.
         op = original_op
-        value_bufs = _value_bufs_for_op(graph, op, dep_names, access_subs)
+        value_bufs = _value_bufs_for_op(graph, op, dep_names, access_subs, sizes)
         logger.info(
             "reorder_nonstick_dims: op %s found %d value_bufs to check",
             op.get_name(),
