@@ -40,7 +40,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
@@ -77,13 +77,7 @@ def _indirect_stride_idx(coords: list[sympy.Expr], access_subs: dict) -> int | N
     return None
 
 
-def _dim_order_is_compliant(
-    value_stl: SpyreTensorLayout,
-    value_layout,
-    index_stl: SpyreTensorLayout,
-    index_layout,
-    stride_idx: int,
-) -> bool:
+def _dim_order_is_compliant(value_stl: SpyreTensorLayout, stride_idx: int) -> bool:
     """Check if indirect access is at the outermost (leftmost) device position.
 
     For indirect access to work correctly, the IndirectAccess coordinate must
@@ -167,7 +161,9 @@ def _build_required_stl(
             host_stride_1 * eps,
             host_stride_1,
         ]
-        return SpyreTensorLayout(device_size, stride_map, value_layout.dtype)
+        return SpyreTensorLayout(
+            device_size, stride_map, get_device_dtype(value_layout.dtype)
+        )
 
     # For non-2D cases, use the standard host-side constructor
     return SpyreTensorLayout(
@@ -220,11 +216,6 @@ def _required_dim_order(
         if d != indirect_dim and d != stick_dim:
             dim_order.append(d)
     dim_order.append(stick_dim)
-    if len(dim_order) != n or set(dim_order) != set(range(n)):
-        raise Unsupported(
-            f"indirect layout: could not construct a valid dim_order; "
-            f"indirect_dim={indirect_dim}, stick_dim={stick_dim}, n={n}"
-        )
     logger.debug(
         "_required_dim_order: indirect_device_pos=%d, required=%s",
         n - 1 - stride_idx,
@@ -323,7 +314,7 @@ def _value_bufs_for_op(
     """
     value_bufs: list = []
     rw = op.get_read_writes()
-    logger.info(
+    logger.debug(
         "reorder_nonstick_dims: _value_bufs_for_op checking %d read deps, %d in dep_names",
         len(rw.reads),
         len(dep_names),
@@ -346,7 +337,7 @@ def _value_bufs_for_op(
         has_indirect = any(
             hasattr(c, "has") and c.has(IndirectAccess) for c in coords_with_indirect
         )
-        logger.info(
+        logger.debug(
             "reorder_nonstick_dims: dep %s coords=%s, coords_with_indirect=%s, has_indirect=%s",
             dep.name,
             coords,
@@ -413,7 +404,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
         # already-patched reads/writes rather than a stale snapshot.
         op = original_op
         value_bufs = _value_bufs_for_op(graph, op, dep_names, access_subs, sizes)
-        logger.info(
+        logger.debug(
             "reorder_nonstick_dims: op %s found %d value_bufs to check",
             op.get_name(),
             len(value_bufs),
@@ -440,13 +431,13 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             value_coords = device_coordinates(value_stl, value_dep, sizes)
             stride_idx = _indirect_stride_idx(value_coords, access_subs)
             if stride_idx is None:
-                logger.info(
+                logger.debug(
                     "reorder_nonstick_dims: op %s value_buf %s has no indirect stride, skipping",
                     op.get_name(),
                     resolved_value_buf.get_name(),
                 )
                 continue
-            logger.info(
+            logger.debug(
                 "reorder_nonstick_dims: op %s value_buf %s stride_idx=%d, value_coords=%s",
                 op.get_name(),
                 resolved_value_buf.get_name(),
@@ -476,11 +467,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             )
             if index_dep is None:
                 continue
-            index_stl = index_layout.device_layout
-
-            if _dim_order_is_compliant(
-                value_stl, value_layout, index_stl, index_layout, stride_idx
-            ):
+            if _dim_order_is_compliant(value_stl, stride_idx):
                 logger.debug(
                     "reorder_nonstick_dims: op %s value_buf %s already compliant",
                     op.get_name(),
