@@ -16,21 +16,13 @@
 
 The three-pass restickify pipeline (propagate_layouts -> optimize_restickify ->
 insert_restickify) resolves stick-dimension layout constraints. Some operations
-impose additional requirements on non-stick dimension ordering based on their
-coordinate access patterns. Currently, indirect-access operations (gather: x[i],
-torch.gather, index_select; scatter: scatter_, index_put, index_copy, ...) require
-that the value tensor's non-stick free-symbol dims align positionally with the
-index tensor's non-stick dims (right-to-left, excluding stick). This requirement
-is currently only assumed at SuperDSC codegen time (indirect_access.py, used by
-codegen/supydsc.py) and never validated pre-scheduler; a violation silently
-produces wrong max_dim_sizes/strides in codegen.
+impose additional requirements on non-stick dimension ordering.
 
 This pass runs after insert_restickify, once every op has a committed
 FixedTiledLayout. For operations with nonstick-dim-order requirements, it checks
 whether the value tensor's current dim_order matches; if not, either rewrites the
-producer's output layout in place (single-consumer case) or inserts a
-spyre.restickify copy in the required layout (mirroring insert_restickify.py's
-own mechanism). New requirement sources can be added by extending
+producer's output layout in place (single-consumer case) or inserts a copy in
+ the required layout. New requirement sources can be added by extending
 _get_nonstick_dim_order_requirements().
 """
 
@@ -48,11 +40,7 @@ from .insert_restickify import _fixed_tiled, insert_restickify_on_node_inputs
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
-from .pass_utils import (
-    _find_scatter_index_buf_names,
-    device_coordinates,
-    indirect_info_from_op,
-)
+from .pass_utils import device_coordinates, indirect_info_from_op
 
 logger = get_inductor_logger("reorder_nonstick_dims")
 
@@ -123,49 +111,31 @@ def _build_required_stl(
     value_layout,
     required_dim_order: list[int],
 ) -> SpyreTensorLayout:
-    """Build a new STL with required_dim_order.
+    """Build a new STL with the indirect dim outermost (device position 0).
 
-    For 2D tensors with indirect access, the device layout must be [0, 1, 1]
-    (non_stick, outer_stick, inner_stick) to match indirect access requirements.
-    For other cases, use the standard host-side constructor which handles the
-    generic tiling via get_generic_stick_layout().
+    For rank >= 3, the host-side constructor's dim_order param does this
+    directly. Rank 2 needs a hand-built device_size/stride_map instead: the
+    C++ get_generic_stick_layout() always maps a 2D dim_order to
+    dim_map=[last, first, last], i.e. the stick's outer tile always comes
+    before the other non-stick dim in dim_map -- there is no dim_order that
+    puts a non-stick dim ahead of the stick's outer tile at rank 2. So we
+    construct the [non_stick, outer_stick, inner_stick] device layout
+    directly via the device_size/stride_map constructor overload, mirroring
+    what dim_map_to_stride_map would produce for that layout.
     """
-    host_rank = len(value_layout.size)
-
-    # Special case: 2D indirect access requires device layout [0, 1, 1]
-    # (non_stick, outer_stick, inner_stick) following dim_map_to_stride_map logic
-    if host_rank == 2:
-        # Compute device layout as if dim_map=[0, 1, 1] were passed to
-        # dim_map_to_stride_map(dim_map=[0,1,1], host_size, host_stride, device_size).
-        # For 2D indirect: device_size=[host_size[0], ceil(host_size[1]/eps), eps]
-        # where eps = elems_per_stick from device_dtype.
+    if len(value_layout.size) == 2:
         from torch_spyre._C import get_elem_in_stick
 
         eps = get_elem_in_stick(value_layout.dtype)
-        host_size_0 = int(value_layout.size[0])
-        host_size_1 = int(value_layout.size[1])
-        host_stride_0 = int(value_layout.stride[0])
-        host_stride_1 = int(value_layout.stride[1])
+        host_size_0, host_size_1 = (int(s) for s in value_layout.size)
+        host_stride_0, host_stride_1 = (int(s) for s in value_layout.stride)
 
-        device_size = [
-            host_size_0,
-            (host_size_1 + eps - 1) // eps,
-            eps,
-        ]
-        # stride_map follows dim_map=[0, 1, 1] backward traversal:
-        # j=2: d=1, first → stride_map[2]=host_stride[1], last_stride[1]=h_s[1]*eps
-        # j=1: d=1, second → stride_map[1]=last_stride[1]=h_s[1]*eps
-        # j=0: d=0, first → stride_map[0]=host_stride[0]
-        stride_map = [
-            host_stride_0,
-            host_stride_1 * eps,
-            host_stride_1,
-        ]
+        device_size = [host_size_0, (host_size_1 + eps - 1) // eps, eps]
+        stride_map = [host_stride_0, host_stride_1 * eps, host_stride_1]
         return SpyreTensorLayout(
             device_size, stride_map, get_device_dtype(value_layout.dtype)
         )
 
-    # For non-2D cases, use the standard host-side constructor
     return SpyreTensorLayout(
         value_layout.size,
         value_layout.stride,
@@ -202,25 +172,12 @@ def _required_dim_order(
 
     stick_dim = _host_dim(n - 1)
     indirect_dim = _host_dim(n - 1 - stride_idx)
-    logger.debug(
-        "reorder_nonstick_dims: computed stick_dim=%d, indirect_dim=%d, stride_idx=%d, n=%d",
-        stick_dim,
-        indirect_dim,
-        stride_idx,
-        n,
-    )
 
-    # Build required dim_order: indirect_host_dim first, then others
     dim_order = [indirect_dim]
-    for d in range(len(value_layout.size)):
-        if d != indirect_dim and d != stick_dim:
-            dim_order.append(d)
-    dim_order.append(stick_dim)
-    logger.debug(
-        "_required_dim_order: indirect_device_pos=%d, required=%s",
-        n - 1 - stride_idx,
-        dim_order,
+    dim_order.extend(
+        d for d in range(len(value_layout.size)) if d not in (indirect_dim, stick_dim)
     )
+    dim_order.append(stick_dim)
     return dim_order
 
 
@@ -290,69 +247,28 @@ def _insert_relayout_copy(
     )
 
 
-# Sentinel returned by _value_bufs_for_op in place of the op's own output
-# buffer (scatter self-mutation case). We cannot return `op` itself and
-# compare by identity later, because a gather value_buf processed earlier in
-# the same outer iteration may have already reconstructed `op` into a fresh
-# ComputedBuffer instance (see CLAUDE.md's "wrap, never reconstruct" note in
-# insert_restickify_on_node_inputs) -- identity would then silently break.
-_OWN_OUTPUT = object()
-
-
 def _value_bufs_for_op(
     graph: GraphLowering,
     op: ComputedBuffer,
-    dep_names: set,
     access_subs: dict,
     sizes: dict | None,
 ) -> list:
-    """Return the value-tensor buffers this op indirectly accesses.
-
-    Gather: any read dep whose device_coordinates contain an IndirectAccess.
-    Scatter: _OWN_OUTPUT, when the op's write dep is indirect and an index
-    buffer name was found via _find_scatter_index_buf_names.
-    """
+    """Return the value-tensor buffers this op indirectly reads (gather:
+    any read dep whose device_coordinates contain an IndirectAccess)."""
     value_bufs: list = []
-    rw = op.get_read_writes()
-    logger.debug(
-        "reorder_nonstick_dims: _value_bufs_for_op checking %d read deps, %d in dep_names",
-        len(rw.reads),
-        len(dep_names),
-    )
-    for dep in rw.reads:
+    for dep in op.get_read_writes().reads:
         if not isinstance(dep, MemoryDep):
-            logger.debug("reorder_nonstick_dims: dep %s is not MemoryDep", dep)
             continue
         buf = graph.get_buffer(dep.name)
         layout = _real_layout(buf)
         if not isinstance(layout, FixedTiledLayout):
-            logger.debug(
-                "reorder_nonstick_dims: dep %s buf %s layout is not FixedTiledLayout",
-                dep.name,
-                buf.get_name(),
-            )
             continue
-        coords = device_coordinates(layout.device_layout, dep, sizes)
-        coords_with_indirect = [c.xreplace(access_subs) for c in coords]
-        has_indirect = any(
-            hasattr(c, "has") and c.has(IndirectAccess) for c in coords_with_indirect
-        )
-        logger.debug(
-            "reorder_nonstick_dims: dep %s coords=%s, coords_with_indirect=%s, has_indirect=%s",
-            dep.name,
-            coords,
-            coords_with_indirect,
-            has_indirect,
-        )
-        if has_indirect:
+        coords = [
+            c.xreplace(access_subs)
+            for c in device_coordinates(layout.device_layout, dep, sizes)
+        ]
+        if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords):
             value_bufs.append(buf)
-
-    scatter_index_names = _find_scatter_index_buf_names(op)
-    if scatter_index_names:
-        write_dep = next(iter(rw.writes))
-        if isinstance(write_dep, MemoryDep) and write_dep.is_indirect():
-            value_bufs.append(_OWN_OUTPUT)
-
     return value_bufs
 
 
@@ -398,64 +314,31 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             continue
         dep_names, access_subs, sizes = requirement
 
-        # _insert_relayout_copy reconstructs the consumer ComputedBuffer (per
-        # CLAUDE.md's "wrap, never reconstruct inner_fn" rule); track the
-        # live instance so a second value_buf in this same op sees the
-        # already-patched reads/writes rather than a stale snapshot.
         op = original_op
-        value_bufs = _value_bufs_for_op(graph, op, dep_names, access_subs, sizes)
-        logger.debug(
-            "reorder_nonstick_dims: op %s found %d value_bufs to check",
-            op.get_name(),
-            len(value_bufs),
-        )
+        value_bufs = _value_bufs_for_op(graph, op, access_subs, sizes)
         for value_buf in value_bufs:
-            is_own_output = value_buf is _OWN_OUTPUT
-            resolved_value_buf = op if is_own_output else value_buf
-            value_layout = _real_layout(resolved_value_buf)
+            value_layout = _real_layout(value_buf)
             if not isinstance(value_layout, FixedTiledLayout):
                 continue
             value_stl = value_layout.device_layout
 
-            if is_own_output:
-                value_dep = next(
-                    d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
-                )
-            else:
-                value_dep = next(
-                    d
-                    for d in op.get_read_writes().reads
-                    if isinstance(d, MemoryDep)
-                    and d.name == resolved_value_buf.get_name()
-                )
+            value_dep = next(
+                d
+                for d in op.get_read_writes().reads
+                if isinstance(d, MemoryDep) and d.name == value_buf.get_name()
+            )
             value_coords = device_coordinates(value_stl, value_dep, sizes)
             stride_idx = _indirect_stride_idx(value_coords, access_subs)
             if stride_idx is None:
-                logger.debug(
-                    "reorder_nonstick_dims: op %s value_buf %s has no indirect stride, skipping",
-                    op.get_name(),
-                    resolved_value_buf.get_name(),
-                )
                 continue
-            logger.debug(
-                "reorder_nonstick_dims: op %s value_buf %s stride_idx=%d, value_coords=%s",
-                op.get_name(),
-                resolved_value_buf.get_name(),
-                stride_idx,
-                value_coords,
-            )
 
             index_names = {
                 sym.args[0].name
                 for sym in access_subs.values()
                 if isinstance(sym, IndirectAccess)
-            } | _find_scatter_index_buf_names(op)
+            }
             index_name = next(iter(index_names & dep_names), None)
             if index_name is None:
-                continue
-            index_buf = graph.get_buffer(index_name)
-            index_layout = _real_layout(index_buf)
-            if not isinstance(index_layout, FixedTiledLayout):
                 continue
             index_dep = next(
                 (
@@ -467,12 +350,10 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             )
             if index_dep is None:
                 continue
+            index_layout = _real_layout(graph.get_buffer(index_name))
+            if not isinstance(index_layout, FixedTiledLayout):
+                continue
             if _dim_order_is_compliant(value_stl, stride_idx):
-                logger.debug(
-                    "reorder_nonstick_dims: op %s value_buf %s already compliant",
-                    op.get_name(),
-                    resolved_value_buf.get_name(),
-                )
                 continue
 
             required_dim_order = _required_dim_order(
@@ -482,18 +363,8 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             )
             required_stl = _build_required_stl(value_layout, required_dim_order)
 
-            if not is_own_output and _can_mutate_producer_in_place(
-                graph, resolved_value_buf
-            ):
-                _rewrite_producer_layout(resolved_value_buf, required_stl)
-            elif not is_own_output:
-                required_layout = _fixed_tiled(value_layout, required_stl)
-                op = _insert_relayout_copy(
-                    graph, op, resolved_value_buf, required_layout
-                )
+            if _can_mutate_producer_in_place(graph, value_buf):
+                _rewrite_producer_layout(value_buf, required_stl)
             else:
-                raise Unsupported(
-                    f"enforce_indirect_layout: scatter output {op.get_name()!r} "
-                    f"has a non-compliant indirect write layout; in-place "
-                    f"mutation targets cannot be relayout-copied"
-                )
+                required_layout = _fixed_tiled(value_layout, required_stl)
+                op = _insert_relayout_copy(graph, op, value_buf, required_layout)
