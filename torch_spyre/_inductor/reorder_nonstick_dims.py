@@ -77,67 +77,31 @@ def _indirect_stride_idx(coords: list[sympy.Expr], access_subs: dict) -> int | N
     return None
 
 
-def _indirect_dim_symbols(
-    index_coords: list[sympy.Expr], access_subs: dict
-) -> list[sympy.Symbol]:
-    """Ordered, deduped free symbols from index_coords, right-to-left, excluding stick.
-
-    Mirrors indirect_access.py::get_indirect_dim_symbols one stage earlier.
-    """
-    seen: set = set()
-    ordered: list = []
-    for i in range(len(index_coords) - 2, -1, -1):
-        expr = index_coords[i].xreplace(access_subs) if access_subs else index_coords[i]
-        for sym in getattr(expr, "free_symbols", ()):
-            if sym not in seen:
-                seen.add(sym)
-                ordered.append(sym)
-    logger.debug(
-        "_indirect_dim_symbols: index_coords=%s, ordered=%s", index_coords, ordered
-    )
-    return ordered
-
-
-def _value_dim_symbols(
-    value_coords: list[sympy.Expr], access_subs: dict, stick_idx_from_right: int
-) -> list[sympy.Symbol]:
-    """Ordered, deduped free symbols from value_coords, right-to-left, excluding
-    stick and excluding the indirect-access position itself."""
-    n = len(value_coords)
-    indirect_pos = n - 1 - stick_idx_from_right
-    seen: set = set()
-    ordered: list = []
-    for i in range(n - 2, -1, -1):
-        if i == indirect_pos:
-            continue
-        expr = value_coords[i].xreplace(access_subs) if access_subs else value_coords[i]
-        for sym in getattr(expr, "free_symbols", ()):
-            if sym not in seen:
-                seen.add(sym)
-                ordered.append(sym)
-    logger.debug(
-        "_value_dim_symbols: value_coords=%s, indirect_pos=%d, ordered=%s",
-        value_coords,
-        indirect_pos,
-        ordered,
-    )
-    return ordered
-
-
 def _dim_order_is_compliant(
-    value_coords: list[sympy.Expr],
-    index_coords: list[sympy.Expr],
-    access_subs: dict,
+    value_stl: SpyreTensorLayout,
+    value_layout,
+    index_stl: SpyreTensorLayout,
+    index_layout,
     stride_idx: int,
 ) -> bool:
-    """Check that value's non-stick dim order (right-to-left) matches index's."""
-    index_syms = _indirect_dim_symbols(index_coords, access_subs)
-    value_syms = _value_dim_symbols(value_coords, access_subs, stride_idx)
-    compliant = value_syms[: len(index_syms)] == index_syms
+    """Check if indirect access is at the outermost (leftmost) device position.
+
+    For indirect access to work correctly, the IndirectAccess coordinate must
+    be at device position 0 (the outermost dimension before non-stick and stick).
+    This corresponds to stride_idx being positioned such that the indirect
+    dimension is leftmost.
+    """
+    v_n = len(value_stl.stride_map)
+    v_indirect_pos = v_n - 1 - stride_idx
+
+    # Compliant if indirect is at position 0 (outermost device dim)
+    compliant = v_indirect_pos == 0
+
     logger.debug(
-        "_dim_order_is_compliant: index_syms=%s, value_syms=%s, compliant=%s",
-        index_syms,
-        value_syms,
+        "_dim_order_is_compliant: v_n=%d, stride_idx=%d, indirect_pos=%d, compliant=%s",
+        v_n,
+        stride_idx,
+        v_indirect_pos,
         compliant,
     )
     return compliant
@@ -217,24 +181,16 @@ def _build_required_stl(
 def _required_dim_order(
     value_stl: SpyreTensorLayout,
     value_layout,
-    value_coords: list[sympy.Expr],
-    index_coords: list[sympy.Expr],
-    access_subs: dict,
     stride_idx: int,
 ) -> list[int]:
-    """Build the dim_order value_stl must use to satisfy the index tensor's
-    non-stick ordering, keeping the currently committed stick dim fixed.
+    """Build the dim_order so indirect access is at device position 0 (outermost).
 
-    Resolves each device dim's host dim by matching value_stl.stride_map
-    against value_layout's host strides (mirrors pass_utils.py's
-    lower_pad_sequence sm_last heuristic), since SpyreTensorLayout does not
-    expose dim_order back after construction.
+    Maps each device position to its host dim via stride_map, then reorders
+    so the indirect dimension's host dim appears first in the dim_order.
 
-    Raises Unsupported if the index tensor's active-dim count does not fit
-    the value tensor's non-stick rank, or if a device dim's stride_map entry
-    cannot be resolved to a host dim.
+    Raises Unsupported if stride_map entries cannot be resolved to host dims.
     """
-    n = len(value_coords)
+    n = len(value_stl.stride_map)
     stride_map = list(value_stl.stride_map)
     host_stride = [int(s) for s in value_layout.stride]
 
@@ -258,45 +214,21 @@ def _required_dim_order(
         n,
     )
 
-    index_syms = _indirect_dim_symbols(index_coords, access_subs)
-    # Map each host free symbol in value_coords back to its host dim index.
-    sym_to_dim: dict = {}
-    for device_pos in range(n - 1):
-        if device_pos == n - 1 - stride_idx:
-            continue
-        coord = value_coords[device_pos]
-        substituted = coord.xreplace(access_subs) if access_subs else coord
-        host_dim = _host_dim(device_pos)
-        for sym in getattr(substituted, "free_symbols", ()):
-            sym_to_dim.setdefault(sym, host_dim)
-
-    ordered_dims = []
-    for sym in index_syms:
-        dim = sym_to_dim.get(sym)
-        if dim is None:
-            raise Unsupported(
-                f"indirect layout: index symbol {sym} has no corresponding "
-                f"host dim in value tensor coords {value_coords!r}"
-            )
-        if dim not in ordered_dims:
-            ordered_dims.append(dim)
-
-    remaining = [
-        d
-        for d in range(n)
-        if d != stick_dim and d != indirect_dim and d not in ordered_dims
-    ]
-    dim_order = ordered_dims + remaining + [indirect_dim] + [stick_dim]
+    # Build required dim_order: indirect_host_dim first, then others
+    dim_order = [indirect_dim]
+    for d in range(len(value_layout.size)):
+        if d != indirect_dim and d != stick_dim:
+            dim_order.append(d)
+    dim_order.append(stick_dim)
     if len(dim_order) != n or set(dim_order) != set(range(n)):
         raise Unsupported(
-            f"indirect layout: could not construct a valid dim_order from "
-            f"index symbols {index_syms!r} and value rank {n}"
+            f"indirect layout: could not construct a valid dim_order; "
+            f"indirect_dim={indirect_dim}, stick_dim={stick_dim}, n={n}"
         )
     logger.debug(
-        "reorder_nonstick_dims: required_dim_order=%s (ordered_dims=%s, remaining=%s)",
+        "_required_dim_order: indirect_device_pos=%d, required=%s",
+        n - 1 - stride_idx,
         dim_order,
-        ordered_dims,
-        remaining,
     )
     return dim_order
 
@@ -544,12 +476,10 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             )
             if index_dep is None:
                 continue
-            index_coords = device_coordinates(
-                index_layout.device_layout, index_dep, sizes
-            )
+            index_stl = index_layout.device_layout
 
             if _dim_order_is_compliant(
-                value_coords, index_coords, access_subs, stride_idx
+                value_stl, value_layout, index_stl, index_layout, stride_idx
             ):
                 logger.debug(
                     "reorder_nonstick_dims: op %s value_buf %s already compliant",
@@ -561,9 +491,6 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             required_dim_order = _required_dim_order(
                 value_stl,
                 value_layout,
-                value_coords,
-                index_coords,
-                access_subs,
                 stride_idx,
             )
             required_stl = _build_required_stl(value_layout, required_dim_order)
