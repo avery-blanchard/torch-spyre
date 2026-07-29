@@ -344,12 +344,44 @@ def _insert_mutation_relayout_copy(
         return
 
     output_stl = _output_real_layout(mutation_op).device_layout
-    write_stride_idx = _indirect_stride_idx(
-        device_coordinates(output_stl, write_dep, sizes), access_subs
-    )
-    assert write_stride_idx is not None, (
-        f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
-    )
+    # For scatter ops, find which stride corresponds to the scatter destination size
+    if isinstance(mutation_op.data, Scatter):
+        # Get the scatter destination size (first dim of mutation target)
+        target_name, target_buf = _resolve_mutation_target(mutation_op)
+        target_layout = target_buf.get_layout()
+        assert isinstance(target_layout, FixedTiledLayout)
+        scatter_dest_size = target_layout.size[0]
+        logger.debug(
+            "enforce_indirect_layout: scatter op scatter_dest_size=%d, device_size=%s, stride_map=%s",
+            scatter_dest_size,
+            output_stl.device_size,
+            output_stl.stride_map,
+        )
+        # Find which stride covers elements up to scatter_dest_size
+        # The stride that divides the scatter dimension determines its position
+        write_stride_idx = None
+        for idx, (stride, dev_size) in enumerate(
+            zip(reversed(output_stl.stride_map), reversed(output_stl.device_size))
+        ):
+            if dev_size == scatter_dest_size:
+                write_stride_idx = idx
+                logger.debug(
+                    "enforce_indirect_layout: found scatter dim at stride_idx=%d, stride=%d, dev_size=%d",
+                    idx,
+                    stride,
+                    dev_size,
+                )
+                break
+        assert write_stride_idx is not None, (
+            f"could not find scatter destination size {scatter_dest_size} in device_size {output_stl.device_size}"
+        )
+    else:
+        write_stride_idx = _indirect_stride_idx(
+            device_coordinates(output_stl, write_dep, sizes), access_subs
+        )
+        assert write_stride_idx is not None, (
+            f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
+        )
     output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
     required_stl = _build_required_stl(output_stl, output_indirect_pos)
 
@@ -359,6 +391,7 @@ def _insert_mutation_relayout_copy(
         f"expected FixedTiledLayout on mutation target {target_name!r}, "
         f"got {type(target_layout).__name__}"
     )
+
     buf_tmp_layout = _fixed_tiled(target_layout, required_stl)
     orig_stl_layout = target_layout
 
@@ -381,6 +414,13 @@ def _insert_mutation_relayout_copy(
     else:
         mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
 
+    mutation_op._emit_set_layout = (target_name, required_stl)
+
+    operations = graph.operations
+    mutation_op_index = operations.index(mutation_op)
+    operations.remove(buf_tmp)
+    operations.insert(mutation_op_index, buf_tmp)
+
     # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (required_stl).
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
     _, buf_copyback = _create_restickify_node(
@@ -388,13 +428,6 @@ def _insert_mutation_relayout_copy(
         mutation_op,
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
-
-    mutation_op._emit_set_layout = (target_name, required_stl)
-
-    operations = graph.operations
-    mutation_op_index = operations.index(mutation_op)
-    operations.remove(buf_tmp)
-    operations.insert(mutation_op_index, buf_tmp)
     operations.remove(buf_copyback)
     operations.insert(mutation_op_index + 2, buf_copyback)
 
@@ -510,15 +543,19 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
         # For scatter ops, ensure scatter destination dimension 0 (scatter index) is outermost
-        if isinstance(op.data, Scatter) and isinstance(
-            op.layout, MutationLayoutSHOULDREMOVE
+        if isinstance(original_op.data, Scatter) and isinstance(
+            original_op.layout, MutationLayoutSHOULDREMOVE
         ):
             write_dep = next(
-                (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)),
+                (
+                    d
+                    for d in original_op.get_read_writes().writes
+                    if isinstance(d, MemoryDep)
+                ),
                 None,
             )
             if write_dep is not None:
-                output_layout = _output_real_layout(op)
+                output_layout = _output_real_layout(original_op)
                 if isinstance(output_layout, FixedTiledLayout):
                     output_stl = output_layout.device_layout
                     # Get the scatter destination size (first dimension of output)
@@ -558,9 +595,9 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     if not is_compliant:
                         logger.info(
                             "scatter_destination_check: inserting mutation relayout copy for %s",
-                            op.get_name(),
+                            original_op.get_name(),
                         )
-                        store_subs, sizes = _build_indirect_store_subs(op)
+                        store_subs, sizes = _build_indirect_store_subs(original_op)
                         if store_subs:
                             scatter_access_subs = {
                                 sym: IndirectAccess(sympy.Symbol(expr.base.name))
@@ -568,7 +605,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                             }
                             _insert_mutation_relayout_copy(
                                 graph,
-                                op,
+                                original_op,
                                 write_dep,
                                 scatter_access_subs,
                                 sizes,
