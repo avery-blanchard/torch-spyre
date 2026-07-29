@@ -804,7 +804,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
-            if self.indirect_vars:
+            # Check if this operation actually uses indirect variables
+            indirect_syms = (
+                {s for s in value.index.free_symbols if s in self.indirect_vars}
+                if self.indirect_vars
+                else set()
+            )
+            if indirect_syms:
                 # Gather/scatter: coordinates are built with raw indirect symbols here;
                 # indirect_access_subs is applied later in codegen_kernel → simplify_op_spec.
                 # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
@@ -815,10 +821,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for idx_tensor in sorted(
-                        self.indirect_vars.values(),
-                        key=lambda t: t.name,
-                    )
+                    for sym in sorted(indirect_syms, key=str)
+                    for idx_tensor in [self.indirect_vars[sym]]
                 ]
                 args += [
                     self.create_tensor_arg(True, value.name, value),
