@@ -242,10 +242,9 @@ def _output_value_buf_for_op(
     """Return op itself if it indirectly writes its own output (scatter: the
     write dep whose device_coordinates contain an IndirectAccess), else None.
 
-    For Scatter ops, detect indirect writes by checking for scatter index buffers.
-    For other ops, check write coordinates for IndirectAccess.
+    For Scatter ops, we need to check the scatter source (value tensor) layout,
+    not the output layout (which is the mutation target with fixed coordinates).
     """
-    from torch._inductor.ir import Scatter
 
     write_dep = next(
         (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)), None
@@ -258,7 +257,15 @@ def _output_value_buf_for_op(
     if isinstance(op.data, Scatter):
         scatter_index_names = _find_scatter_index_buf_names(op)
         if scatter_index_names:
+            logger.debug(
+                "_output_value_buf_for_op %s: scatter with index buffers %s",
+                op.get_name(),
+                scatter_index_names,
+            )
             return op
+        logger.debug(
+            "_output_value_buf_for_op %s: scatter with no index buffers", op.get_name()
+        )
         return None
 
     # For non-Scatter ops, check write coordinates for IndirectAccess
@@ -496,8 +503,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
-        # For scatter ops, build scatter-specific access_subs for write coordinate analysis
-        scatter_access_subs = access_subs
+        # For scatter ops, handle the scatter source (value tensor) layout
         if isinstance(op.data, Scatter):
             store_subs, _ = _build_indirect_store_subs(op)
             if store_subs:
@@ -505,33 +511,46 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     sym: IndirectAccess(sympy.Symbol(expr.base.name))
                     for sym, expr in store_subs.items()
                 }
+                # Find scatter source buffers (which are read with indirect indices)
+                scatter_value_bufs = _value_bufs_for_op(
+                    graph, op, scatter_access_subs, sizes
+                )
+                for value_buf in scatter_value_bufs:
+                    value_layout = _real_layout(value_buf)
+                    if not isinstance(value_layout, FixedTiledLayout):
+                        continue
+                    value_stl = value_layout.device_layout
 
-        output_value_buf = _output_value_buf_for_op(
-            graph, op, scatter_access_subs, sizes
-        )
-        if output_value_buf is not None:
-            output_layout = _output_real_layout(op)
-            if isinstance(output_layout, FixedTiledLayout):
-                output_stl = output_layout.device_layout
-                write_dep = next(
-                    d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
-                )
-                write_coords = device_coordinates(output_stl, write_dep, sizes)
-                write_stride_idx = _indirect_stride_idx(
-                    write_coords, scatter_access_subs
-                )
-                if write_stride_idx is not None and not _dim_order_is_compliant(
-                    output_stl, write_stride_idx
-                ):
-                    if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                        _insert_mutation_relayout_copy(
-                            graph, op, write_dep, scatter_access_subs, sizes
-                        )
+                    value_dep = next(
+                        (
+                            d
+                            for d in op.get_read_writes().reads
+                            if isinstance(d, MemoryDep)
+                            and d.name == value_buf.get_name()
+                        ),
+                        None,
+                    )
+                    if value_dep is None:
+                        continue
+
+                    value_coords = device_coordinates(value_stl, value_dep, sizes)
+                    stride_idx = _indirect_stride_idx(value_coords, scatter_access_subs)
+                    if stride_idx is None:
+                        continue
+
+                    if _dim_order_is_compliant(value_stl, stride_idx):
+                        continue
+
+                    # Rotate to put indirect coordinate at position 0
+                    indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
+                    required_stl = _build_required_stl(value_stl, indirect_device_pos)
+
+                    if _can_mutate_producer_in_place(
+                        value_buf, graph.get_output_names()
+                    ):
+                        _rewrite_producer_layout(value_buf, required_stl)
                     else:
-                        output_indirect_pos = (
-                            len(output_stl.stride_map) - 1 - write_stride_idx
+                        required_layout = _fixed_tiled(value_layout, required_stl)
+                        op = _insert_relayout_copy(
+                            graph, op, value_buf, required_layout
                         )
-                        output_required_stl = _build_required_stl(
-                            output_stl, output_indirect_pos
-                        )
-                        _rewrite_producer_layout(op, output_required_stl)
