@@ -525,30 +525,31 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     output_layout = _output_real_layout(op)
                     if isinstance(output_layout, FixedTiledLayout):
                         output_stl = output_layout.device_layout
-                        output_coords = device_coordinates(output_stl, write_dep, sizes)
-                        # Apply scatter_access_subs to find indirect in output coords
-                        output_coords_substituted = [
-                            c.xreplace(scatter_access_subs)
-                            if scatter_access_subs
-                            else c
-                            for c in output_coords
-                        ]
-                        output_stride_idx = _indirect_stride_idx(
-                            output_coords_substituted, {}
+                        # Check if scatter index symbols appear in write_dep.index
+                        write_index_with_indirect = write_dep.index.xreplace(
+                            scatter_access_subs
                         )
-                        if output_stride_idx is not None:
-                            is_compliant = _dim_order_is_compliant(
-                                output_stl, output_stride_idx
-                            )
-                            if not is_compliant:
-                                logger.info(
-                                    "scatter_destination_check: inserting mutation relayout copy for %s",
-                                    op.get_name(),
-                                )
-                                _insert_mutation_relayout_copy(
-                                    graph,
-                                    op,
-                                    write_dep,
-                                    scatter_access_subs,
-                                    sizes,
-                                )
+                        if write_index_with_indirect.has(IndirectAccess):
+                            # Find which stride_map index the indirect appears at
+                            # by checking write_dep.index against stride_map
+                            for stride_idx, stride in enumerate(
+                                reversed(output_stl.stride_map)
+                            ):
+                                coeff = write_index_with_indirect.coeff(stride)
+                                if coeff is not None and coeff.has(IndirectAccess):
+                                    is_compliant = _dim_order_is_compliant(
+                                        output_stl, stride_idx
+                                    )
+                                    if not is_compliant:
+                                        logger.info(
+                                            "scatter_destination_check: inserting mutation relayout copy for %s",
+                                            op.get_name(),
+                                        )
+                                        _insert_mutation_relayout_copy(
+                                            graph,
+                                            op,
+                                            write_dep,
+                                            scatter_access_subs,
+                                            sizes,
+                                        )
+                                    break
