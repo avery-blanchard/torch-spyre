@@ -31,12 +31,20 @@ import sympy
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
-
+from torch._inductor.ir import (
+    ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
+    StorageBox,
+)
 from torch_spyre._C import SpyreTensorLayout
 
 from .constants import ELIDED_COPY_BACK_ATTR
-from .insert_restickify import _fixed_tiled, insert_restickify_on_node_inputs
+from .insert_restickify import (
+    _create_restickify_node,
+    _fixed_tiled,
+    insert_restickify_on_node_inputs,
+)
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
@@ -209,6 +217,171 @@ def _value_bufs_for_op(
     return value_bufs
 
 
+def _output_real_layout(op: ComputedBuffer) -> FixedTiledLayout:
+    """Resolve an op's committed output layout, unwrapping a genuine mutation
+    target (unlike _real_layout, which asserts mutation layouts only appear on
+    elided copy-backs — an op's own MutationLayoutSHOULDREMOVE is expected)."""
+    layout = op.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    return layout
+
+
+def _output_value_buf_for_op(
+    graph: GraphLowering,
+    op: ComputedBuffer,
+    access_subs: dict,
+    sizes: dict | None,
+) -> ComputedBuffer | None:
+    """Return op itself if it indirectly writes its own output (scatter: the
+    write dep whose device_coordinates contain an IndirectAccess), else None."""
+    write_dep = next(
+        (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)), None
+    )
+    if write_dep is None:
+        return None
+    layout = _output_real_layout(op)
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    coords = [
+        c.xreplace(access_subs)
+        for c in device_coordinates(layout.device_layout, write_dep, sizes)
+    ]
+    if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords):
+        return op
+    return None
+
+
+def _resolve_mutation_target(op: ComputedBuffer) -> tuple[str, object]:
+    """Unwrap a MutationLayoutSHOULDREMOVE op's layout to (target_name, target_buf).
+
+    Mirrors propagate_layouts.py's MutationLayoutSHOULDREMOVE branch, which
+    unwraps ReinterpretView chains the same way to resolve the mutation target.
+    """
+    assert isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    target = op.layout.target
+    while isinstance(target, ReinterpretView):
+        target = target.data
+    return target.get_name(), target
+
+
+def _insert_mutation_relayout_copy(
+    graph: GraphLowering,
+    mutation_op: ComputedBuffer,
+    write_dep: MemoryDep,
+    access_subs: dict,
+    sizes: dict | None,
+) -> None:
+    """Fix a non-compliant indirect-write layout on a MutationLayoutSHOULDREMOVE op.
+
+    Mirrors insert_post_mutation_restickify's copy-in / retarget / copy-back
+    shape, built eagerly here (rather than via the _restickify_plan deferred
+    queue, which insert_post_mutation_restickify alone owns) since
+    reorder_nonstick_dims runs after every op already has a committed
+    FixedTiledLayout.
+
+    If a _restickify_plan is already pending on mutation_op (propagate_layouts
+    staged a stick-offset fix that insert_post_mutation_restickify will apply
+    later), don't build a second copy-in/copy-back pair. Instead, rotate the
+    pending alt_stl so the single later copy already lands the target in a
+    layout that satisfies both requirements. alt_stl lives in its own
+    coordinate space (propagate_layouts.py's _candidate_output_stls builds it
+    from the target's host size/stride with a possibly different dim chosen as
+    the stick dim, not by permuting the current device stride_map), so the
+    rotation is re-derived from scratch against alt_stl via the same
+    indirect-position lookup used everywhere else in this pass, rather than by
+    transplanting the independent branch's rotation order onto it.
+    """
+    pending_plan = getattr(mutation_op, "_restickify_plan", None)
+    if pending_plan is not None:
+        target_name, orig_stl, alt_stl = pending_plan
+        alt_coords = device_coordinates(alt_stl, write_dep, sizes)
+        alt_stride_idx = _indirect_stride_idx(alt_coords, access_subs)
+        if alt_stride_idx is not None and not _dim_order_is_compliant(
+            alt_stl, alt_stride_idx
+        ):
+            alt_indirect_pos = len(alt_stl.stride_map) - 1 - alt_stride_idx
+            rotated_alt_stl = _build_required_stl(alt_stl, alt_indirect_pos)
+        else:
+            rotated_alt_stl = alt_stl
+        mutation_op._restickify_plan = (target_name, orig_stl, rotated_alt_stl)
+        graph_input = graph.graph_inputs.get(target_name)
+        if graph_input is not None:
+            graph_input.layouts = [rotated_alt_stl]
+        logger.info(
+            "enforce_indirect_layout: composed with pending restickify_plan for "
+            "%s -> rotated alt_stl %s",
+            target_name,
+            list(rotated_alt_stl.stride_map),
+        )
+        return
+
+    output_stl = _output_real_layout(mutation_op).device_layout
+    write_stride_idx = _indirect_stride_idx(
+        device_coordinates(output_stl, write_dep, sizes), access_subs
+    )
+    assert write_stride_idx is not None, (
+        f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
+    )
+    output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
+    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+
+    target_name, target_buf = _resolve_mutation_target(mutation_op)
+    target_layout = target_buf.get_layout()
+    assert isinstance(target_layout, FixedTiledLayout), (
+        f"expected FixedTiledLayout on mutation target {target_name!r}, "
+        f"got {type(target_layout).__name__}"
+    )
+    buf_tmp_layout = _fixed_tiled(target_layout, required_stl)
+    orig_stl_layout = target_layout
+
+    # Step 1: copy-in: target (current layout) -> buf_tmp (required_stl).
+    _, buf_tmp = _create_restickify_node(
+        {"arg_name": target_name, "target_layout": buf_tmp_layout}, mutation_op
+    )
+    buf_tmp_name = buf_tmp.get_name()
+    buf_tmp._input_layout_overrides = {target_name: orig_stl_layout}
+
+    # Step 2: retarget the mutation to buf_tmp, preserving any slice offset.
+    mutation_name = mutation_op.get_name()
+    original_layout = mutation_op.layout
+    assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
+    slice_layout = original_layout.target.get_layout()
+    if isinstance(original_layout.target, ReinterpretView) and slice_layout.offset != 0:
+        mutation_op.layout = MutationLayoutSHOULDREMOVE(
+            ReinterpretView(data=StorageBox(buf_tmp), layout=slice_layout)
+        )
+    else:
+        mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
+
+    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (required_stl).
+    buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
+    _, buf_copyback = _create_restickify_node(
+        {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+        mutation_op,
+    )
+    buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
+
+    mutation_op._emit_set_layout = (target_name, required_stl)
+
+    operations = graph.operations
+    mutation_op_index = operations.index(mutation_op)
+    operations.remove(buf_tmp)
+    operations.insert(mutation_op_index, buf_tmp)
+    operations.remove(buf_copyback)
+    operations.insert(mutation_op_index + 2, buf_copyback)
+
+    logger.info(
+        "enforce_indirect_layout: inserted mutation relayout copy for %s "
+        "(copy-in %s -> %s, copy-back %s -> %s)",
+        mutation_name,
+        target_name,
+        buf_tmp_name,
+        buf_tmp_name,
+        target_name,
+    )
+
+
 def _get_nonstick_dim_order_requirements(
     op: ComputedBuffer,
 ) -> tuple[set[str], dict, dict[sympy.Symbol, int] | None] | None:
@@ -302,3 +475,29 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
             else:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
+
+        output_value_buf = _output_value_buf_for_op(graph, op, access_subs, sizes)
+        if output_value_buf is not None:
+            output_layout = _output_real_layout(op)
+            if isinstance(output_layout, FixedTiledLayout):
+                output_stl = output_layout.device_layout
+                write_dep = next(
+                    d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
+                )
+                write_coords = device_coordinates(output_stl, write_dep, sizes)
+                write_stride_idx = _indirect_stride_idx(write_coords, access_subs)
+                if write_stride_idx is not None and not _dim_order_is_compliant(
+                    output_stl, write_stride_idx
+                ):
+                    if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                        _insert_mutation_relayout_copy(
+                            graph, op, write_dep, access_subs, sizes
+                        )
+                    else:
+                        output_indirect_pos = (
+                            len(output_stl.stride_map) - 1 - write_stride_idx
+                        )
+                        output_required_stl = _build_required_stl(
+                            output_stl, output_indirect_pos
+                        )
+                        _rewrite_producer_layout(op, output_required_stl)
