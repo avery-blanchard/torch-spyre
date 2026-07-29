@@ -446,6 +446,12 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
     for original_op in list(graph.operations):
         if not isinstance(original_op, ComputedBuffer):
             continue
+        logger.debug(
+            "reorder_nonstick_dims: checking op %s, is_scatter=%s, is_mutation=%s",
+            original_op.get_name(),
+            isinstance(original_op.data, Scatter),
+            isinstance(original_op.layout, MutationLayoutSHOULDREMOVE),
+        )
         requirement = _get_nonstick_dim_order_requirements(original_op)
         if not requirement:
             continue
@@ -538,6 +544,24 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                         logger.debug(
                             "scatter_destination_check: output_stl stride_map=%s",
                             output_stl.stride_map,
+                        )
+                        # The store_subs keys are loop vars from the scatter index buffer
+                        # These map to IndirectAccess symbols in scatter_access_subs
+                        logger.debug(
+                            "scatter_destination_check: write_dep.index free_symbols=%s",
+                            write_dep.index.free_symbols,
+                        )
+                        # Check if any free symbol in write_dep.index is in store_subs
+                        write_free_syms = write_dep.index.free_symbols
+                        scatter_index_syms = set(store_subs.keys())
+                        logger.debug(
+                            "scatter_destination_check: scatter_index_syms=%s",
+                            scatter_index_syms,
+                        )
+                        # Find which write_free_syms match scatter index symbols
+                        matched_syms = write_free_syms & scatter_index_syms
+                        logger.debug(
+                            "scatter_destination_check: matched_syms=%s", matched_syms
                         )
                         # Check if scatter index symbols appear in write_dep.index
                         write_index_with_indirect = write_dep.index.xreplace(
