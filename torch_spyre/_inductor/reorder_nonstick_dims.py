@@ -589,42 +589,38 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                                                 output_coords = device_coordinates(
                                                     output_stl, write_dep, sizes
                                                 )
-                                                # Find which position the indirect index is at in the output
-                                                output_indirect_idx = None
-                                                for idx, coord in enumerate(
-                                                    reversed(output_coords)
-                                                ):
-                                                    if coord.free_symbols & set(
-                                                        scatter_access_subs.keys()
-                                                    ):
-                                                        output_indirect_idx = idx
-                                                        logger.debug(
-                                                            "scatter_destination_check: found output indirect at stride_idx=%d",
-                                                            idx,
-                                                        )
-                                                        break
-
-                                                logger.debug(
-                                                    "scatter_destination_check: output_indirect_idx=%s",
-                                                    output_indirect_idx,
+                                                # Apply scatter_access_subs to find indirect in output
+                                                output_coords_substituted = [
+                                                    c.xreplace(scatter_access_subs)
+                                                    if scatter_access_subs
+                                                    else c
+                                                    for c in output_coords
+                                                ]
+                                                output_stride_idx = (
+                                                    _indirect_stride_idx(
+                                                        output_coords_substituted, {}
+                                                    )
                                                 )
-                                                if output_indirect_idx is not None:
+                                                logger.debug(
+                                                    "scatter_destination_check: output_stride_idx=%s",
+                                                    output_stride_idx,
+                                                )
+                                                if output_stride_idx is not None:
                                                     is_compliant = (
                                                         _dim_order_is_compliant(
                                                             output_stl,
-                                                            output_indirect_idx,
+                                                            output_stride_idx,
                                                         )
                                                     )
                                                     logger.debug(
-                                                        "scatter_destination_check: output_stl stride_map len=%d, output_indirect_idx=%d, compliant=%s",
-                                                        len(output_stl.stride_map),
-                                                        output_indirect_idx,
+                                                        "scatter_destination_check: output_stride_idx=%d, compliant=%s",
+                                                        output_stride_idx,
                                                         is_compliant,
                                                     )
                                                 else:
                                                     is_compliant = True
                                                     logger.debug(
-                                                        "scatter_destination_check: no indirect found in output coords, skipping"
+                                                        "scatter_destination_check: no indirect found in output coords"
                                                     )
                                                 if not is_compliant:
                                                     logger.info(
