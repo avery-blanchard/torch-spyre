@@ -48,7 +48,11 @@ from .insert_restickify import (
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
-from .pass_utils import device_coordinates, indirect_info_from_op
+from .pass_utils import (
+    device_coordinates,
+    indirect_info_from_op,
+    _find_scatter_index_buf_names,
+)
 
 logger = get_inductor_logger("reorder_nonstick_dims")
 
@@ -236,28 +240,32 @@ def _output_value_buf_for_op(
     """Return op itself if it indirectly writes its own output (scatter: the
     write dep whose device_coordinates contain an IndirectAccess), else None.
 
-    For scatters, the indirect symbol in write_coords may not be in access_subs
-    (which is built from gathers), so we also check for free_symbols that are
-    not loop vars as an indicator of indirect access.
+    For Scatter ops, detect indirect writes by checking for scatter index buffers.
+    For other ops, check write coordinates for IndirectAccess.
     """
+    from torch._inductor.ir import Scatter
+
     write_dep = next(
         (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)), None
     )
     if write_dep is None:
+        logger.debug("_output_value_buf_for_op %s: no write_dep", op.get_name())
         return None
+
+    # For Scatter ops, check if there are scatter index buffers (indirect write indicator)
+    if isinstance(op.data, Scatter):
+        scatter_index_names = _find_scatter_index_buf_names(op)
+        if scatter_index_names:
+            return op
+        return None
+
+    # For non-Scatter ops, check write coordinates for IndirectAccess
     layout = _output_real_layout(op)
     if not isinstance(layout, FixedTiledLayout):
         return None
     coords = device_coordinates(layout.device_layout, write_dep, sizes)
-    # First check: apply access_subs if available (covers gathers)
     coords_substituted = [c.xreplace(access_subs) if access_subs else c for c in coords]
     if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords_substituted):
-        return op
-    # Second check: for scatters not in access_subs, check if any coordinate
-    # has free symbols beyond the loop variables (indicates indirect indexing)
-    if write_dep.ranges and any(
-        (c.free_symbols - set(write_dep.ranges.keys())) for c in coords
-    ):
         return op
     return None
 

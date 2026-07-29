@@ -392,8 +392,9 @@ def _build_indirect_store_subs(
 ) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
     """Map indirect symbols in scatter writes to (IndexedBase subs, sizes).
 
-    For Scatter ops, extract indirect index tensors from output_indexer closure
-    and build substitution map for scatter write coordinates.
+    For Scatter ops, the scatter indices are loop vars in write_dep.index.
+    Identify which loop vars come from scatter index buffers by extracting
+    those buffers and seeing which symbols appear in their index expressions.
     Returns ({sym: IndexedBase[...]}, {sym: size}).
     """
     from torch._inductor.ir import Scatter
@@ -428,7 +429,7 @@ def _build_indirect_store_subs(
         return {}, None
     write_dep = writes[0]
 
-    # Extract indirect index buffer names and build dep map
+    # Extract scatter index buffer names and build dep map
     index_buf_names = []
     for idx_tensor in indices:
         if idx_tensor is None:
@@ -442,35 +443,35 @@ def _build_indirect_store_subs(
     if not index_buf_names:
         return {}, None
 
-    # Build reverse map of all read deps by name
+    # Build map of all read deps by name
     read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
     dep_by_name = {d.name: d for d in read_deps}
 
     subs = {}
     sizes = {}
 
-    # Extract free symbols from write_dep.index that are not loop vars
-    # These represent the indirect indexing dimensions
-    indirect_syms = [
-        s for s in write_dep.index.free_symbols if s not in write_dep.ranges
-    ]
-
-    # Match each indirect symbol with its corresponding index buffer.
-    # For a scatter x[idx] = val, write_dep.index typically has the structure
-    # encoding the gather dimension, and indirect_syms will contain the symbol(s)
-    # representing that dimension.
+    # For each scatter index buffer, the loop vars it appears in the index with
+    # are the scatter indices. Collect all such loop vars.
+    scatter_index_syms = set()
     for index_buf_name in index_buf_names:
         if index_buf_name not in dep_by_name:
             continue
-        indirect_index_dep = dep_by_name[index_buf_name]
-        # For each indirect symbol, map it to the index buffer's IndexedBase
-        # We associate all indirect symbols found with this index buffer,
-        # which works for the common case of a single indirect dimension
-        for indirect_sym in indirect_syms:
-            subs[indirect_sym] = IndexedBase(indirect_index_dep.name)[
-                indirect_index_dep.index
-            ]
-            sizes[indirect_sym] = 0  # Size unknown in output_indexer
+        index_dep = dep_by_name[index_buf_name]
+        # Extract loop vars from the scatter index buffer's index expression
+        # These are the symbols that will appear in write_dep.index when scattering
+        index_syms = index_dep.index.free_symbols & set(write_dep.ranges.keys())
+        scatter_index_syms.update(index_syms)
+
+    # Map each scatter index symbol to its corresponding index buffer.
+    # In the common case of a single scatter dimension, map all scatter_index_syms
+    # to the first (and usually only) scatter index buffer.
+    if scatter_index_syms and index_buf_names:
+        first_index_buf = index_buf_names[0]
+        if first_index_buf in dep_by_name:
+            index_dep = dep_by_name[first_index_buf]
+            for sym in scatter_index_syms:
+                subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
+                sizes[sym] = 0  # Size unknown in output_indexer
 
     return subs, sizes if sizes else None
 
