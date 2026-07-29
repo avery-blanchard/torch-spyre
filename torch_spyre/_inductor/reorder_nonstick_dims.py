@@ -521,16 +521,40 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 output_layout = _output_real_layout(op)
                 if isinstance(output_layout, FixedTiledLayout):
                     output_stl = output_layout.device_layout
-                    # For scatter, dimension 0 is the scatter index and must be outermost.
-                    # Check if dimension 0 corresponds to stride_idx = len(stride_map)-1
-                    required_stride_idx = len(output_stl.stride_map) - 1
-                    is_compliant = _dim_order_is_compliant(
-                        output_stl, required_stride_idx
+                    # Get the scatter destination size (first dimension of output)
+                    # The output shape is [scatter_dest_size, ...]
+                    # From _output_real_layout we get the mutation target size
+                    output_size = output_layout.size
+                    scatter_dest_size = output_size[0] if output_size else None
+                    logger.debug(
+                        "scatter_destination_check: output_size=%s, scatter_dest_size=%s",
+                        output_size,
+                        scatter_dest_size,
                     )
                     logger.debug(
-                        "scatter_destination_check: output dim 0 compliant=%s",
-                        is_compliant,
+                        "scatter_destination_check: device_size=%s, stride_map=%s",
+                        output_stl.device_size,
+                        output_stl.stride_map,
                     )
+                    # Check if scatter_dest_size matches the first device dimension
+                    if scatter_dest_size is not None:
+                        first_device_dim = output_stl.device_size[0]
+                        if first_device_dim == scatter_dest_size:
+                            is_compliant = True
+                        else:
+                            # Scatter dest is not at device position 0
+                            is_compliant = False
+                        logger.debug(
+                            "scatter_destination_check: first_device_dim=%d, is_compliant=%s",
+                            first_device_dim,
+                            is_compliant,
+                        )
+                    else:
+                        is_compliant = True
+                        logger.debug(
+                            "scatter_destination_check: could not determine output size"
+                        )
+
                     if not is_compliant:
                         logger.info(
                             "scatter_destination_check: inserting mutation relayout copy for %s",
