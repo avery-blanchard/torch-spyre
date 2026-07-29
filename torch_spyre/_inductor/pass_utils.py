@@ -387,27 +387,120 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     return names
 
 
+def _build_indirect_store_subs(
+    op: ComputedBuffer,
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Map indirect symbols in scatter writes to (IndexedBase subs, sizes).
+
+    For Scatter ops, extract indirect index tensors from output_indexer closure
+    and build substitution map for scatter write coordinates.
+    Returns ({sym: IndexedBase[...]}, {sym: size}).
+    """
+    from torch._inductor.ir import Scatter
+    from sympy import IndexedBase
+
+    if not isinstance(op.data, Scatter):
+        return {}, None
+
+    fn = op.data.output_indexer
+    if fn.__closure__ is None:
+        return {}, None
+
+    freevars = fn.__code__.co_freevars
+    try:
+        cells = {
+            name: cell.cell_contents for name, cell in zip(freevars, fn.__closure__)
+        }
+    except ValueError:
+        return {}, None
+
+    if "indices" not in cells:
+        return {}, None
+
+    indices = cells["indices"]
+    rw = op.get_read_writes()
+    writes = [
+        d
+        for d in rw.writes
+        if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
+    ]
+    if not writes:
+        return {}, None
+    write_dep = writes[0]
+
+    # Extract indirect index buffer names and build dep map
+    index_buf_names = []
+    for idx_tensor in indices:
+        if idx_tensor is None:
+            continue
+        node = idx_tensor
+        while hasattr(node, "data"):
+            node = node.data
+        if hasattr(node, "name") and node.name is not None:
+            index_buf_names.append(node.name)
+
+    if not index_buf_names:
+        return {}, None
+
+    # Build reverse map of all read deps by name
+    read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    dep_by_name = {d.name: d for d in read_deps}
+
+    subs = {}
+    sizes = {}
+
+    # Extract free symbols from write_dep.index that are not loop vars
+    # These represent the indirect indexing dimensions
+    indirect_syms = [
+        s for s in write_dep.index.free_symbols if s not in write_dep.ranges
+    ]
+
+    # Match each indirect symbol with its corresponding index buffer.
+    # For a scatter x[idx] = val, write_dep.index typically has the structure
+    # encoding the gather dimension, and indirect_syms will contain the symbol(s)
+    # representing that dimension.
+    for index_buf_name in index_buf_names:
+        if index_buf_name not in dep_by_name:
+            continue
+        indirect_index_dep = dep_by_name[index_buf_name]
+        # For each indirect symbol, map it to the index buffer's IndexedBase
+        # We associate all indirect symbols found with this index buffer,
+        # which works for the common case of a single indirect dimension
+        for indirect_sym in indirect_syms:
+            subs[indirect_sym] = IndexedBase(indirect_index_dep.name)[
+                indirect_index_dep.index
+            ]
+            sizes[indirect_sym] = 0  # Size unknown in output_indexer
+
+    return subs, sizes if sizes else None
+
+
 def indirect_info_from_op(
     op: "ComputedBuffer | None",
 ) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
     """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass.
 
+    Captures both gather (read) and scatter (write) indirect indices.
     Pass op=None when there is no ComputedBuffer (e.g. structural callers that only
     check stick compatibility or layout shape). Returns (set(), {}, None), where
     sizes=None tells compute_coordinates to skip unknown symbols silently rather than
-    raising Unsupported. None is returned when op has no indirect reads. If indirect
-    reads exist but none resolve to a known buffer (unexpected), sizes={} is returned;
+    raising Unsupported. None is returned when op has no indirect reads/writes. If indirect
+    accesses exist but none resolve to a known buffer (unexpected), sizes={} is returned;
     in normalize_coordinates this still produces opaque-Term fallback (same as None),
     but in compute_coordinates an unknown symbol would raise Unsupported.
     """
     if op is None:
         return set(), {}, None
-    subs, sizes = _build_indirect_load_subs(op)
+    load_subs, load_sizes = _build_indirect_load_subs(op)
+    store_subs, store_sizes = _build_indirect_store_subs(op)
+    subs = {**load_subs, **store_subs}
     names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
     access_subs = {
         sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in subs.items()
     }
+    # Merge sizes: prefer load_sizes if available, fallback to store_sizes
+    sizes = load_sizes if load_sizes is not None else store_sizes
     return names, access_subs, sizes
 
 

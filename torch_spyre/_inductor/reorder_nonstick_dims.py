@@ -234,7 +234,12 @@ def _output_value_buf_for_op(
     sizes: dict | None,
 ) -> ComputedBuffer | None:
     """Return op itself if it indirectly writes its own output (scatter: the
-    write dep whose device_coordinates contain an IndirectAccess), else None."""
+    write dep whose device_coordinates contain an IndirectAccess), else None.
+
+    For scatters, the indirect symbol in write_coords may not be in access_subs
+    (which is built from gathers), so we also check for free_symbols that are
+    not loop vars as an indicator of indirect access.
+    """
     write_dep = next(
         (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)), None
     )
@@ -243,11 +248,16 @@ def _output_value_buf_for_op(
     layout = _output_real_layout(op)
     if not isinstance(layout, FixedTiledLayout):
         return None
-    coords = [
-        c.xreplace(access_subs)
-        for c in device_coordinates(layout.device_layout, write_dep, sizes)
-    ]
-    if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords):
+    coords = device_coordinates(layout.device_layout, write_dep, sizes)
+    # First check: apply access_subs if available (covers gathers)
+    coords_substituted = [c.xreplace(access_subs) if access_subs else c for c in coords]
+    if any(hasattr(c, "has") and c.has(IndirectAccess) for c in coords_substituted):
+        return op
+    # Second check: for scatters not in access_subs, check if any coordinate
+    # has free symbols beyond the loop variables (indicates indirect indexing)
+    if write_dep.ranges and any(
+        (c.free_symbols - set(write_dep.ranges.keys())) for c in coords
+    ):
         return op
     return None
 
