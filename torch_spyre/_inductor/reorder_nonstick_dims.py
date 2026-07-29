@@ -503,139 +503,52 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
-        # For scatter ops, handle the scatter target (mutation output) layout.
-        if isinstance(op.data, Scatter):
-            store_subs, _ = _build_indirect_store_subs(op)
+        # For scatter ops, check if scatter destination needs layout reordering
+        if isinstance(op.data, Scatter) and isinstance(
+            op.layout, MutationLayoutSHOULDREMOVE
+        ):
+            store_subs, sizes = _build_indirect_store_subs(op)
             if store_subs:
                 scatter_access_subs = {
                     sym: IndirectAccess(sympy.Symbol(expr.base.name))
                     for sym, expr in store_subs.items()
                 }
-                if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                    logger.debug(
-                        "scatter_destination_check: op %s is MutationLayoutSHOULDREMOVE",
-                        op.get_name(),
-                    )
-                    scatter_index_names = _find_scatter_index_buf_names(op)
-                    logger.debug(
-                        "scatter_destination_check: scatter_index_names=%s",
-                        scatter_index_names,
-                    )
-                    if scatter_index_names:
-                        index_name = next(iter(scatter_index_names))
-                        logger.debug(
-                            "scatter_destination_check: index_name=%s", index_name
-                        )
-                        read_deps = [
-                            d
-                            for d in op.get_read_writes().reads
-                            if isinstance(d, MemoryDep) and d.name == index_name
+                write_dep = next(
+                    (
+                        d
+                        for d in op.get_read_writes().writes
+                        if isinstance(d, MemoryDep)
+                    ),
+                    None,
+                )
+                if write_dep is not None:
+                    output_layout = _output_real_layout(op)
+                    if isinstance(output_layout, FixedTiledLayout):
+                        output_stl = output_layout.device_layout
+                        output_coords = device_coordinates(output_stl, write_dep, sizes)
+                        # Apply scatter_access_subs to find indirect in output coords
+                        output_coords_substituted = [
+                            c.xreplace(scatter_access_subs)
+                            if scatter_access_subs
+                            else c
+                            for c in output_coords
                         ]
-                        logger.debug(
-                            "scatter_destination_check: read_deps count=%d",
-                            len(read_deps),
+                        output_stride_idx = _indirect_stride_idx(
+                            output_coords_substituted, {}
                         )
-                        if read_deps:
-                            try:
-                                index_dep = read_deps[0]
-                                index_buf = graph.get_buffer(index_name)
-                                index_layout = _real_layout(index_buf)
-                                logger.debug(
-                                    "scatter_destination_check: index_layout type=%s",
-                                    type(index_layout).__name__,
+                        if output_stride_idx is not None:
+                            is_compliant = _dim_order_is_compliant(
+                                output_stl, output_stride_idx
+                            )
+                            if not is_compliant:
+                                logger.info(
+                                    "scatter_destination_check: inserting mutation relayout copy for %s",
+                                    op.get_name(),
                                 )
-                                if isinstance(index_layout, FixedTiledLayout):
-                                    index_stl = index_layout.device_layout
-                                    index_coords = device_coordinates(
-                                        index_stl, index_dep, sizes
-                                    )
-                                    # Find which position the index coordinate is at
-                                    # Check for indirect symbols (keys of scatter_access_subs)
-                                    index_indirect_idx = None
-                                    for idx, coord in enumerate(reversed(index_coords)):
-                                        if coord.free_symbols & set(
-                                            scatter_access_subs.keys()
-                                        ):
-                                            index_indirect_idx = idx
-                                            logger.debug(
-                                                "scatter_destination_check: found indirect at stride_idx=%d",
-                                                idx,
-                                            )
-                                            break
-
-                                    logger.debug(
-                                        "scatter_destination_check: index_indirect_idx=%s",
-                                        index_indirect_idx,
-                                    )
-                                    if index_indirect_idx is not None:
-                                        write_dep = next(
-                                            (
-                                                d
-                                                for d in op.get_read_writes().writes
-                                                if isinstance(d, MemoryDep)
-                                            ),
-                                            None,
-                                        )
-                                        logger.debug(
-                                            "scatter_destination_check: write_dep=%s",
-                                            write_dep,
-                                        )
-                                        if write_dep is not None:
-                                            output_layout = _output_real_layout(op)
-                                            if isinstance(
-                                                output_layout, FixedTiledLayout
-                                            ):
-                                                output_stl = output_layout.device_layout
-                                                output_coords = device_coordinates(
-                                                    output_stl, write_dep, sizes
-                                                )
-                                                # Apply scatter_access_subs to find indirect in output
-                                                output_coords_substituted = [
-                                                    c.xreplace(scatter_access_subs)
-                                                    if scatter_access_subs
-                                                    else c
-                                                    for c in output_coords
-                                                ]
-                                                output_stride_idx = (
-                                                    _indirect_stride_idx(
-                                                        output_coords_substituted, {}
-                                                    )
-                                                )
-                                                logger.debug(
-                                                    "scatter_destination_check: output_stride_idx=%s",
-                                                    output_stride_idx,
-                                                )
-                                                if output_stride_idx is not None:
-                                                    is_compliant = (
-                                                        _dim_order_is_compliant(
-                                                            output_stl,
-                                                            output_stride_idx,
-                                                        )
-                                                    )
-                                                    logger.debug(
-                                                        "scatter_destination_check: output_stride_idx=%d, compliant=%s",
-                                                        output_stride_idx,
-                                                        is_compliant,
-                                                    )
-                                                else:
-                                                    is_compliant = True
-                                                    logger.debug(
-                                                        "scatter_destination_check: no indirect found in output coords"
-                                                    )
-                                                if not is_compliant:
-                                                    logger.info(
-                                                        "scatter_destination_check: inserting mutation relayout copy for %s",
-                                                        op.get_name(),
-                                                    )
-                                                    _insert_mutation_relayout_copy(
-                                                        graph,
-                                                        op,
-                                                        write_dep,
-                                                        scatter_access_subs,
-                                                        sizes,
-                                                    )
-                            except Exception as e:
-                                logger.debug(
-                                    "scatter_destination_check: error checking scatter destination: %s",
-                                    e,
+                                _insert_mutation_relayout_copy(
+                                    graph,
+                                    op,
+                                    write_dep,
+                                    scatter_access_subs,
+                                    sizes,
                                 )
