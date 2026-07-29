@@ -554,3 +554,62 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                         op = _insert_relayout_copy(
                             graph, op, value_buf, required_layout
                         )
+
+                # Also handle the scatter target (mutation output) layout.
+                # Find scatter index buffer and its position to determine target layout.
+                if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                    scatter_index_names = _find_scatter_index_buf_names(op)
+                    if scatter_index_names:
+                        index_name = next(iter(scatter_index_names))
+                        read_deps = [
+                            d
+                            for d in op.get_read_writes().reads
+                            if isinstance(d, MemoryDep) and d.name == index_name
+                        ]
+                        if read_deps:
+                            index_dep = read_deps[0]
+                            index_buf = graph.get_buffer(index_name)
+                            index_layout = _real_layout(index_buf)
+                            if isinstance(index_layout, FixedTiledLayout):
+                                index_stl = index_layout.device_layout
+                                index_coords = device_coordinates(
+                                    index_stl, index_dep, sizes
+                                )
+                                # Find which position the index coordinate is at
+                                index_indirect_idx = None
+                                for idx, coord in enumerate(reversed(index_coords)):
+                                    if coord.free_symbols & set(
+                                        scatter_access_subs.values()
+                                    ):
+                                        index_indirect_idx = idx
+                                        break
+
+                                if index_indirect_idx is not None:
+                                    # Target needs same indirect position as index
+                                    write_dep = next(
+                                        (
+                                            d
+                                            for d in op.get_read_writes().writes
+                                            if isinstance(d, MemoryDep)
+                                        ),
+                                        None,
+                                    )
+                                    if write_dep is not None:
+                                        output_layout = _output_real_layout(op)
+                                        if isinstance(output_layout, FixedTiledLayout):
+                                            output_stl = output_layout.device_layout
+                                            indirect_device_pos = (
+                                                len(output_stl.stride_map)
+                                                - 1
+                                                - index_indirect_idx
+                                            )
+                                            if not _dim_order_is_compliant(
+                                                output_stl, index_indirect_idx
+                                            ):
+                                                _insert_mutation_relayout_copy(
+                                                    graph,
+                                                    op,
+                                                    write_dep,
+                                                    scatter_access_subs,
+                                                    sizes,
+                                                )
