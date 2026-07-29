@@ -1570,6 +1570,7 @@ def propagate_spyre_tensor_layouts(
                         outermost_dim = _indirect_write_host_dim(
                             op, target_layout, output_dep
                         )
+                        pre_pin_stl = target_stl
                         target_stl = _multi_arg_pointwise_layouts(
                             op, target_layout, output_dep, args, (outermost_dim,)
                         )[0]
@@ -1591,6 +1592,26 @@ def propagate_spyre_tensor_layouts(
                         graph_input = V.graph.graph_inputs.get(target_name)
                         if graph_input is not None:
                             graph_input.layouts = [target_stl]
+                        if target_stl != pre_pin_stl:
+                            # pre_pin_stl is the tensor's current on-device
+                            # SpyreTensorLayout (from allocation, or from an
+                            # earlier op in this graph). Pinning the indirect
+                            # dim to device dim 0 only changes the *compiler's*
+                            # view of the layout (target.data.data.layout,
+                            # graph_input.layouts) above -- it does not touch
+                            # the tensor's actual runtime spyre_layout. Unless
+                            # a set_spyre_tensor_layout restore is emitted, the
+                            # D2H copy after this kernel reads the tensor back
+                            # using the stale pre_pin_stl and produces
+                            # scrambled data, even though the on-device bytes
+                            # were written correctly per target_stl. Reuse the
+                            # same _emit_set_layout tag that
+                            # insert_post_mutation_restickify uses; no
+                            # restickify/copy-back is needed here since the
+                            # scatter write itself is already valid against
+                            # target_stl, only the tensor's stored layout is
+                            # out of date.
+                            op._emit_set_layout = (target_name, target_stl)
 
                 # Find an alternative layout if the write has an unsupported stick
                 # expression (e.g. offset like v+32). Force the optimizer to use
