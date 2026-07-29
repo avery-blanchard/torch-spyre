@@ -503,7 +503,7 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
-        # For scatter ops, handle the scatter source (value tensor) layout
+        # For scatter ops, handle the scatter target (mutation output) layout.
         if isinstance(op.data, Scatter):
             store_subs, _ = _build_indirect_store_subs(op)
             if store_subs:
@@ -511,105 +511,135 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     sym: IndirectAccess(sympy.Symbol(expr.base.name))
                     for sym, expr in store_subs.items()
                 }
-                # Find scatter source buffers (which are read with indirect indices)
-                scatter_value_bufs = _value_bufs_for_op(
-                    graph, op, scatter_access_subs, sizes
-                )
-                for value_buf in scatter_value_bufs:
-                    value_layout = _real_layout(value_buf)
-                    if not isinstance(value_layout, FixedTiledLayout):
-                        continue
-                    value_stl = value_layout.device_layout
-
-                    value_dep = next(
-                        (
-                            d
-                            for d in op.get_read_writes().reads
-                            if isinstance(d, MemoryDep)
-                            and d.name == value_buf.get_name()
-                        ),
-                        None,
-                    )
-                    if value_dep is None:
-                        continue
-
-                    value_coords = device_coordinates(value_stl, value_dep, sizes)
-                    stride_idx = _indirect_stride_idx(value_coords, scatter_access_subs)
-                    if stride_idx is None:
-                        continue
-
-                    if _dim_order_is_compliant(value_stl, stride_idx):
-                        continue
-
-                    # Rotate to put indirect coordinate at position 0
-                    indirect_device_pos = len(value_stl.stride_map) - 1 - stride_idx
-                    required_stl = _build_required_stl(value_stl, indirect_device_pos)
-
-                    if _can_mutate_producer_in_place(
-                        value_buf, graph.get_output_names()
-                    ):
-                        _rewrite_producer_layout(value_buf, required_stl)
-                    else:
-                        required_layout = _fixed_tiled(value_layout, required_stl)
-                        op = _insert_relayout_copy(
-                            graph, op, value_buf, required_layout
-                        )
-
-                # Also handle the scatter target (mutation output) layout.
-                # Find scatter index buffer and its position to determine target layout.
                 if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                    logger.debug(
+                        "scatter_destination_check: op %s is MutationLayoutSHOULDREMOVE",
+                        op.get_name(),
+                    )
                     scatter_index_names = _find_scatter_index_buf_names(op)
+                    logger.debug(
+                        "scatter_destination_check: scatter_index_names=%s",
+                        scatter_index_names,
+                    )
                     if scatter_index_names:
                         index_name = next(iter(scatter_index_names))
+                        logger.debug(
+                            "scatter_destination_check: index_name=%s", index_name
+                        )
                         read_deps = [
                             d
                             for d in op.get_read_writes().reads
                             if isinstance(d, MemoryDep) and d.name == index_name
                         ]
+                        logger.debug(
+                            "scatter_destination_check: read_deps count=%d",
+                            len(read_deps),
+                        )
                         if read_deps:
-                            index_dep = read_deps[0]
-                            index_buf = graph.get_buffer(index_name)
-                            index_layout = _real_layout(index_buf)
-                            if isinstance(index_layout, FixedTiledLayout):
-                                index_stl = index_layout.device_layout
-                                index_coords = device_coordinates(
-                                    index_stl, index_dep, sizes
+                            try:
+                                index_dep = read_deps[0]
+                                index_buf = graph.get_buffer(index_name)
+                                index_layout = _real_layout(index_buf)
+                                logger.debug(
+                                    "scatter_destination_check: index_layout type=%s",
+                                    type(index_layout).__name__,
                                 )
-                                # Find which position the index coordinate is at
-                                index_indirect_idx = None
-                                for idx, coord in enumerate(reversed(index_coords)):
-                                    if coord.free_symbols & set(
-                                        scatter_access_subs.values()
-                                    ):
-                                        index_indirect_idx = idx
-                                        break
-
-                                if index_indirect_idx is not None:
-                                    # Target needs same indirect position as index
-                                    write_dep = next(
-                                        (
-                                            d
-                                            for d in op.get_read_writes().writes
-                                            if isinstance(d, MemoryDep)
-                                        ),
-                                        None,
+                                if isinstance(index_layout, FixedTiledLayout):
+                                    index_stl = index_layout.device_layout
+                                    index_coords = device_coordinates(
+                                        index_stl, index_dep, sizes
                                     )
-                                    if write_dep is not None:
-                                        output_layout = _output_real_layout(op)
-                                        if isinstance(output_layout, FixedTiledLayout):
-                                            output_stl = output_layout.device_layout
-                                            indirect_device_pos = (
-                                                len(output_stl.stride_map)
-                                                - 1
-                                                - index_indirect_idx
+                                    # Find which position the index coordinate is at
+                                    # Check for indirect symbols (keys of scatter_access_subs)
+                                    index_indirect_idx = None
+                                    for idx, coord in enumerate(reversed(index_coords)):
+                                        if coord.free_symbols & set(
+                                            scatter_access_subs.keys()
+                                        ):
+                                            index_indirect_idx = idx
+                                            logger.debug(
+                                                "scatter_destination_check: found indirect at stride_idx=%d",
+                                                idx,
                                             )
-                                            if not _dim_order_is_compliant(
-                                                output_stl, index_indirect_idx
+                                            break
+
+                                    logger.debug(
+                                        "scatter_destination_check: index_indirect_idx=%s",
+                                        index_indirect_idx,
+                                    )
+                                    if index_indirect_idx is not None:
+                                        write_dep = next(
+                                            (
+                                                d
+                                                for d in op.get_read_writes().writes
+                                                if isinstance(d, MemoryDep)
+                                            ),
+                                            None,
+                                        )
+                                        logger.debug(
+                                            "scatter_destination_check: write_dep=%s",
+                                            write_dep,
+                                        )
+                                        if write_dep is not None:
+                                            output_layout = _output_real_layout(op)
+                                            if isinstance(
+                                                output_layout, FixedTiledLayout
                                             ):
-                                                _insert_mutation_relayout_copy(
-                                                    graph,
-                                                    op,
-                                                    write_dep,
-                                                    scatter_access_subs,
-                                                    sizes,
+                                                output_stl = output_layout.device_layout
+                                                output_coords = device_coordinates(
+                                                    output_stl, write_dep, sizes
                                                 )
+                                                # Find which position the indirect index is at in the output
+                                                output_indirect_idx = None
+                                                for idx, coord in enumerate(
+                                                    reversed(output_coords)
+                                                ):
+                                                    if coord.free_symbols & set(
+                                                        scatter_access_subs.keys()
+                                                    ):
+                                                        output_indirect_idx = idx
+                                                        logger.debug(
+                                                            "scatter_destination_check: found output indirect at stride_idx=%d",
+                                                            idx,
+                                                        )
+                                                        break
+
+                                                logger.debug(
+                                                    "scatter_destination_check: output_indirect_idx=%s",
+                                                    output_indirect_idx,
+                                                )
+                                                if output_indirect_idx is not None:
+                                                    is_compliant = (
+                                                        _dim_order_is_compliant(
+                                                            output_stl,
+                                                            output_indirect_idx,
+                                                        )
+                                                    )
+                                                    logger.debug(
+                                                        "scatter_destination_check: output_stl stride_map len=%d, output_indirect_idx=%d, compliant=%s",
+                                                        len(output_stl.stride_map),
+                                                        output_indirect_idx,
+                                                        is_compliant,
+                                                    )
+                                                else:
+                                                    is_compliant = True
+                                                    logger.debug(
+                                                        "scatter_destination_check: no indirect found in output coords, skipping"
+                                                    )
+                                                if not is_compliant:
+                                                    logger.info(
+                                                        "scatter_destination_check: inserting mutation relayout copy for %s",
+                                                        op.get_name(),
+                                                    )
+                                                    _insert_mutation_relayout_copy(
+                                                        graph,
+                                                        op,
+                                                        write_dep,
+                                                        scatter_access_subs,
+                                                        sizes,
+                                                    )
+                            except Exception as e:
+                                logger.debug(
+                                    "scatter_destination_check: error checking scatter destination: %s",
+                                    e,
+                                )
