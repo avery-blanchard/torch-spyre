@@ -344,8 +344,16 @@ def _insert_mutation_relayout_copy(
         return
 
     output_stl = _output_real_layout(mutation_op).device_layout
+
+    # Detect scatter by checking if access_subs contains IndirectAccess values
+    is_scatter_op = (
+        any(isinstance(v, IndirectAccess) for v in access_subs.values())
+        if access_subs
+        else False
+    )
+
     # For scatter ops, find which stride corresponds to the scatter destination size
-    if isinstance(mutation_op.data, Scatter):
+    if is_scatter_op or isinstance(mutation_op.data, Scatter):
         # Get the scatter destination size (first dim of mutation target)
         target_name, target_buf = _resolve_mutation_target(mutation_op)
         target_layout = target_buf.get_layout()
@@ -421,11 +429,13 @@ def _insert_mutation_relayout_copy(
     operations.remove(buf_tmp)
     operations.insert(mutation_op_index, buf_tmp)
 
-    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (required_stl).
+    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout)
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
+    # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
+    copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
     _, buf_copyback = _create_restickify_node(
         {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
-        mutation_op,
+        copyback_metadata_op,
     )
     buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
     operations.remove(buf_copyback)
