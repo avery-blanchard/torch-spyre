@@ -509,106 +509,43 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
-        # For scatter ops, check if scatter destination needs layout reordering
+        # For scatter ops, ensure scatter destination dimension 0 (scatter index) is outermost
         if isinstance(op.data, Scatter) and isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
         ):
-            logger.debug(
-                "scatter_destination_check: checking scatter op %s",
-                op.get_name(),
+            write_dep = next(
+                (d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)),
+                None,
             )
-            store_subs, sizes = _build_indirect_store_subs(op)
-            logger.debug("scatter_destination_check: store_subs=%s", store_subs)
-            if store_subs:
-                scatter_access_subs = {
-                    sym: IndirectAccess(sympy.Symbol(expr.base.name))
-                    for sym, expr in store_subs.items()
-                }
-                logger.debug(
-                    "scatter_destination_check: scatter_access_subs=%s",
-                    scatter_access_subs,
-                )
-                write_dep = next(
-                    (
-                        d
-                        for d in op.get_read_writes().writes
-                        if isinstance(d, MemoryDep)
-                    ),
-                    None,
-                )
-                logger.debug("scatter_destination_check: write_dep=%s", write_dep)
-                if write_dep is not None:
-                    output_layout = _output_real_layout(op)
-                    if isinstance(output_layout, FixedTiledLayout):
-                        output_stl = output_layout.device_layout
-                        logger.debug(
-                            "scatter_destination_check: output_stl stride_map=%s",
-                            output_stl.stride_map,
+            if write_dep is not None:
+                output_layout = _output_real_layout(op)
+                if isinstance(output_layout, FixedTiledLayout):
+                    output_stl = output_layout.device_layout
+                    # For scatter, dimension 0 is the scatter index and must be outermost.
+                    # Check if dimension 0 corresponds to stride_idx = len(stride_map)-1
+                    required_stride_idx = len(output_stl.stride_map) - 1
+                    is_compliant = _dim_order_is_compliant(
+                        output_stl, required_stride_idx
+                    )
+                    logger.debug(
+                        "scatter_destination_check: output dim 0 compliant=%s",
+                        is_compliant,
+                    )
+                    if not is_compliant:
+                        logger.info(
+                            "scatter_destination_check: inserting mutation relayout copy for %s",
+                            op.get_name(),
                         )
-                        # The store_subs keys are loop vars from the scatter index buffer
-                        # These map to IndirectAccess symbols in scatter_access_subs
-                        logger.debug(
-                            "scatter_destination_check: write_dep.index free_symbols=%s",
-                            write_dep.index.free_symbols,
-                        )
-                        # Check if any free symbol in write_dep.index is in store_subs
-                        write_free_syms = write_dep.index.free_symbols
-                        scatter_index_syms = set(store_subs.keys())
-                        logger.debug(
-                            "scatter_destination_check: scatter_index_syms=%s",
-                            scatter_index_syms,
-                        )
-                        # Find which write_free_syms match scatter index symbols
-                        matched_syms = write_free_syms & scatter_index_syms
-                        logger.debug(
-                            "scatter_destination_check: matched_syms=%s", matched_syms
-                        )
-                        # Check if scatter index symbols appear in write_dep.index
-                        write_index_with_indirect = write_dep.index.xreplace(
-                            scatter_access_subs
-                        )
-                        logger.debug(
-                            "scatter_destination_check: write_index_with_indirect=%s",
-                            write_index_with_indirect,
-                        )
-                        if write_index_with_indirect.has(IndirectAccess):
-                            logger.debug(
-                                "scatter_destination_check: has IndirectAccess"
+                        store_subs, sizes = _build_indirect_store_subs(op)
+                        if store_subs:
+                            scatter_access_subs = {
+                                sym: IndirectAccess(sympy.Symbol(expr.base.name))
+                                for sym, expr in store_subs.items()
+                            }
+                            _insert_mutation_relayout_copy(
+                                graph,
+                                op,
+                                write_dep,
+                                scatter_access_subs,
+                                sizes,
                             )
-                            # Find which stride_map index the indirect appears at
-                            # by checking write_dep.index against stride_map
-                            for stride_idx, stride in enumerate(
-                                reversed(output_stl.stride_map)
-                            ):
-                                coeff = write_index_with_indirect.coeff(stride)
-                                logger.debug(
-                                    "scatter_destination_check: stride_idx=%d, stride=%s, coeff=%s",
-                                    stride_idx,
-                                    stride,
-                                    coeff,
-                                )
-                                if coeff is not None and coeff.has(IndirectAccess):
-                                    logger.debug(
-                                        "scatter_destination_check: found indirect at stride_idx=%d",
-                                        stride_idx,
-                                    )
-                                    is_compliant = _dim_order_is_compliant(
-                                        output_stl, stride_idx
-                                    )
-                                    logger.debug(
-                                        "scatter_destination_check: is_compliant=%s",
-                                        is_compliant,
-                                    )
-                                    if not is_compliant:
-                                        logger.info(
-                                            "scatter_destination_check: inserting mutation relayout copy for %s",
-                                            op.get_name(),
-                                        )
-                                        _insert_mutation_relayout_copy(
-                                            graph,
-                                            op,
-                                            write_dep,
-                                            scatter_access_subs,
-                                            sizes,
-                                        )
-                                    break
