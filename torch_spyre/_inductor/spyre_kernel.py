@@ -804,16 +804,24 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
-            # Check if this operation actually uses indirect variables
-            indirect_syms = (
-                {s for s in value.index.free_symbols if s in self.indirect_vars}
-                if self.indirect_vars
-                else set()
-            )
-            if indirect_syms:
+            # Compute which indirect variables THIS operation actually uses
+            # For gather: check source index for indirect symbols
+            # For scatter: check destination index for indirect symbols
+            indirect_syms_used: set[sympy.Symbol] = set()
+            if self.indirect_vars:
+                # Check source (gather operations read from indirect indices)
+                indirect_syms_used.update(
+                    s for s in value.index.free_symbols if s in self.indirect_vars
+                )
+                # Check destination (scatter operations write to indirect indices)
+                indirect_syms_used.update(
+                    s for s in dst.index.free_symbols if s in self.indirect_vars
+                )
+
+            if indirect_syms_used:
                 # Gather/scatter: coordinates are built with raw indirect symbols here;
                 # indirect_access_subs is applied later in codegen_kernel → simplify_op_spec.
-                # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
+                # Only add the indirect tensors that this specific operation uses.
                 args = [
                     self.create_tensor_arg(
                         True,
@@ -821,18 +829,23 @@ class SpyreKernel(Kernel[CSEVariable]):
                         idx_tensor,
                         opspec_name=idx_tensor.name,
                     )
-                    for sym in sorted(indirect_syms, key=str)
+                    for sym in sorted(indirect_syms_used, key=str)
                     for idx_tensor in [self.indirect_vars[sym]]
                 ]
                 args += [
                     self.create_tensor_arg(True, value.name, value),
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
+                # Only pass indirect var names that this operation uses
+                op_indirect_var_names = frozenset(
+                    self.indirect_vars[sym].name for sym in indirect_syms_used
+                )
             else:
                 args = [
                     self.create_tensor_arg(True, value.name, value),
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
+                op_indirect_var_names = None
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
             if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
@@ -843,7 +856,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             else:
                 op = IDENTITY_OP
             op_spec = self.create_op_spec(
-                op, False, args, op_info, self.indirect_var_names()
+                op, False, args, op_info, op_indirect_var_names
             )
             self.op_specs.append(op_spec)
         else:
