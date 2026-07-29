@@ -481,27 +481,22 @@ def indirect_info_from_op(
 ) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
     """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass.
 
-    Captures both gather (read) and scatter (write) indirect indices.
     Pass op=None when there is no ComputedBuffer (e.g. structural callers that only
     check stick compatibility or layout shape). Returns (set(), {}, None), where
     sizes=None tells compute_coordinates to skip unknown symbols silently rather than
-    raising Unsupported. None is returned when op has no indirect reads/writes. If indirect
-    accesses exist but none resolve to a known buffer (unexpected), sizes={} is returned;
+    raising Unsupported. None is returned when op has no indirect reads. If indirect
+    reads exist but none resolve to a known buffer (unexpected), sizes={} is returned;
     in normalize_coordinates this still produces opaque-Term fallback (same as None),
     but in compute_coordinates an unknown symbol would raise Unsupported.
     """
     if op is None:
         return set(), {}, None
-    load_subs, load_sizes = _build_indirect_load_subs(op)
-    store_subs, store_sizes = _build_indirect_store_subs(op)
-    subs = {**load_subs, **store_subs}
+    subs, sizes = _build_indirect_load_subs(op)
     names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
     access_subs = {
         sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in subs.items()
     }
-    # Merge sizes: prefer load_sizes if available, fallback to store_sizes
-    sizes = load_sizes if load_sizes is not None else store_sizes
     return names, access_subs, sizes
 
 

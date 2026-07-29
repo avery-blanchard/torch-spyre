@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
     ReinterpretView,
+    Scatter,
     StorageBox,
 )
 from torch_spyre._C import SpyreTensorLayout
@@ -52,6 +53,7 @@ from .pass_utils import (
     device_coordinates,
     indirect_info_from_op,
     _find_scatter_index_buf_names,
+    _build_indirect_store_subs,
 )
 
 logger = get_inductor_logger("reorder_nonstick_dims")
@@ -494,7 +496,19 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
-        output_value_buf = _output_value_buf_for_op(graph, op, access_subs, sizes)
+        # For scatter ops, build scatter-specific access_subs for write coordinate analysis
+        scatter_access_subs = access_subs
+        if isinstance(op.data, Scatter):
+            store_subs, _ = _build_indirect_store_subs(op)
+            if store_subs:
+                scatter_access_subs = {
+                    sym: IndirectAccess(sympy.Symbol(expr.base.name))
+                    for sym, expr in store_subs.items()
+                }
+
+        output_value_buf = _output_value_buf_for_op(
+            graph, op, scatter_access_subs, sizes
+        )
         if output_value_buf is not None:
             output_layout = _output_real_layout(op)
             if isinstance(output_layout, FixedTiledLayout):
@@ -503,13 +517,15 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                     d for d in op.get_read_writes().writes if isinstance(d, MemoryDep)
                 )
                 write_coords = device_coordinates(output_stl, write_dep, sizes)
-                write_stride_idx = _indirect_stride_idx(write_coords, access_subs)
+                write_stride_idx = _indirect_stride_idx(
+                    write_coords, scatter_access_subs
+                )
                 if write_stride_idx is not None and not _dim_order_is_compliant(
                     output_stl, write_stride_idx
                 ):
                     if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                         _insert_mutation_relayout_copy(
-                            graph, op, write_dep, access_subs, sizes
+                            graph, op, write_dep, scatter_access_subs, sizes
                         )
                     else:
                         output_indirect_pos = (
