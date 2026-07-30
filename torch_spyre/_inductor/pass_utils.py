@@ -640,6 +640,26 @@ def indirect_access_subs_from_op(
     return access_subs
 
 
+def indirect_store_access_subs_from_op(
+    op: "ComputedBuffer",
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Build {indirect_sym → IndirectAccess(name)} for a Scatter op's write (pre-scheduler).
+
+    Mirrors indirect_access_subs_from_op(), but for the scatter (write-side)
+    indirect index rather than a gather (read-side) one: wraps
+    _build_indirect_store_subs() and converts its IndexedBase subs into the
+    same IndirectAccess representation device_coordinates()/_indirect_stride_idx()
+    consume uniformly for both gather and scatter. Returns ({}, None) for
+    non-Scatter ops or scatter ops with no discoverable index buffers.
+    """
+    store_subs, sizes = _build_indirect_store_subs(op)
+    access_subs = {
+        sym: IndirectAccess(sympy.Symbol(expr.base.name))
+        for sym, expr in store_subs.items()
+    }
+    return access_subs, sizes
+
+
 def indirect_access_subs_from_kernel(
     indirect_vars: "dict[sympy.Symbol, Any]",
 ) -> "dict[sympy.Symbol, sympy.Expr]":
