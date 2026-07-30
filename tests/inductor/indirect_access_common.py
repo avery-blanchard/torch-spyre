@@ -42,8 +42,8 @@ backend aborts -- because the backend does not yet implement indirect access
 correctly. The xfail is raised after the capture-path stage checks run, so those
 stay strict; when the backend is fixed and results match, no xfail is raised and
 the test passes (xpass alerts you if a hard-coded expectation goes stale). For
-expect_close=True ops a mismatch/failure is instead a hard error. Only gather
-reaches this path today; the name is generic so scatter can reuse it later.
+expect_close=True ops a mismatch/failure is instead a hard error. Both gather
+and scatter reach this path via _stage_and_e2e.
 """
 
 import contextlib
@@ -403,9 +403,7 @@ def run_e2e(
     device tensors the kernel is invoked with; the CPU reference is computed
     from their host copies.
 
-    Today only gather kernels reach the indirect path -- the name is
-    deliberately generic so scatter (and other indirect ops) can reuse it once
-    the backend supports them.
+    Both gather and scatter kernels reach this path via _stage_and_e2e.
 
     The CPU reference is computed first; if *that* raises it is a problem with
     the test itself (e.g. an out-of-bounds index) and is allowed to propagate.
@@ -429,9 +427,9 @@ def run_e2e(
                          correct, e.g. a supported direct op or CPU fallback);
           - `False` -> assert the result diverges (pin a known-bad path);
           - `None`  -> xfail on divergence (the default for on-device indirect
-                         gather, which the backend does not yet implement
-                         correctly). When it is fixed and results match, no xfail
-                         is raised and the test simply passes.
+                         gather/scatter, which the backend does not yet
+                         implement correctly). When it is fixed and results
+                         match, no xfail is raised and the test simply passes.
 
     Returns an `E2EResult` when the result matched (or expect_close handled it);
     on divergence/backend failure it raises pytest.xfail and does not return.
@@ -710,17 +708,18 @@ class IndirectAccessTestCase(InductorTestCase):
     ):
         """Validate every capture-path stage with check(), then run end-to-end.
 
-        Shared by the gather and scatter op-family tests. Currently only the
-        capture-path stages run; the e2e leg (real backend: dxp_standalone +
-        on-device launch via run_e2e) is wired up but disabled until e2e
-        support lands. Pass expect_close=True for ops whose result must match
-        the CPU reference (e.g. a supported direct op) once e2e is enabled.
+        Shared by the gather and scatter op-family tests. The capture-path
+        stages run first via check() (classification, op-spec structure, SDSC
+        fields), then the kernel runs on the real backend via run_e2e. Pass
+        expect_close=True for ops whose result must match the CPU reference
+        (e.g. a supported direct op); leave it None (default) for ops the
+        backend does not yet implement correctly, which xfails on divergence
+        instead of failing the test.
 
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
         r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
-        # TODO: Enable once e2e is available; expect_close is reserved for that path.
-        # run_e2e(self, kernel, *dev_args, expect_close=expect_close)
+        run_e2e(self, kernel, *dev_args, expect_close=expect_close)
         return r
 
     # -- SDSC indirect-access field validation ---------------------------
