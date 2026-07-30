@@ -422,7 +422,7 @@ def _insert_mutation_relayout_copy(
     else:
         mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
 
-    mutation_op._emit_set_layout = (target_name, required_stl)
+    # mutation_op._emit_set_layout = (target_name, required_stl)
 
     operations = graph.operations
     mutation_op_index = operations.index(mutation_op)
