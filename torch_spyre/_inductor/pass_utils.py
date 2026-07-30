@@ -420,16 +420,15 @@ def _build_indirect_store_subs(
 
     indices = cells["indices"]
     rw = op.get_read_writes()
-    writes = [
+    reads = [
         d
-        for d in rw.writes
+        for d in rw.reads
         if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
     ]
-    if not writes:
+    if not reads:
         return {}, None
-    write_dep = writes[0]
 
-    # Extract scatter index buffer names and build dep map
+    # Extract scatter index buffer names
     index_buf_names = []
     for idx_tensor in indices:
         if idx_tensor is None:
@@ -444,34 +443,38 @@ def _build_indirect_store_subs(
         return {}, None
 
     # Build map of all read deps by name
-    read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
-    dep_by_name = {d.name: d for d in read_deps}
+    dep_by_name = {d.name: d for d in reads}
 
     subs = {}
     sizes = {}
 
-    # For each scatter index buffer, the loop vars it appears in the index with
-    # are the scatter indices. Collect all such loop vars.
-    scatter_index_syms = set()
+    # For each scatter index buffer read, extract the loop vars it uses.
+    # These tell us which dimensions of the source are being scattered into.
+    # Store the first index buffer as the primary source (common case: single scatter dim).
+    scatter_index_syms = []
     for index_buf_name in index_buf_names:
         if index_buf_name not in dep_by_name:
             continue
         index_dep = dep_by_name[index_buf_name]
-        # Extract loop vars from the scatter index buffer's index expression
-        # These are the symbols that will appear in write_dep.index when scattering
-        index_syms = index_dep.index.free_symbols & set(write_dep.ranges.keys())
-        scatter_index_syms.update(index_syms)
+        # Extract loop vars from the index buffer's index (in order they appear)
+        # These correspond to the scatter dimensions in order
+        index_loop_vars = sorted(
+            [s for s in index_dep.index.free_symbols if s in index_dep.ranges],
+            key=lambda s: str(s),
+        )
+        scatter_index_syms.extend(index_loop_vars)
 
-    # Map each scatter index symbol to its corresponding index buffer.
-    # In the common case of a single scatter dimension, map all scatter_index_syms
-    # to the first (and usually only) scatter index buffer.
-    if scatter_index_syms and index_buf_names:
-        first_index_buf = index_buf_names[0]
-        if first_index_buf in dep_by_name:
-            index_dep = dep_by_name[first_index_buf]
-            for sym in scatter_index_syms:
-                subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
-                sizes[sym] = 0  # Size unknown in output_indexer
+    # For now, treat all loop vars involved in index reads as scatter indices
+    # (common case: 1D or multi-D scatter where index buffer indexing pattern
+    # directly corresponds to the scatter operation's loop structure)
+    for sym in scatter_index_syms:
+        if index_buf_names:
+            # Map to first index buffer for substitution
+            first_index_buf = index_buf_names[0]
+            if first_index_buf in dep_by_name:
+                index_dep = dep_by_name[first_index_buf]
+                subs[sym] = IndexedBase(first_index_buf)[index_dep.index]
+                sizes[sym] = 0  # Size unknown in output_indexer closure
 
     return subs, sizes if sizes else None
 

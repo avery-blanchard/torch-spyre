@@ -53,7 +53,6 @@ from .pass_utils import (
     device_coordinates,
     indirect_info_from_op,
     _find_scatter_index_buf_names,
-    indirect_store_access_subs_from_op as _scatter_access_subs_and_sizes,
 )
 
 logger = get_inductor_logger("reorder_nonstick_dims")
@@ -522,7 +521,9 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
 
-        # For scatter ops, ensure scatter index coordinate is at device position 0
+        # For scatter ops, handle the mutation target's layout compliance.
+        # The target must have its scattered-into dimension at device position 0.
+        # We infer the scatter dimension from the index buffer's indexing pattern.
         if isinstance(original_op.data, Scatter) and isinstance(
             original_op.layout, MutationLayoutSHOULDREMOVE
         ):
@@ -538,23 +539,54 @@ def reorder_nonstick_dims(graph: GraphLowering) -> None:
                 output_layout = _output_real_layout(original_op)
                 if isinstance(output_layout, FixedTiledLayout):
                     output_stl = output_layout.device_layout
-                    access_subs, sizes = _scatter_access_subs_and_sizes(original_op)
-                    if access_subs:
-                        write_coords = device_coordinates(output_stl, write_dep, sizes)
-                        write_stride_idx = _indirect_stride_idx(
-                            write_coords, access_subs
-                        )
-                        if write_stride_idx is not None and not _dim_order_is_compliant(
-                            output_stl, write_stride_idx
-                        ):
-                            logger.info(
-                                "scatter_destination_check: inserting mutation relayout copy for %s",
-                                original_op.get_name(),
+
+                    # Find which loop var indexes the scatter index buffer.
+                    # This tells us which dimension is being scattered into.
+                    scatter_dim_loop_var = None
+                    for dep in original_op.get_read_writes().reads:
+                        if not isinstance(dep, MemoryDep):
+                            continue
+                        # Check if this is a scatter index buffer
+                        if (
+                            dep.name in dep_names
+                        ):  # dep_names includes scatter index names
+                            # Extract loop vars from the index buffer's read
+                            index_loop_vars = sorted(
+                                [s for s in dep.index.free_symbols if s in dep.ranges],
+                                key=lambda s: str(s),
                             )
-                            _insert_mutation_relayout_copy(
-                                graph,
-                                original_op,
-                                write_dep,
-                                access_subs,
-                                sizes,
-                            )
+                            if index_loop_vars:
+                                scatter_dim_loop_var = index_loop_vars[0]
+                                break
+
+                    if scatter_dim_loop_var is not None:
+                        # Get the size of the scattered dimension from write_dep.ranges
+                        scatter_dim_size = int(write_dep.ranges[scatter_dim_loop_var])
+                        target_layout = _resolve_mutation_target(original_op)[
+                            1
+                        ].get_layout()
+                        if isinstance(target_layout, FixedTiledLayout):
+                            # Check if first device dim matches the scatter dim size
+                            device_dim0_size = int(output_stl.device_size[0])
+                            if device_dim0_size != scatter_dim_size:
+                                logger.info(
+                                    "scatter_destination_check: inserting relayout copy for %s "
+                                    "(scatter_dim_size=%s != device_size[0]=%s)",
+                                    original_op.get_name(),
+                                    scatter_dim_size,
+                                    device_dim0_size,
+                                )
+                                # Use loop var as placeholder indirect symbol for _insert_mutation_relayout_copy
+                                access_subs = {
+                                    scatter_dim_loop_var: IndirectAccess(
+                                        sympy.Symbol(f"idx_{scatter_dim_loop_var}")
+                                    )
+                                }
+                                sizes = None
+                                _insert_mutation_relayout_copy(
+                                    graph,
+                                    original_op,
+                                    write_dep,
+                                    access_subs,
+                                    sizes,
+                                )
