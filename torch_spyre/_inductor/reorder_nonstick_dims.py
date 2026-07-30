@@ -400,18 +400,26 @@ def _insert_mutation_relayout_copy(
     operations.remove(buf_tmp)
     operations.insert(mutation_op_index, buf_tmp)
 
-    # If target is a graph output, emit a layout restore to convert buf_tmp's
-    # required_stl back to the original layout at codegen time. This ensures
-    # the output buffer matches the user's expected layout.
-    if target_name in graph.get_output_names():
-        mutation_op._emit_set_layout = (target_name, orig_stl_layout.device_layout)
+    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout)
+    buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
+    # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
+    copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
+    _, buf_copyback = _create_restickify_node(
+        {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+        copyback_metadata_op,
+    )
+    buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
+    operations.remove(buf_copyback)
+    operations.insert(mutation_op_index + 2, buf_copyback)
 
     logger.info(
         "enforce_indirect_layout: inserted mutation relayout copy for %s "
-        "(copy-in %s -> %s, mutate in-place in required_stl)",
+        "(copy-in %s -> %s, copy-back %s -> %s)",
         mutation_name,
         target_name,
         buf_tmp_name,
+        buf_tmp_name,
+        target_name,
     )
 
 
