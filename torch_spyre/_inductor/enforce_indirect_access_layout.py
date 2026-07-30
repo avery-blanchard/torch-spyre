@@ -31,18 +31,71 @@ import sympy
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
-
+from torch._inductor.ir import (
+    ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
+    Scatter,
+    StorageBox,
+)
 from torch_spyre._C import SpyreTensorLayout
 
 from .constants import ELIDED_COPY_BACK_ATTR
-from .insert_restickify import _fixed_tiled, insert_restickify_on_node_inputs
+from .insert_restickify import (
+    _create_restickify_node,
+    _fixed_tiled,
+    insert_restickify_on_node_inputs,
+)
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
-from .pass_utils import device_coordinates, indirect_info_from_op
+from .pass_utils import (
+    _build_indirect_store_subs,
+    device_coordinates,
+    indirect_info_from_op,
+)
 
 logger = get_inductor_logger("enforce_indirect_access_layout")
+
+
+def _scatter_access_subs_and_sizes(
+    scatter_op: ComputedBuffer, output_layout, write_dep: MemoryDep
+) -> tuple[dict, dict]:
+    """Build access substitutions and sizes for scatter op index symbols.
+
+    The scatter index symbols appear in write_dep.index (e.g., tmp0 in d1 + 1024*tmp0).
+    Extract them and map to IndirectAccess, with sizes from output_layout.
+    Returns ({sym: IndirectAccess(...)}, {sym: size}).
+    """
+    store_subs, _ = _build_indirect_store_subs(scatter_op)
+
+    # The store_subs maps loop vars to index buffer accesses (e.g., d0 -> arg1_1[d0])
+    # Extract the actual scatter index symbols from write_dep.index
+    # These are symbols that appear in the write but NOT in write_dep.ranges
+    all_syms = write_dep.index.free_symbols
+    loop_syms = set(write_dep.ranges.keys())
+    scatter_syms = (
+        all_syms - loop_syms
+    )  # Symbols not in loop ranges are scatter indices
+
+    # Map scatter symbols to IndirectAccess using store_subs to find the index buffer name
+    access_subs: dict = {}
+    if scatter_syms and store_subs:
+        # store_subs values are IndexedBase(name)[expr], extract the name
+        for sym in scatter_syms:
+            for loop_sym, expr in store_subs.items():
+                # Use the index buffer name from store_subs
+                if hasattr(expr, "base"):
+                    access_subs[sym] = IndirectAccess(sympy.Symbol(expr.base.name))
+                    break
+
+    # Map scatter symbols to their sizes
+    sizes: dict[sympy.Symbol, int] = {}
+    if output_layout.size:
+        for sym in scatter_syms:
+            sizes[sym] = output_layout.size[0]
+
+    return access_subs, sizes
 
 
 def _real_layout(buf) -> FixedTiledLayout:
@@ -209,6 +262,211 @@ def _value_bufs_for_op(
     return value_bufs
 
 
+def _output_real_layout(op: ComputedBuffer) -> FixedTiledLayout:
+    """Resolve an op's committed output layout, unwrapping a genuine mutation
+    target (unlike _real_layout, which asserts mutation layouts only appear on
+    elided copy-backs — an op's own MutationLayoutSHOULDREMOVE is expected)."""
+    layout = op.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    return layout
+
+
+def _resolve_mutation_target(op: ComputedBuffer) -> tuple[str, object]:
+    """Unwrap a MutationLayoutSHOULDREMOVE op's layout to (target_name, target_buf).
+
+    Mirrors propagate_layouts.py's MutationLayoutSHOULDREMOVE branch, which
+    unwraps ReinterpretView chains the same way to resolve the mutation target.
+    """
+    assert isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+    target = op.layout.target
+    while isinstance(target, ReinterpretView):
+        target = target.data
+    return target.get_name(), target
+
+
+def _insert_mutation_relayout_copy(
+    graph: GraphLowering,
+    mutation_op: ComputedBuffer,
+    write_dep: MemoryDep,
+    access_subs: dict,
+    sizes: dict | None,
+) -> None:
+    """Fix a non-compliant indirect-write layout on a MutationLayoutSHOULDREMOVE op.
+
+    Mirrors insert_post_mutation_restickify's copy-in / retarget / copy-back
+    shape, built eagerly here (rather than via the _restickify_plan deferred
+    queue, which insert_post_mutation_restickify alone owns) since
+    enforce_indirect_access_layout runs after every op already has a committed
+    FixedTiledLayout.
+
+    If a _restickify_plan is already pending on mutation_op (propagate_layouts
+    staged a stick-offset fix that insert_post_mutation_restickify will apply
+    later), don't build a second copy-in/copy-back pair. Instead, rotate the
+    pending alt_stl so the single later copy already lands the target in a
+    layout that satisfies both requirements. alt_stl lives in its own
+    coordinate space (propagate_layouts.py's _candidate_output_stls builds it
+    from the target's host size/stride with a possibly different dim chosen as
+    the stick dim, not by permuting the current device stride_map), so the
+    rotation is re-derived from scratch against alt_stl via the same
+    indirect-position lookup used everywhere else in this pass, rather than by
+    transplanting the independent branch's rotation order onto it.
+    """
+    # Detect scatter by checking if access_subs contains IndirectAccess values
+    is_scatter_op = (
+        any(isinstance(v, IndirectAccess) for v in access_subs.values())
+        if access_subs
+        else False
+    )
+    is_scatter_op = is_scatter_op or isinstance(mutation_op.data, Scatter)
+
+    pending_plan = getattr(mutation_op, "_restickify_plan", None)
+    if pending_plan is not None:
+        target_name, orig_stl, alt_stl = pending_plan
+        alt_stride_idx: int | None
+        if is_scatter_op:
+            # For scatter, find indirect coordinates in the write and check first one
+            alt_coords = device_coordinates(alt_stl, write_dep, sizes)
+            alt_stride_idx = _indirect_stride_idx(alt_coords, {})
+        else:
+            alt_coords = device_coordinates(alt_stl, write_dep, sizes)
+            alt_stride_idx = _indirect_stride_idx(alt_coords, access_subs)
+        if alt_stride_idx is not None and not _dim_order_is_compliant(
+            alt_stl, alt_stride_idx
+        ):
+            alt_indirect_pos = len(alt_stl.stride_map) - 1 - alt_stride_idx
+            rotated_alt_stl = _build_required_stl(alt_stl, alt_indirect_pos)
+        else:
+            rotated_alt_stl = alt_stl
+        mutation_op._restickify_plan = (target_name, orig_stl, rotated_alt_stl)
+        graph_input = graph.graph_inputs.get(target_name)
+        if graph_input is not None:
+            graph_input.layouts = [rotated_alt_stl]
+        logger.info(
+            "enforce_indirect_layout: composed with pending restickify_plan for "
+            "%s -> rotated alt_stl %s",
+            target_name,
+            list(rotated_alt_stl.stride_map),
+        )
+        return
+
+    output_stl = _output_real_layout(mutation_op).device_layout
+
+    write_stride_idx: int | None = None
+    if is_scatter_op:
+        logger.debug(
+            "enforce_indirect_layout: scatter op device_size=%s, stride_map=%s",
+            output_stl.device_size,
+            output_stl.stride_map,
+        )
+        # For scatter, get access subs and sizes, then find indirect in write coords
+        # Extract scatter index buffer names from the op itself
+        scatter_dep_names: set[str] = set()
+        if isinstance(mutation_op.data, Scatter):
+            fn = mutation_op.data.output_indexer
+            if fn.__closure__ is not None:
+                freevars = fn.__code__.co_freevars
+                try:
+                    cells = {
+                        name: cell.cell_contents
+                        for name, cell in zip(freevars, fn.__closure__)
+                    }
+                    if "indices" in cells:
+                        indices = cells["indices"]
+                        for idx_tensor in indices:
+                            if idx_tensor is None:
+                                continue
+                            node = idx_tensor
+                            while hasattr(node, "data"):
+                                node = node.data
+                            if hasattr(node, "name") and node.name is not None:
+                                scatter_dep_names.add(node.name)
+                except (ValueError, AttributeError):
+                    pass
+
+        scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
+            mutation_op, _output_real_layout(mutation_op), write_dep
+        )
+        write_stride_idx = _indirect_stride_idx(
+            device_coordinates(output_stl, write_dep, scatter_sizes),
+            scatter_access_subs,
+        )
+    else:
+        write_stride_idx = _indirect_stride_idx(
+            device_coordinates(output_stl, write_dep, sizes), access_subs
+        )
+        assert write_stride_idx is not None, (
+            f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
+        )
+    assert write_stride_idx is not None
+    output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
+    required_stl = _build_required_stl(output_stl, output_indirect_pos)
+
+    target_name, target_buf = _resolve_mutation_target(mutation_op)
+    if target_buf is None:
+        raise AssertionError(
+            f"mutation target resolved to None for {mutation_op.get_name()}"
+        )
+    target_layout = target_buf.get_layout()
+    if target_layout is None:
+        raise AssertionError(
+            f"mutation target {target_name!r} has None layout for {mutation_op.get_name()}"
+        )
+    assert isinstance(target_layout, FixedTiledLayout), (
+        f"expected FixedTiledLayout on mutation target {target_name!r}, "
+        f"got {type(target_layout).__name__}"
+    )
+
+    buf_tmp_layout = _fixed_tiled(target_layout, required_stl)
+    orig_stl_layout = target_layout
+
+    # Step 1: copy-in: target (current layout) -> buf_tmp (required_stl).
+    _, buf_tmp = _create_restickify_node(
+        {"arg_name": target_name, "target_layout": buf_tmp_layout}, mutation_op
+    )
+    buf_tmp_name = buf_tmp.get_name()
+    buf_tmp._input_layout_overrides = {target_name: orig_stl_layout}
+
+    # Step 2: retarget the mutation to buf_tmp, preserving any slice offset.
+    mutation_name = mutation_op.get_name()
+    original_layout = mutation_op.layout
+    assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
+    slice_layout = original_layout.target.get_layout()
+    if isinstance(original_layout.target, ReinterpretView) and slice_layout.offset != 0:
+        mutation_op.layout = MutationLayoutSHOULDREMOVE(
+            ReinterpretView(data=StorageBox(buf_tmp), layout=slice_layout)
+        )
+    else:
+        mutation_op.layout = MutationLayoutSHOULDREMOVE(buf_tmp)
+
+    operations = graph.operations
+    mutation_op_index = operations.index(mutation_op)
+    operations.remove(buf_tmp)
+    operations.insert(mutation_op_index, buf_tmp)
+
+    # Step 3: copy-back: buf_tmp (required_stl) -> target_buf (original layout)
+    buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
+    # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
+    copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
+    _, buf_copyback = _create_restickify_node(
+        {"arg_name": buf_tmp_name, "target_layout": buf_copyback_layout},
+        copyback_metadata_op,
+    )
+    buf_copyback.layout = MutationLayoutSHOULDREMOVE(target_buf)
+    operations.remove(buf_copyback)
+    operations.insert(mutation_op_index + 2, buf_copyback)
+
+    logger.info(
+        "enforce_indirect_layout: inserted mutation relayout copy for %s "
+        "(copy-in %s -> %s, copy-back %s -> %s)",
+        mutation_name,
+        target_name,
+        buf_tmp_name,
+        buf_tmp_name,
+        target_name,
+    )
+
+
 def _get_indirect_access_dim_order_requirements(
     op: ComputedBuffer,
 ) -> tuple[set[str], dict, dict[sympy.Symbol, int] | None] | None:
@@ -241,6 +499,16 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
     for original_op in list(graph.operations):
         if not isinstance(original_op, ComputedBuffer):
             continue
+        is_scatter = isinstance(original_op.data, Scatter)
+        is_mutation = isinstance(original_op.layout, MutationLayoutSHOULDREMOVE)
+        if is_scatter or is_mutation:
+            logger.debug(
+                "enforce_indirect_access_layout: checking op %s, is_scatter=%s, "
+                "is_mutation=%s",
+                original_op.get_name(),
+                is_scatter,
+                is_mutation,
+            )
         requirement = _get_indirect_access_dim_order_requirements(original_op)
         if not requirement:
             continue
@@ -297,3 +565,163 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
             else:
                 required_layout = _fixed_tiled(value_layout, required_stl)
                 op = _insert_relayout_copy(graph, op, value_buf, required_layout)
+
+        # For scatter ops, ensure scatter destination dimension 0 (scatter index) is outermost
+        if is_scatter and is_mutation:
+            write_dep = next(
+                (
+                    d
+                    for d in original_op.get_read_writes().writes
+                    if isinstance(d, MemoryDep)
+                ),
+                None,
+            )
+            if write_dep is not None:
+                output_layout = _output_real_layout(original_op)
+                if isinstance(output_layout, FixedTiledLayout):
+                    output_stl = output_layout.device_layout
+
+                    # The scatter mutates its input (the value tensor). The mutation target
+                    # is the value producer. Resolve and look up the actual buffer.
+                    target_name, _ = _resolve_mutation_target(original_op)
+                    target_buf = graph.get_buffer(target_name)
+                    logger.debug(
+                        "scatter_value_check: mutation_target=%s, is_computed=%s",
+                        target_name,
+                        isinstance(target_buf, ComputedBuffer),
+                    )
+                    value_producer_rewritten = False
+                    if isinstance(target_buf, ComputedBuffer):
+                        can_mutate = _can_mutate_producer_in_place(
+                            target_buf, graph.get_output_names()
+                        )
+                        logger.debug(
+                            "scatter_value_check: %s can_mutate_in_place=%s",
+                            target_name,
+                            can_mutate,
+                        )
+                        if can_mutate:
+                            value_layout = _real_layout(target_buf)
+                            is_tiled = isinstance(value_layout, FixedTiledLayout)
+                            logger.debug(
+                                "scatter_value_check: %s is_tiled=%s",
+                                target_name,
+                                is_tiled,
+                            )
+                            if is_tiled:
+                                value_stl = value_layout.device_layout
+                                layouts_match = value_stl == output_stl
+                                logger.debug(
+                                    "scatter_value_check: %s layouts_match=%s, value_stl=%s, output_stl=%s",
+                                    target_name,
+                                    layouts_match,
+                                    list(value_stl.stride_map),
+                                    list(output_stl.stride_map),
+                                )
+                                if not layouts_match:
+                                    _rewrite_producer_layout(target_buf, output_stl)
+                                    value_producer_rewritten = True
+                                    logger.info(
+                                        "scatter_value_check: rewrote mutation target %s layout "
+                                        "to match scatter output layout",
+                                        target_buf.get_name(),
+                                    )
+
+                    # Only check scatter destination compliance if we didn't rewrite
+                    # the value producer. If value producer is rewritten to match the
+                    # output layout, the scatter destination is automatically compliant.
+                    if not value_producer_rewritten:
+                        logger.debug(
+                            "scatter_destination_check: device_size=%s, stride_map=%s",
+                            output_stl.device_size,
+                            output_stl.stride_map,
+                        )
+
+                        # Check scatter destination compliance using write coordinates,
+                        # like gather does for read coordinates. Find all IndirectAccess
+                        # positions in the write and ensure they're outermost.
+                        scatter_access_subs, scatter_sizes = (
+                            _scatter_access_subs_and_sizes(
+                                original_op, output_layout, write_dep
+                            )
+                            if requirement
+                            else ({}, {})
+                        )
+                        logger.debug(
+                            "scatter_destination_check: scatter_access_subs=%s",
+                            scatter_access_subs,
+                        )
+                        logger.debug(
+                            "scatter_destination_check: scatter_sizes=%s",
+                            scatter_sizes,
+                        )
+
+                        write_coords = device_coordinates(
+                            output_stl,
+                            write_dep,
+                            scatter_sizes if scatter_sizes else None,
+                        )
+                        logger.debug(
+                            "scatter_destination_check: write_coords=%s",
+                            write_coords,
+                        )
+                        indirect_stride_idxs: list[int] = []
+                        for idx, coord in enumerate(reversed(write_coords)):
+                            substituted = (
+                                coord.xreplace(scatter_access_subs)
+                                if scatter_access_subs
+                                else coord
+                            )
+                            logger.debug(
+                                "scatter_destination_check: coord[%d]=%s, substituted=%s, has_indirect=%s",
+                                len(write_coords) - 1 - idx,
+                                coord,
+                                substituted,
+                                hasattr(substituted, "has")
+                                and substituted.has(IndirectAccess),
+                            )
+                            if hasattr(substituted, "has") and substituted.has(
+                                IndirectAccess
+                            ):
+                                indirect_stride_idxs.append(idx)
+
+                        is_compliant = True
+                        if indirect_stride_idxs:
+                            # Convert stride_idx positions (from right) to device_pos (from left)
+                            scatter_indirect_device_pos: list[int] = [
+                                len(output_stl.stride_map) - 1 - idx
+                                for idx in indirect_stride_idxs
+                            ]
+                            # Check if they form a contiguous block at the front
+                            # (positions 0, 1, 2, ... for however many scatter dims)
+                            expected_positions: list[int] = list(
+                                range(len(indirect_stride_idxs))
+                            )
+                            if (
+                                sorted(scatter_indirect_device_pos)
+                                != expected_positions
+                            ):
+                                is_compliant = False
+                            logger.debug(
+                                "scatter_destination_check: scatter_indirect_device_pos=%s, expected=%s, compliant=%s",
+                                sorted(scatter_indirect_device_pos),
+                                expected_positions,
+                                is_compliant,
+                            )
+
+                        if not is_compliant:
+                            logger.info(
+                                "scatter_destination_check: inserting mutation relayout copy for %s",
+                                original_op.get_name(),
+                            )
+                            # For scatter, _insert_mutation_relayout_copy detects via
+                            # isinstance(mutation_op.data, Scatter) and doesn't use
+                            # access_subs or sizes -- it uses scatter_host_stride_0 instead.
+                            # Pass empty dicts for clarity.
+                            _insert_mutation_relayout_copy(
+                                graph,
+                                original_op,
+                                write_dep,
+                                {},
+                                None,
+                            )
