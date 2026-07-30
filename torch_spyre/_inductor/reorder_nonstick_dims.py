@@ -345,30 +345,24 @@ def _insert_mutation_relayout_copy(
     output_stl = _output_real_layout(mutation_op).device_layout
     is_scatter_op = isinstance(mutation_op.data, Scatter)
 
-    # For scatter ops, populate the real scattered-dim size in the sizes dict.
-    # _build_indirect_store_subs sets sizes[sym]=0 ("unknown") because size is
-    # not captured in output_indexer's closure; here we recover it from the
-    # mutation target's actual host layout. This is crucial for device_coordinates
-    # to correctly identify the indirect coordinate (range_val <= 1 skips it).
-    if is_scatter_op and sizes:
-        target_name, target_buf = _resolve_mutation_target(mutation_op)
-        target_layout = target_buf.get_layout()
-        if isinstance(target_layout, FixedTiledLayout):
-            # The scattered dimension is conventionally dim 0; use the target's size.
-            # In the general case, this could be recovered via matching_dim-style
-            # coordinate identity, but for now we trust that scatter operations
-            # target dim 0 (as per PyTorch's scatter/index_put conventions).
-            scattered_dim_size = target_layout.size[0]
-            for sym in sizes:
-                if sizes[sym] == 0:
-                    sizes[sym] = int(scattered_dim_size)
+    if is_scatter_op:
+        # For scatter, access_subs contains a loop var (not an indirect symbol).
+        # We can't use device_coordinates + _indirect_stride_idx directly.
+        # Instead, we assume the scatter dimension corresponds to the first device dim,
+        # and rotate the layout to put it at position 0 (before the stick).
+        # Device position 0 is rightmost in stride_map indexing: stride_idx = n-1.
+        scatter_loop_var = next(iter(access_subs.keys()))
+        write_stride_idx = (
+            len(output_stl.stride_map) - 1
+        )  # Rightmost = device position 0
+    else:
+        write_stride_idx = _indirect_stride_idx(
+            device_coordinates(output_stl, write_dep, sizes), access_subs
+        )
+        assert write_stride_idx is not None, (
+            f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
+        )
 
-    write_stride_idx = _indirect_stride_idx(
-        device_coordinates(output_stl, write_dep, sizes), access_subs
-    )
-    assert write_stride_idx is not None, (
-        f"expected an IndirectAccess write coordinate on {mutation_op.get_name()!r}"
-    )
     output_indirect_pos = len(output_stl.stride_map) - 1 - write_stride_idx
     required_stl = _build_required_stl(output_stl, output_indirect_pos)
 
