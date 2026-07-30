@@ -1038,19 +1038,15 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
-            # Compute which indirect variables THIS operation actually uses
-            # For gather: check source index for indirect symbols
-            # For scatter: check destination index for indirect symbols
-            indirect_syms_used: set[sympy.Symbol] = set()
-            if self.indirect_vars:
-                # Check source (gather operations read from indirect indices)
-                indirect_syms_used.update(
-                    s for s in value.index.free_symbols if s in self.indirect_vars
-                )
-                # Check destination (scatter operations write to indirect indices)
-                indirect_syms_used.update(
-                    s for s in dst.index.free_symbols if s in self.indirect_vars
-                )
+            # Compute which indirect variables THIS operation actually uses:
+            # - For gather: check source index for indirect symbols
+            # - For scatter: check destination index for indirect symbols
+            # Use the same filtering logic as PointwiseOp to avoid duplication.
+            indirect_syms_used = (
+                _indirect_syms_used(value, self.indirect_vars, dst_index=dst.index)
+                if self.indirect_vars
+                else set()
+            )
 
             if indirect_syms_used:
                 # Gather/scatter: coordinates are built with raw indirect symbols here;
@@ -1267,16 +1263,27 @@ class SpyreKernel(Kernel[CSEVariable]):
 
 
 def _indirect_syms_used(
-    value: "PointwiseOp", indirect_vars: "dict[sympy.Symbol, TensorAccess]"
+    value,
+    indirect_vars: "dict[sympy.Symbol, TensorAccess]",
+    dst_index: "sympy.Expr | None" = None,
 ) -> "set[sympy.Symbol]":
-    """Return the subset of indirect_vars keys that appear in value's argument indices."""
-    return {
-        s
-        for inp in value.arguments
-        if isinstance(inp, TensorAccess)
-        for s in inp.index.free_symbols
-        if s in indirect_vars
-    }
+    """Return the subset of indirect_vars keys that appear in value's indices.
+
+    For PointwiseOp: checks all argument indices.
+    If dst_index is provided (for scatter operations), also checks the destination index.
+    """
+    syms = set()
+    if hasattr(value, "arguments"):
+        syms = {
+            s
+            for inp in value.arguments
+            if isinstance(inp, TensorAccess)
+            for s in inp.index.free_symbols
+            if s in indirect_vars
+        }
+    if dst_index is not None:
+        syms.update(s for s in dst_index.free_symbols if s in indirect_vars)
+    return syms
 
 
 def _is_indirect_index_arg(
