@@ -457,9 +457,11 @@ def _enforce_scatter_destination_layout(
     if write_dep is None:
         return
     output_layout = _output_real_layout(scatter_op)
-    if not isinstance(output_layout, FixedTiledLayout):
+    if isinstance(output_layout, FixedTiledLayout):
+        output_stl = output_layout.device_layout
+    else:
+        # For non-tiled layouts (e.g., FixedLayout), skip enforcement.
         return
-    output_stl = output_layout.device_layout
 
     # The scatter mutates its input (the value tensor); the mutation target is
     # the value producer. Resolve and look up the actual buffer.
@@ -487,33 +489,48 @@ def _enforce_scatter_destination_layout(
         # below is automatically satisfied -- skip it.
         return
 
-    # Check scatter destination compliance using write coordinates, like
-    # gather does for read coordinates. Find all IndirectAccess positions in
-    # the write and ensure they form a contiguous block at the front.
-    scatter_access_subs, scatter_sizes = (
-        _scatter_access_subs_and_sizes(scatter_op, output_layout, write_dep)
-        if requirement
-        else ({}, {})
-    )
-    write_coords = device_coordinates(
-        output_stl, write_dep, scatter_sizes if scatter_sizes else None
-    )
+    # Check scatter destination compliance: scatter index dimensions must be outermost.
+    # Detect scatter index symbols (non-loop symbols in write_dep.index).
+    all_write_syms = write_dep.index.free_symbols
+    loop_syms = set(write_dep.ranges.keys())
+    scatter_syms = all_write_syms - loop_syms
+
+    if not scatter_syms:
+        # No scatter index symbols found (shouldn't happen for a real scatter).
+        logger.debug(
+            "scatter_destination_check: no scatter symbols found for %s",
+            scatter_op.get_name(),
+        )
+        return
+
+    # Build substitutions mapping scatter symbols to IndirectAccess markers.
+    scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
+
+    # Compute write coordinates and find positions of IndirectAccess markers.
+    write_coords = device_coordinates(output_stl, write_dep, None)
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
-        substituted = (
-            coord.xreplace(scatter_access_subs) if scatter_access_subs else coord
-        )
+        substituted = coord.xreplace(scatter_access_subs)
         if hasattr(substituted, "has") and substituted.has(IndirectAccess):
             indirect_stride_idxs.append(idx)
 
-    is_compliant = True
+    # Check compliance: all indirect positions must be at the front (positions 0, 1, ...).
+    is_compliant = False
     if indirect_stride_idxs:
-        # Convert stride_idx positions (from right) to device_pos (from left).
-        scatter_indirect_device_pos = sorted(
+        # Convert stride_idx (from right) to device_pos (from left).
+        indirect_device_pos = sorted(
             len(output_stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
         )
-        expected_positions = list(range(len(indirect_stride_idxs)))
-        is_compliant = scatter_indirect_device_pos == expected_positions
+        # Indirect dims must occupy the first N positions (0, 1, ..., N-1).
+        expected_pos = list(range(len(indirect_stride_idxs)))
+        is_compliant = indirect_device_pos == expected_pos
+        logger.debug(
+            "scatter_destination_check: %s indirect_device_pos=%s, expected=%s, compliant=%s",
+            scatter_op.get_name(),
+            indirect_device_pos,
+            expected_pos,
+            is_compliant,
+        )
 
     if not is_compliant:
         logger.info(
@@ -547,6 +564,7 @@ def enforce_indirect_access_layout(graph: GraphLowering) -> None:
                 is_mutation,
             )
         requirement = _get_indirect_access_dim_order_requirements(original_op)
+
         if not requirement:
             continue
         dep_names, access_subs, sizes = requirement

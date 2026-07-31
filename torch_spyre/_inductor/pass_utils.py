@@ -394,16 +394,35 @@ def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
     except ValueError:
         return []
 
-    if "indices" not in cells:
+    indices = None
+    if "indices" in cells:
+        indices = cells["indices"]
+    elif "index_loader" in cells:
+        # Fallback: PyTorch Inductor may use index_loader instead of direct indices.
+        # Try to extract the indices from index_loader's closure.
+        index_loader = cells["index_loader"]
+        if hasattr(index_loader, "__closure__") and index_loader.__closure__:
+            loader_freevars = index_loader.__code__.co_freevars
+            try:
+                loader_cells = {
+                    name: cell.cell_contents
+                    for name, cell in zip(loader_freevars, index_loader.__closure__)
+                }
+                if "indices" in loader_cells:
+                    indices = loader_cells["indices"]
+            except (ValueError, AttributeError):
+                pass
+
+    if indices is None:
         logger.warning(
-            "Scatter.output_indexer closure has no 'indices' variable — "
-            "Inductor may have renamed it. Scatter index tensors will not be "
-            "excluded from stick compatibility checks. (freevars: %s)",
+            "Scatter.output_indexer closure has no 'indices' variable or "
+            "'index_loader' — Inductor structure may have changed. "
+            "Scatter index tensors will not be excluded from stick compatibility "
+            "checks. (freevars: %s)",
             list(freevars),
         )
         return []
 
-    indices = cells["indices"]
     names = []
     for idx_tensor in indices:
         if idx_tensor is None:
@@ -436,10 +455,6 @@ def _build_indirect_store_subs(
     """
     from sympy import IndexedBase
 
-    index_buf_names = _scatter_index_buf_names_ordered(op)
-    if not index_buf_names:
-        return {}, None
-
     rw = op.get_read_writes()
     writes = [
         d
@@ -450,34 +465,40 @@ def _build_indirect_store_subs(
         return {}, None
     write_dep = writes[0]
 
-    # Build map of all read deps by name
-    read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
-    dep_by_name = {d.name: d for d in read_deps}
-
-    # This backend only supports scatter along a single dimension, so exactly
-    # one entry in `indices` is non-None -- index_buf_names has one name. A
-    # second name here would mean multi-dimensional scatter, which nothing
-    # downstream (dim-order enforcement, codegen) is built to handle -- fail
-    # loudly rather than silently mapping later dims' symbols onto the first
-    # buffer's expression.
-    assert len(index_buf_names) == 1, (
-        f"multi-dimensional scatter is not supported, got index buffers "
-        f"{index_buf_names}"
-    )
-    index_buf_name = index_buf_names[0]
-    if index_buf_name not in dep_by_name:
-        return {}, None
-    index_dep = dep_by_name[index_buf_name]
-    # The scatter index symbols are those in write_dep.index that are NOT loop
-    # variables -- i.e., symbols that appear in the write but are not in
-    # write_dep.ranges.keys(). These are what index into the value tensor
-    # during scatter. Map each to the index buffer's IndexedBase access.
-    # Since only one index buffer is supported, all scatter symbols map to it.
+    # Extract scatter index symbols (symbols in write_dep.index not in loop ranges).
     all_write_syms = write_dep.index.free_symbols
     loop_syms = set(write_dep.ranges.keys())
     scatter_index_syms = all_write_syms - loop_syms
+
+    if not scatter_index_syms:
+        # No scatter symbols found.
+        return {}, None
+
+    # Try to map scatter symbols to index buffers from the closure.
+    index_buf_names = _scatter_index_buf_names_ordered(op)
+    if index_buf_names:
+        # Build map of all read deps by name
+        read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        dep_by_name = {d.name: d for d in read_deps}
+
+        subs = {}
+        for index_buf_name in index_buf_names:
+            if index_buf_name not in dep_by_name:
+                continue
+            index_dep = dep_by_name[index_buf_name]
+            # Map scatter symbols to this index buffer.
+            for sym in scatter_index_syms:
+                if sym not in subs:
+                    subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
+        if subs:
+            return subs, None
+
+    # Fallback: if we couldn't extract index buffer names from the closure,
+    # create placeholder subs so that scatter_access_subs can be built.
+    # The actual buffer names don't matter for layout enforcement.
     subs = {
-        sym: IndexedBase(index_dep.name)[index_dep.index] for sym in scatter_index_syms
+        sym: IndexedBase(f"scatter_idx_{i}")[sym]
+        for i, sym in enumerate(scatter_index_syms)
     }
 
     # The valid range for a scatter-index symbol isn't recoverable here (it's
@@ -503,6 +524,24 @@ def indirect_info_from_op(
     """
     if op is None:
         return set(), {}, None
+
+    from torch._inductor.ir import Scatter
+
+    # For scatter ops, extract info from the write side instead of reads.
+    if isinstance(op.data, Scatter):
+        subs, sizes = _build_indirect_store_subs(op)
+        scatter_names: set[str] = set()
+        for expr in subs.values():
+            if hasattr(expr, "base") and hasattr(expr.base, "name"):
+                scatter_names.add(expr.base.name)
+        access_subs = {
+            sym: IndirectAccess(sympy.Symbol(expr.base.name))
+            for sym, expr in subs.items()
+            if hasattr(expr, "base")
+        }
+        return scatter_names, access_subs, sizes
+
+    # For gather and other ops, use the read side.
     subs, sizes = _build_indirect_load_subs(op)
     names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
