@@ -304,76 +304,16 @@ def _insert_mutation_relayout_copy(
 ) -> None:
     """Fix a non-compliant indirect-write layout on a MutationLayoutSHOULDREMOVE op.
 
-    Mirrors insert_post_mutation_restickify's copy-in / retarget / copy-back
-    shape, built eagerly here (rather than via the _restickify_plan deferred
-    queue, which insert_post_mutation_restickify alone owns) since
-    enforce_indirect_access_layout runs after every op already has a committed
-    FixedTiledLayout.
-
-    If a _restickify_plan is already pending on mutation_op (propagate_layouts
-    staged a stick-offset fix that insert_post_mutation_restickify will apply
-    later), don't build a second copy-in/copy-back pair. Instead, rotate the
-    pending alt_stl so the single later copy already lands the target in a
-    layout that satisfies both requirements. alt_stl lives in its own
-    coordinate space (propagate_layouts.py's _candidate_output_stls builds it
-    from the target's host size/stride with a possibly different dim chosen as
-    the stick dim, not by permuting the current device stride_map), so the
-    rotation is re-derived from scratch against alt_stl via the same
-    indirect-position lookup used everywhere else in this pass, rather than by
-    transplanting the independent branch's rotation order onto it.
-
-    access_subs/sizes describe the *caller's* indirect coordinates (e.g. a
-    gather's read side). For scatter callers these are irrelevant -- the
-    scatter index symbols live in mutation_op's own write_dep.index, not in
-    whatever access_subs the caller was tracking for an unrelated op -- so
-    callers pass {}, None for scatter and this function re-derives its own
-    scatter_access_subs/scatter_sizes via _scatter_access_subs_and_sizes
-    below.
+    Inserts a copy-in / retarget / copy-back sequence around the mutation.
+    For scatter ops, uses buf_tmp as the metadata source for copy-back to
+    avoid inheriting the index tensor dependency from the scatter op.
     """
-    # A caller (e.g. gather handling) may pass access_subs already carrying
-    # IndirectAccess values; a scatter mutation_op is otherwise unambiguous
-    # via isinstance(mutation_op.data, Scatter). Either signal is sufficient.
     is_scatter_op = (
         any(isinstance(v, IndirectAccess) for v in access_subs.values())
         if access_subs
         else False
     )
     is_scatter_op = is_scatter_op or isinstance(mutation_op.data, Scatter)
-
-    pending_plan = getattr(mutation_op, "_restickify_plan", None)
-    if pending_plan is not None:
-        target_name, orig_stl, alt_stl = pending_plan
-        alt_stride_idx: int | None
-        if is_scatter_op:
-            # For scatter, re-derive real access_subs/sizes against alt_stl --
-            # the caller passed {}, None since the scatter index symbols live
-            # in mutation_op's own write_dep.index, not in the caller's subs.
-            scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
-                mutation_op, _output_real_layout(mutation_op), write_dep
-            )
-            alt_coords = device_coordinates(alt_stl, write_dep, scatter_sizes)
-            alt_stride_idx = _indirect_stride_idx(alt_coords, scatter_access_subs)
-        else:
-            alt_coords = device_coordinates(alt_stl, write_dep, sizes)
-            alt_stride_idx = _indirect_stride_idx(alt_coords, access_subs)
-        if alt_stride_idx is not None and not _dim_order_is_compliant(
-            alt_stl, alt_stride_idx
-        ):
-            alt_indirect_pos = len(alt_stl.stride_map) - 1 - alt_stride_idx
-            rotated_alt_stl = _build_required_stl(alt_stl, alt_indirect_pos)
-        else:
-            rotated_alt_stl = alt_stl
-        mutation_op._restickify_plan = (target_name, orig_stl, rotated_alt_stl)
-        graph_input = graph.graph_inputs.get(target_name)
-        if graph_input is not None:
-            graph_input.layouts = [rotated_alt_stl]
-        logger.info(
-            "enforce_indirect_layout: composed with pending restickify_plan for "
-            "%s -> rotated alt_stl %s",
-            target_name,
-            list(rotated_alt_stl.stride_map),
-        )
-        return
 
     output_stl = _output_real_layout(mutation_op).device_layout
 
