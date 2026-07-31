@@ -75,7 +75,6 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
-    shared_base: bool = False
     device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
@@ -98,7 +97,6 @@ class SDSCArgs:
             f"  backGap={self.backGap}\n"
             f"  is_index_tensor={self.is_index_tensor}\n"
             f"  related_value_tensor_idx={self.related_value_tensor_idx}\n"
-            f"  shared_base={self.shared_base}\n"
             f")"
         )
 
@@ -760,14 +758,6 @@ def _create_sdsc_tensors(
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
-                # shared_base is True for:
-                #   gather  — the value table input (its row dim carries IndirectAccess
-                #             in device_coords, so is_indirect_value_tensor returns True)
-                #   scatter — the destination output (work_division._build_output_td
-                #             injects IndirectAccess into its coords, so
-                #             is_indirect_value_tensor also returns True here, keeping
-                #             the destination at a shared base address across all cores)
-                shared_base=has_indirect_access and is_indirect_value_tensor(arg),
                 device_tile_advance_expr=arg.device_tile_advance_expr,
             )
         )
@@ -914,13 +904,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_pool = _is_pool(op_spec.op)
     ndim = len(op_spec.iteration_space)
-    # Detect indirect access from device_coordinates: index tensors are those
-    # whose name is referenced by an IndirectAccess in another tensor's coordinates,
-    # and value tensors are those that contain IndirectAccess in their coordinates.
-    index_tensor_indices = {
-        i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
-    }
-    has_indirect_access = bool(index_tensor_indices)
 
     if is_pool:
         dim_labels = _align_pool_dim_labels(op_spec.node_output_ranges, ndim)
@@ -964,13 +947,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             symbolic_dims[sdsc_dim_name] = (sym_str, granularity, max_val)
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] if not has_indirect_access else 1
-        for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice if not has_indirect_access else 1
+        symbol_mapping[sym]: wk_slice
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
