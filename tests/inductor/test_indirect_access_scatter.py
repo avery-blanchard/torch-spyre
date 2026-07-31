@@ -17,10 +17,10 @@
 Each scenario routes its compile through
 self._stage_and_e2e(...): it asserts across every capture-path stage --
 classification, op-spec structure (IndirectAccess on the output), and SDSC
-fields -- and then runs the kernel end-to-end on the real backend. The e2e run
-reports an expected failure (pytest.xfail) on the value divergence / backend
-abort the backend currently produces for indirect scatter, while the
-capture-path checks above stay strict (a stage regression fails red).
+fields -- and then runs the kernel end-to-end on the real backend. With
+expect_close=True, the e2e run hard-asserts the device result matches the CPU
+reference, so a regression in the backend's indirect-scatter support fails red
+instead of being absorbed as an xfail.
 
 The two forms that crash during compilation -- index_fill (rank-0 scalar
 Constant codegen) and masked_scatter (mask-based CPU fallback) -- stay
@@ -29,8 +29,10 @@ capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 All scatter scenarios run with SENCORES=1.
 
 Status (validated on hardware build): index-tensor scatters reach a real op
-spec with IndirectAccess on the output (SCATTER_OP_SPEC); the deeptools backend
-diverges from / aborts on the bundle, surfaced here as xfail.
+spec with IndirectAccess on the output (SCATTER_OP_SPEC) and the deeptools
+backend now produces matching results end-to-end. scatter_reduce("amax") is
+the one known exception -- it still diverges from the CPU reference and stays
+on the xfail path.
 """
 
 import os
@@ -82,7 +84,9 @@ class TestScatter(IndirectAccessTestCase):
             out[idx] = src
             return out
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_with_exp(self):
         """out[idx] = src.exp() -- index_put fused with a unary operation."""
@@ -92,7 +96,9 @@ class TestScatter(IndirectAccessTestCase):
             out[idx] = src.exp()
             return out
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, op="exp")
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, op="exp", expect_close=True
+        )
 
     def test_scatter(self):
         """torch.scatter(out, 0, index, src)"""
@@ -101,7 +107,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return torch.scatter(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_method_without_unary(self):
         """out.scatter_(0, index, src) -- in-place method form without a unary."""
@@ -110,7 +118,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_with_exp(self):
         """y.scatter_(0, index, src.exp()) -- fused unary, exp runs on Spyre.
@@ -132,6 +142,7 @@ class TestScatter(IndirectAccessTestCase):
             expect=SCATTER_OP_SPEC,
             op="exp",
             detected=False,
+            expect_close=True,
         )
 
     def test_scatter_add(self):
@@ -141,7 +152,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_add_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_copy(self):
         """torch.index_copy(out, 0, idx, src).
@@ -154,7 +167,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return torch.index_copy(out, 0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_add(self):
         """out.index_add_(0, idx, src)"""
@@ -163,7 +178,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_reduce(self):
         """out.scatter_reduce_(0, index, src, "sum")"""
@@ -172,7 +189,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "sum")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_accumulate(self):
         """out.index_put_((idx,), src, accumulate=True) -- out[idx] += src."""
@@ -181,7 +200,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.index_put_((idx,), src, accumulate=True)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_add_functional(self):
         """torch.scatter_add(out, 0, index, src) -- functional accumulating scatter."""
@@ -190,7 +211,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return torch.scatter_add(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
     def test_scatter_reduce_amax(self):
@@ -209,7 +232,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "amin")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_reduce_prod(self):
         """out.scatter_reduce_(0, index, src, "prod")"""
@@ -218,7 +243,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "prod")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=DIRECT_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=DIRECT_OP_SPEC, expect_close=True
+        )
 
     # -- Known crashes (separate from the indirect-store path) -------------
     def test_index_fill_crashes(self):
