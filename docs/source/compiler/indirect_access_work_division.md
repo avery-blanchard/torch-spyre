@@ -135,7 +135,7 @@ left for a single core.
 
 ## The proposed fix
 
-Five changes, in order of importance.
+Six changes, in order of importance.
 
 ### 1. Forbid splitting the shared table's data dims — the correctness fix
 
@@ -150,10 +150,12 @@ coordinates:
   `IndirectAccess` and only its data dims remain as coordinate symbols.
 
 `shared_indirect_data_syms` then takes the non-`IndirectAccess` coordinate
-symbols of those tensors — the same extraction for both directions — and
-`_default_split` removes them from the output and reduction priority
-lists, so the core budget is distributed only over the index-entry dims —
-**divide by the index, not the table.**
+symbols of those tensors — the same extraction for both directions. The split
+passes consult it through `indirect_forbidden_split_syms`, which combines it with
+the partial-last-stick rule ([fix #6](#6-stick-align-the-index-entry-split-partial-last-stick));
+`_default_split` removes the resulting symbols from the output and reduction
+priority lists, so the core budget is distributed only over the index-entry
+dims — **divide by the index, not the table.**
 
 When the index dim cannot absorb all the cores, the op falls back to fewer cores
 rather than splitting a data dim. **Correct-but-serial is the intended
@@ -222,6 +224,46 @@ decode sites (`work_distribution_pass`, `create_op_spec`) prefer the first
 `_first_non_indirect_read_index`. This same reference also carries a scatter's
 entry-dim split (fix #2).
 
+### 6. Stick-align the index-entry split (partial last stick)
+
+Enabling the index-entry split (fixes #1–2) exposes a second hazard when the
+entry count is **not a whole multiple of the index stick** (32 int32 entries per
+128-byte stick). Work division splits the entry dim in whole sticks, so an
+*even* per-core slice of a partial last stick — e.g. `Q = 40` = one full stick +
+8 — hands the second core a slice that **straddles the index stick boundary**.
+The backend cannot step a sticked dimension across a stick boundary *within* a core,
+so the entries past the boundary are read from the wrong device addresses (the
+result miscompiles on exactly the rows in the partial second stick).
+
+The fix pads the **gather output**'s entry-dim `device_size` up to the next stick
+multiple (`enforce_indirect_access_layout._pad_output_for_stick_aligned_split`,
+e.g. `40 → 64`), leaving the logical size unchanged. The physical allocation
+grows, so the per-core base becomes stick-aligned — matching the index tensor,
+whose device layout is already stick-padded — and the D2H copy extracts the
+logical rows from the larger allocation (its `physical_exceeds_logical` path). To
+keep the per-core base stride consistent, `superdsc` grows the SDSC iteration to
+the padded size **before** `_create_sdsc_tensors` computes strides; otherwise the
+base lands element-aligned (mid-stick) and the split still miscompiles.
+
+`indirect_forbidden_split_syms`
+([work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py))
+enforces the invariant, **forbid unless provably padded**:
+
+* it **forbids** a partial-last-stick entry dim by default — reading the index's
+  *unpadded* logical count (`d.ranges`), which the output padding never changes;
+* it **lifts** that forbiddance only when the output was grown to a whole stick,
+  detected via `indirect_entry_output_dim(op).out_extent % eps == 0`.
+
+So a padded gather splits stick-aligned, while anything unpadded falls back to a
+single core rather than miscompiling. A **scatter cannot be padded**: its
+destination is written in place (a mutation layout the pass skips) and its entry
+row is data-dependent (an `IndirectAccess` coord), so `indirect_entry_output_dim`
+returns `None`, the forbiddance is never lifted, and a partial-stick scatter
+stays on a single core — correct-but-serial, never miscompiled.
+
+Stick-aligned counts (a multiple of 32) are unaffected: no padding, the
+forbiddance never fires, and they split exactly as before.
+
 ## Detection: load side vs. store side
 
 Both directions discover their indirect symbols before scheduling via
@@ -269,9 +311,13 @@ stickifies `d0` to `ceil(5 / 32) = 1` stick.
 | Result | wrong / backend abort | correct (serial — index too small to split) |
 
 In both cases parallelism is set by the index size in sticks:
-`cores = min(Q / 32, 32)` for a 1-D index (`Q = 256 → 8`, `Q = 1024 → 32`), or a
-spatial (non-stick) index dimension splits directly. A small index (the scatter
-`Q = 5` here) runs correct-but-serial.
+`cores = core_split(ceil(Q / 32), SENCORES)` for a 1-D index — the largest
+divisor of the index's stick count that fits the core budget (`Q = 256 → 8
+sticks → 8`, `Q = 1024 → 32`; a partial count like `Q = 40` pads to `2` sticks →
+`2` cores ([fix #6](#6-stick-align-the-index-entry-split-partial-last-stick)),
+and a non-power-of-two `SENCORES = 6` rounds `8` sticks down to `4`). A spatial
+(non-stick) index dimension splits directly. A small index (the scatter `Q = 5`
+here) runs correct-but-serial.
 
 ## Validation
 
@@ -296,6 +342,10 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicor
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/scatter_multicore_exp.py
 ```
 
+**Note:** `examples/scatter_multicore_exp.py` is a **work in progress** — the
+scatter backend path is not yet complete, so this example is illustrative and may
+not pass end-to-end. `examples/gather_multicore_exp.py` is the validated one.
+
 ### Paged-attention examples
 
 Two additional examples demonstrate indirect access in the paged-attention pattern
@@ -305,11 +355,13 @@ that motivated this feature:
   gather reads KV-cache rows selected by a 1-D slot-index tensor. Runs the CPU
   reference and the Spyre compiled path side-by-side and validates the outputs.
 
-* **`examples/paged_attention_kernel.py`** — full paged attention with combined
-  gather (KV read) and scatter (KV write): populates a paged KV cache with
-  scatter (`cache[slot_ids] = new_kv`), reads it back with gather
-  (`kv = cache[slot_ids]`), and runs the attention computation. Validates each
-  stage against the CPU reference.
+* **`examples/paged_attention_kernel.py`** (**work in progress**) — full paged
+  attention with combined gather (KV read) and scatter (KV write): populates a
+  paged KV cache with scatter (`cache[slot_ids] = new_kv`), reads it back with
+  gather (`kv = cache[slot_ids]`), and runs the attention computation. Because it
+  depends on the scatter backend path (not yet complete), this example is
+  illustrative and may not pass end-to-end yet; `paged_attention_compute.py`
+  (gather only) is the validated one.
 
 Note: these workloads have a small block-table index and wide KV rows, so they
 exercise the correctness fix but typically run on 1–2 cores (see
@@ -352,14 +404,16 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=8 python examples/paged_attention_
 
 | File | Change |
 |---|---|
-| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index` |
-| `_inductor/work_division.py` | `collect_shared_indirect_tds` (gather reads + scatter destination), `shared_indirect_data_syms`, `_non_indirect_coord_syms`, `_build_output_td`, `collect_indirect_value_tds`, `indirect_store_entry_syms`, `forbidden_split_syms` + `force_output_syms` in `_default_split`, `IndirectAccess` span guard |
-| `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for any `IndirectAccess`-carrying tensor (gather value, scatter destination) |
+| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`, `indirect_entry_output_dim` + `IndirectEntryDim` (partial-stick, fix #6) |
+| `_inductor/work_division.py` | `collect_shared_indirect_tds` (gather reads + scatter destination), `shared_indirect_data_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule, fix #6), `_non_indirect_coord_syms`, `_build_output_td`, `collect_indirect_value_tds`, `indirect_store_entry_syms`, `forbidden_split_syms` + `force_output_syms` in `_default_split`, `IndirectAccess` span guard |
+| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — grows a partial-stick gather output's entry-dim `device_size` to a whole stick (fix #6) |
+| `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for any `IndirectAccess`-carrying tensor (gather value, scatter destination); grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #6) |
 | `_inductor/codegen/compute_ops.py` | `core_idx_to_slice_offset` honours `shared_base` |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
-| `examples/gather_multicore_exp.py`, `examples/scatter_multicore_exp.py` | three-scenario multicore validation examples |
+| `examples/gather_multicore_exp.py` | three-scenario multicore validation example (gather) |
+| `examples/scatter_multicore_exp.py` | three-scenario multicore example (scatter) — **WIP** |
 | `examples/paged_attention_compute.py` | paged-attention 1-D gather example (CPU + Spyre, validates outputs) |
-| `examples/paged_attention_kernel.py` | full paged-attention gather + scatter example (KV write, read, attention) |
+| `examples/paged_attention_kernel.py` | full paged-attention gather + scatter example (KV write, read, attention) — **WIP** |
 
 ## See also
 

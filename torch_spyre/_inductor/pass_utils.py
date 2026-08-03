@@ -870,6 +870,81 @@ def try_device_coordinates(
         return None
 
 
+class IndirectEntryDim(NamedTuple):
+    """Geometry of a gather's index-entry dim as seen on the output tensor.
+
+    The entry dim is the index tensor's STICK dim (its rows are selected at
+    runtime), which on the gather output is a NON-stick dim (the row selector).
+    Multi-core work division splits this dim in whole index sticks, so a split
+    is only legal when the output can hold a stick-aligned slice -- i.e. when
+    ``out_extent`` is a whole multiple of ``eps``.
+    """
+
+    stick_var: sympy.Symbol  # iteration symbol indexing the entry dim
+    eps: int  # index tensor elems_per_stick (the split granularity)
+    out_pos: int  # entry dim's device position in the output layout
+    out_extent: int  # output device_size at out_pos (physical extent)
+
+
+def indirect_entry_output_dim(op) -> "IndirectEntryDim | None":
+    """Describe a gather's index-entry dim on the output, or None.
+
+    Returns None when ``op`` is not a gather-style indirect access, when the
+    output layout is not yet a committed ``FixedTiledLayout``, or when the entry
+    dim coincides with the output's own stick dim (a different geometry that the
+    stick-alignment padding does not cover). Valid from
+    ``enforce_indirect_access_layout`` onward, once every buffer's layout is
+    committed.
+
+    Callers key the partial-stick split decision off ``out_extent``:
+    ``enforce_indirect_access_layout`` grows it to the next multiple of ``eps``
+    (padding the output allocation) so the split becomes legal, and the
+    work-division guard forbids the split whenever it is still not a multiple.
+    """
+    subs = indirect_access_subs_from_op(op)
+    if not subs:
+        return None
+    index_names = {e.args[0].name for e in subs.values() if e.args}
+
+    rw = op.get_read_writes()
+    out_dep = next(iter(rw.writes), None)
+    if out_dep is None:
+        return None
+
+    # Fail safe: this only *lifts* a forbiddance for a paddable gather output. If
+    # the output can't be analysed (e.g. a scatter writes its destination
+    # indirectly, so device_coordinates can't resolve the entry coord), return
+    # None so the caller keeps the conservative forbiddance rather than erroring.
+    try:
+        out_stl = _fixed_read_layout(op).device_layout
+        out_coords = device_coordinates(out_stl, out_dep, None)
+        for d in rw.reads:
+            if not (isinstance(d, MemoryDep) and d.name in index_names):
+                continue
+            idx_stl = _fixed_read_layout(V.graph.get_buffer(d.name)).device_layout
+            stick_expr = device_coordinates(idx_stl, d, None)[-1]
+            if len(stick_expr.free_symbols) != 1:
+                continue
+            stick_var = next(iter(stick_expr.free_symbols))
+            eps = idx_stl.elems_per_stick()
+            # The entry dim must be a NON-stick dim of the output (exclude the
+            # last, stick, coordinate). On a scatter the entry coord is an
+            # IndirectAccess (its free symbol is the index buffer, not the
+            # iteration stick var), so no match -> None -> partial scatter stays
+            # forbidden, which is correct: its in-place dest can't be padded.
+            for pos, coord in enumerate(out_coords[:-1]):
+                if coord.free_symbols == {stick_var}:
+                    return IndirectEntryDim(
+                        stick_var=stick_var,
+                        eps=eps,
+                        out_pos=pos,
+                        out_extent=int(out_stl.device_size[pos]),
+                    )
+    except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
+        return None
+    return None
+
+
 def iter_var_id(stick_expr) -> int:
     """Iteration variable index from a stick expr: Mod(d2,64) -> 2, d2 -> 2.
     Returns -1 for constant-zero (scalar/broadcast, no real stick).

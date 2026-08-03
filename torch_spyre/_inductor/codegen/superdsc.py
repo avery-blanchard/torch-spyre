@@ -964,13 +964,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             symbolic_dims[sdsc_dim_name] = (sym_str, granularity, max_val)
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] if not has_indirect_access else 1
-        for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice if not has_indirect_access else 1
+        symbol_mapping[sym]: wk_slice
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
@@ -1017,6 +1016,32 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+
+    # Grow the index-entry iteration to the padded output device_size so a
+    # partial-last-stick gather splits stick-aligned across cores. The output's
+    # entry-dim device_size was rounded up to the index stick multiple at layout
+    # time (enforce_indirect_access_layout); match the SDSC iteration to it BEFORE
+    # _create_sdsc_tensors so the output's per-core base stride is computed from
+    # the padded (stick-aligned) size rather than the shorter logical count.
+    # Otherwise the per-core base lands element-aligned (mid-stick) and the split
+    # miscompiles. No-op unless the output was actually padded (device_size >
+    # iteration), i.e. only for the multi-core partial-stick case.
+    if has_indirect_access and _spyre_config.sencores > 1:
+        idx_arg = op_spec.args[next(iter(index_tensor_indices))]
+        idx_stick = idx_arg.device_coordinates[-1]
+        if len(idx_stick.free_symbols) == 1:
+            entry_c = next(iter(idx_stick.free_symbols))
+            out_arg = op_spec.args[-1]
+            for pos, coord in enumerate(out_arg.device_coordinates[:-1]):
+                if coord.free_symbols == {entry_c}:
+                    entry_mb = symbol_mapping.get(entry_c)
+                    dev = int(out_arg.device_size[pos])
+                    if (
+                        entry_mb in sdsc_iteration_space
+                        and dev > sdsc_iteration_space[entry_mb]
+                    ):
+                        sdsc_iteration_space[entry_mb] = dev
+                    break
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,

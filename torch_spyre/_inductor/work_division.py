@@ -51,6 +51,7 @@ from .pass_utils import (
     concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
+    indirect_entry_output_dim,
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
@@ -776,6 +777,58 @@ def shared_indirect_data_syms(op: ComputedBuffer) -> set[Symbol]:
     return syms
 
 
+def indirect_forbidden_split_syms(op: ComputedBuffer) -> set[Symbol]:
+    """Iteration dims that must not be core-split for an indirect op.
+
+    1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
+       table must not advance per core (all cores share the same base address).
+
+    2. **Partial-last-stick entry dims** — splitting a partial last index stick
+       across cores straddles the stick boundary. Forbidden unless the gather
+       output was already padded to a stick boundary by
+       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
+       output rows are chosen at runtime so can never be padded; they stay unsplit.
+    """
+    syms = shared_indirect_data_syms(op)  # (1)
+
+    # (2a) ADD: forbid a partial-last-stick index-entry dim, for BOTH gather and
+    # scatter (indirect_access_subs_from_op merges load+store subs). This keys
+    # off the INDEX's *logical* entry count (d.ranges[stick_var], e.g. 40), which
+    # is NEVER padded -- the stick-alignment fix grows the gather OUTPUT's
+    # device_size, not the index -- so this add fires for every partial-stick
+    # indirect op, gather included. It is the safe default: forbid unless the
+    # output is later proven stick-aligned (2b).
+    subs = indirect_access_subs_from_op(op)
+    index_names = {e.args[0].name for e in subs.values() if e.args}
+    for d in op.get_read_writes().reads:
+        if not (isinstance(d, MemoryDep) and d.name in index_names):
+            continue
+        layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+        stick_expr = device_coordinates(layout.device_layout, d, None)[-1]
+        if len(stick_expr.free_symbols) != 1:
+            continue
+        stick_var = next(iter(stick_expr.free_symbols))
+        eps = layout.device_layout.elems_per_stick()
+        if stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0:
+            syms.add(stick_var)
+
+    # (2b) DISCARD: lift (2a)'s forbiddance when the GATHER output WAS padded up
+    # to a whole stick by enforce_indirect_access_layout (out_extent grows to a
+    # multiple of eps), which makes the stick-aligned split legal. So for a
+    # normally-padded gather (2a) adds and (2b) removes -- a deliberate no-op:
+    # (2a) can't see the padding (it reads the unpadded index count) while (2b)
+    # reads the padded OUTPUT extent. The add+discard together mean "split only
+    # when the output is provably stick-aligned." It stays forbidden when the
+    # output is NOT padded: a SCATTER (indirect_entry_output_dim returns None --
+    # its in-place dest can't be resized) or a gather whose output the pass could
+    # not grow -- those must fall back to a single core, not miscompile.
+    entry = indirect_entry_output_dim(op)
+    if entry is not None and entry.out_extent % entry.eps == 0:
+        syms.discard(entry.stick_var)
+
+    return syms
+
+
 def indirect_store_entry_syms(op: ComputedBuffer) -> set[Symbol]:
     """Find which dimensions of a scatter can be safely parallelized.
 
@@ -790,7 +843,7 @@ def indirect_store_entry_syms(op: ComputedBuffer) -> set[Symbol]:
         return set()
     if not indirect_store_subs_from_op(op):
         return set()
-    return set(iteration_space_from_op(op)) - shared_indirect_data_syms(op)
+    return set(iteration_space_from_op(op)) - indirect_forbidden_split_syms(op)
 
 
 def _first_non_indirect_read_index(rw, default):
@@ -1054,7 +1107,7 @@ def span_reduction_pass(
     # never be split along their data dimensions — all cores must see the same
     # base address. Pass the forbidden set into must_split_vars so span
     # reduction never commits a split that would break shared-table addressing.
-    forbidden = shared_indirect_data_syms(op) or None
+    forbidden = indirect_forbidden_split_syms(op) or None
     min_splits = must_split_vars(
         all_tds,
         it_space,
@@ -1257,7 +1310,7 @@ def work_distribution_pass(
         max_cores,
         symbol_meta,
         blocked,
-        forbidden_split_syms=shared_indirect_data_syms(op),
+        forbidden_split_syms=indirect_forbidden_split_syms(op),
         force_output_syms=indirect_store_entry_syms(op),
     )
 
