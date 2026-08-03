@@ -64,7 +64,7 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
       break;
     case 5:
       dim_map = {host_dim_order[0], host_dim_order[1], host_dim_order[2],
-                 host_dim_order[4], host_dim_order[2], host_dim_order[4]};
+                 host_dim_order[4], host_dim_order[3], host_dim_order[4]};
       break;
     case 6:
       dim_map = {host_dim_order[0], host_dim_order[1], host_dim_order[2],
