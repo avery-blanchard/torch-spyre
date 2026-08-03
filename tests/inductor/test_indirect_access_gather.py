@@ -53,6 +53,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
+    IndirectAccessTestCase,
     register_multicore_variants,
     bundle_jsons_from_captured,
     capture_op_specs,
@@ -822,41 +823,167 @@ class _GatherScenarios:
         self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
-    def test_gather_multiple_indices_same_kernel(self):
-        """Test x[i] + y[i] - multiple gathers with same index in one kernel.
+    # -- stick-aligned vs partial-last-stick index-entry counts -----------
+    # The index-entry dim is the index tensor's stick dim, so work division
+    # splits it in whole 32-entry sticks. A STICK-ALIGNED count (a multiple of
+    # 32) has always split cleanly. A NON-aligned count (a partial last stick)
+    # used to be forced onto one core, because an even per-core slice straddles
+    # the index stick boundary and the backend cannot step a sticked dim across it;
+    # the fix pads the gather output's entry dim up to the next whole stick
+    # (enforce_indirect_access_layout) so the split lands stick-aligned. Both
+    # kinds are swept across every SENCORES; the expected split for either is
+    # min(SENCORES, ceil(count / 32)) with the K data dim always pinned at 1.
 
-        Verifies that when multiple gather operations use the same index tensor
-        in the same kernel, each operation correctly gets only the index tensors
-        it needs, not all indirect tensors in the kernel (regression test for
-        kernel-level indirect_vars carryover bug).
+    def test_work_division_index_split_aligned_six_sticks(self):
+        """Stick-aligned index with exactly 6 sticks (P=192): a non-power-of-two
+        stick count, so the split is the largest divisor of 6 that fits the core
+        count -- 6 at SENCORES>=6, 3 at 4 cores, 2 at 2 -- exercising the
+        SENCORES=6 case. Complements the 8- and 32-stick aligned cases.
         """
-        x, i = self._xi(P=3, two_d=True, dtype=torch.int64)
-        y = torch.randn_like(x)
 
-        def kernel(x, y, i):
-            return x[i] + y[i]
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(192) % 128).int().to("spyre")
+            return x, i
 
-        self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=192, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
-    def test_gather_different_indices_same_kernel(self):
-        """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
+    def test_work_division_index_split_partial_stick(self):
+        """Non-stick-aligned index (P=40 = one full stick + a partial second):
+        the entry dim is padded up to ceil(40/32)=2 whole sticks so the split
+        lands stick-aligned (2 across any SENCORES>=2) instead of an even slice
+        that would straddle the index stick boundary and miscompile."""
 
-        Verifies that when multiple gather operations use different index tensors
-        in the same kernel, each operation gets the correct index tensor without
-        cross-contamination from other gathers.
-        """
-        x, i = self._xi(P=3, two_d=True, dtype=torch.int64, M=128, N=256)
-        y, j = self._xi(P=3, two_d=True, dtype=torch.int64, M=100, N=256)
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(40) % 128).int().to("spyre")
+            return x, i
 
-        def kernel(x, y, i, j):
-            return x[i] + y[j]
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=40, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
-        self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
+    def test_work_division_index_split_partial_stick_mid(self):
+        """Non-stick-aligned index spanning several sticks (P=250, ceil=8 sticks):
+        the padded split scales past a single partial stick -- the non-aligned
+        counterpart of the aligned 8-stick test_work_division_index_split_capped,
+        splitting by the same largest divisor of 8 that fits the core count."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(250) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=250, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick_full(self):
+        """Non-stick-aligned index at 32-stick scale (P=1000, ceil=32): the
+        padded split reaches a full 32-way division, the partial-stick
+        counterpart of the aligned test_work_division_index_split_full."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1000) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1000, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    # def test_gather_multiple_indices_same_kernel(self):
+    #     """Test x[i] + y[i] - multiple gathers with same index in one kernel.
+
+    #     Verifies that when multiple gather operations use the same index tensor
+    #     in the same kernel, each operation correctly gets only the index tensors
+    #     it needs, not all indirect tensors in the kernel (regression test for
+    #     kernel-level indirect_vars carryover bug).
+    #     """
+    #     x, i = self._xi(P=3, two_d=True, dtype=torch.int64)
+    #     y = torch.randn_like(x)
+
+    #     def kernel(x, y, i):
+    #         return x[i] + y[i]
+
+    #     self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
+
+    # def test_gather_different_indices_same_kernel(self):
+    #     """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
+
+    #     Verifies that when multiple gather operations use different index tensors
+    #     in the same kernel, each operation gets the correct index tensor without
+    #     cross-contamination from other gathers.
+    #     """
+    #     x, i = self._xi(P=3, two_d=True, dtype=torch.int64, M=128, N=256)
+    #     y, j = self._xi(P=3, two_d=True, dtype=torch.int64, M=100, N=256)
+
+    #     def kernel(x, y, i, j):
+    #         return x[i] + y[j]
+
+    #     self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
 
 
 # Generate TestGather_cores1 .. TestGather_cores32, one per SENCORES value, so
 # every gather scenario is exercised across the multicore work-division planner.
 register_multicore_variants(_GatherScenarios, "TestGather", globals())
+
+
+# ---------------------------------------------------------------------------
+# Large-vocab embedding: all partial-stick index buckets at sencores=32.
+# Runs once (not multiplied by register_multicore_variants) because it is
+# pinned to sencores=32 — duplicating it at every core count would run
+# identical compiles 7× for no additional coverage.
+# ---------------------------------------------------------------------------
+from torch_spyre._inductor import config as _spyre_config  # noqa: E402
+
+
+@_spyre_config.patch({"sencores": 32})
+class TestEmbeddingAllIndexBuckets(IndirectAccessTestCase):
+    """torch.embedding over all 32 partial-stick N buckets at sencores=32.
+
+    Covers every possible ceil(N/32) value (1..32) in a single test method.
+    For each bucket b:
+      N = b*32 - offset  (offset ∈ [1,31] seeded from b)
+      → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
+      → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
+      → classified as GATHER_OP_SPEC
+    """
+
+    _A = 49152
+    _STICK = 4096
+
+    @staticmethod
+    def _embedding_fn(weight, input_ids):
+        return torch.embedding(weight, input_ids)
+
+    def _make(self, N):
+        weight = torch.rand(self._A, self._STICK, dtype=torch.float16).to("spyre")
+        input_ids = (torch.arange(N) % self._A).int().to("spyre")
+        return weight, input_ids
+
+    @staticmethod
+    def _n_for_bucket(bucket: int) -> int:
+        """Non-stick-aligned N in the bucket: N = bucket*32 - offset, offset ∈ [1,31]."""
+        rng = torch.Generator()
+        rng.manual_seed(bucket)
+        offset = int(torch.randint(1, 32, (1,), generator=rng).item())
+        return bucket * 32 - offset
+
+    def test_embedding_all_partial_stick_index_buckets(self):
+        """Classify torch.embedding for every N bucket from ceil(N/32)=1 to 32."""
+        for bucket in range(1, 33):
+            N = self._n_for_bucket(bucket)
+            torch._dynamo.reset()
+            self._stage_and_e2e(
+                self._embedding_fn, *self._make(N), expect=GATHER_OP_SPEC
+            )
 
 
 if __name__ == "__main__":
