@@ -94,7 +94,6 @@ from .views import matching_dim
 
 logger = get_inductor_logger("propagate_layouts")
 
-
 prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -1491,11 +1490,6 @@ def propagate_spyre_tensor_layouts(
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
                 mutation_target_view = _mutation_target_view(op.layout)
-                logger.info(
-                    f"mutation target type: {type(target).__name__}, "
-                    f"is_view={isinstance(target, ReinterpretView)}, "
-                    f"mutation_target_view is not None={mutation_target_view is not None}"
-                )
                 while isinstance(target, ReinterpretView):
                     target = target.data
                 target_name = target.get_name() if hasattr(target, "get_name") else ""
@@ -1674,28 +1668,24 @@ def propagate_spyre_tensor_layouts(
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
                 )
-                if mutation_target_view is not None and not isinstance(
-                    mutation_target_view.layout, FixedTiledLayout
+                if (
+                    mutation_target_view is not None
+                    and mutation_target_view.get_layout().offset == 0
                 ):
-                    # The mutation's iteration space matches the *view's* host
-                    # shape/rank, not the fully-unwrapped buffer's. Stamp the view
-                    # itself with a FixedTiledLayout pairing its own host
-                    # shape/stride with the resolved target_stl. Later passes
-                    # (propagate_mutation_layouts) that read this view's layout
-                    # see a rank-consistent FixedTiledLayout instead of having
-                    # to re-derive one from real_layout(), which would return
-                    # the buffer's (wrong) rank.
-                    view_layout = mutation_target_view.layout
-                    object.__setattr__(
-                        mutation_target_view,
-                        "layout",
-                        FixedTiledLayout(
-                            view_layout.device,
-                            view_layout.dtype,
-                            view_layout.size,
-                            view_layout.stride,
-                            target_stl,
-                        ),
+                    # Mutation iterates over view's shape/rank, not buffer's
+                    # (rank mismatch would cause crash). Stamp view-derived
+                    # FixedTiledLayout onto op.layout (not the view node
+                    # itself, which may be frozen/shared IR). Only safe for
+                    # pure reshape views (offset==0); sliced views (offset!=0)
+                    # must use real_layout() since SpyreTensorLayout has no
+                    # offset field and Spyre codegen binds base pointer.
+                    view_layout = mutation_target_view.get_layout()
+                    op.layout.view_layout = FixedTiledLayout(
+                        view_layout.device,
+                        view_layout.dtype,
+                        view_layout.size,
+                        view_layout.stride,
+                        target_stl,
                     )
                 continue
             op.decide_layout()
@@ -1810,10 +1800,14 @@ def propagate_mutation_layouts(
     ``key_cache.view(32768, H, D)[slot_idxs] = keys``): the op's own iteration
     space matches the view's shape, not the fully-unwrapped buffer's, so
     real_layout() alone would assign a layout whose rank disagrees with
-    op.data.ranges. propagate_spyre_tensor_layouts already stamps a
-    FixedTiledLayout on that intervening view (pairing its host shape/stride
-    with the resolved device_layout) when it first resolves target_stl for
-    this mutation, so _mutation_target_view need only read it back here.
+    op.data.ranges. propagate_spyre_tensor_layouts already computed a
+    rank-correct FixedTiledLayout for that case (pairing the view's host
+    shape/stride with the resolved device_layout) and recorded it as
+    ``op.layout.view_layout`` -- it is not stamped onto the view node itself,
+    since that node may be a frozen, shared/cached IR node (e.g.
+    ReinterpretView) that other ops also read. op.layout (the
+    MutationLayoutSHOULDREMOVE instance) is owned by this one mutation, so
+    it's a safe place to carry the extra layout alongside real_layout().
     """
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
@@ -1822,8 +1816,7 @@ def propagate_mutation_layouts(
             continue
         if isinstance(n.node.data, (Pointwise, Reduction)):
             real = n.node.layout.real_layout()
-            view = _mutation_target_view(n.node.layout)
-            view_layout = view.get_layout() if view is not None else None
+            view_layout = getattr(n.node.layout, "view_layout", None)
             if isinstance(view_layout, FixedTiledLayout):
                 n.node.layout = view_layout
             elif isinstance(real, FixedTiledLayout):
