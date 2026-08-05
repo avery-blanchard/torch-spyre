@@ -1490,8 +1490,11 @@ def propagate_spyre_tensor_layouts(
                 continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
-                mutation_target_view = (
-                    target if isinstance(target, ReinterpretView) else None
+                mutation_target_view = _mutation_target_view(op.layout)
+                logger.info(
+                    f"mutation target type: {type(target).__name__}, "
+                    f"is_view={isinstance(target, ReinterpretView)}, "
+                    f"mutation_target_view is not None={mutation_target_view is not None}"
                 )
                 while isinstance(target, ReinterpretView):
                     target = target.data
@@ -1675,17 +1678,13 @@ def propagate_spyre_tensor_layouts(
                     mutation_target_view.layout, FixedTiledLayout
                 ):
                     # The mutation's iteration space matches the *view's* host
-                    # shape/rank (e.g. key_cache.view(32768, H, D)[slot_idxs] =
-                    # keys), not the fully-unwrapped buffer's. Stamp the view
+                    # shape/rank, not the fully-unwrapped buffer's. Stamp the view
                     # itself with a FixedTiledLayout pairing its own host
-                    # FixedLayout with the just-resolved device_layout, so
-                    # later passes (propagate_mutation_layouts) that read this
-                    # view's layout see a rank-consistent FixedTiledLayout
-                    # instead of having to re-derive one from real_layout(),
-                    # which would return the buffer's (wrong) rank.
-                    # ReinterpretView is a frozen dataclass; object.__setattr__
-                    # is the pattern PyTorch core itself uses to mutate it
-                    # in-place (see ReinterpretView.__post_init__).
+                    # shape/stride with the resolved target_stl. Later passes
+                    # (propagate_mutation_layouts) that read this view's layout
+                    # see a rank-consistent FixedTiledLayout instead of having
+                    # to re-derive one from real_layout(), which would return
+                    # the buffer's (wrong) rank.
                     view_layout = mutation_target_view.layout
                     object.__setattr__(
                         mutation_target_view,
@@ -1767,28 +1766,27 @@ def propagate_spyre_tensor_layouts(
 
 
 def _mutation_target_view(mutation_layout: MutationLayoutSHOULDREMOVE):
-    """Like ``MutationLayoutSHOULDREMOVE.get_buffer()``, but stop unwrapping at
-    the first view instead of discarding it.
+    """Like ``MutationLayoutSHOULDREMOVE.get_buffer()``, but does not unwrap the views.
 
     ``get_buffer()``/``real_layout()`` walk ``target`` all the way down to the
     raw storage ``Buffer`` (through ``BaseView.unwrap_view()``), so their
     result always has the *buffer's* shape/rank. When the mutation target is
-    itself a view (e.g. ``key_cache.view(32768, H, D)[slot_idxs] = keys``),
+    itself a view,
     the mutating op's own iteration space matches the *view's* shape, not the
     buffer's -- assigning the fully-unwrapped layout produces a rank mismatch
     between ``op.data.ranges`` and ``layout.stride``.
 
-    Mirrors ``get_buffer()``'s ``unwrap_views``, but only unwraps pure wrapper
-    layers (``MutationLayoutSHOULDREMOVE``, ``MutableBox``) and stops at the
-    first ``BaseView``, returning that view object itself instead of recursing
-    into ``unwrap_view()``. Returns ``None`` if there is no intervening view
-    (``real_layout()`` already matches the op's shape in that case).
+    Mirrors upstream``get_buffer()``'s ``unwrap_views``
     """
     target = mutation_layout.target
     while True:
         if isinstance(target, MutationLayoutSHOULDREMOVE):
             target = target.target
         elif isinstance(target, MutableBox):
+            target = target.data
+        elif isinstance(target, TensorBox):
+            target = target.data
+        elif isinstance(target, StorageBox):
             target = target.data
         elif isinstance(target, BaseView):
             return target
