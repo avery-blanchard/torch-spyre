@@ -23,12 +23,14 @@ import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
+    BaseView,
     ComputedBuffer,
     DeviceCopy,
     ExternKernel,
     FallbackKernel,
     FixedLayout,
     InputBuffer,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
     ReinterpretView,
@@ -1488,6 +1490,9 @@ def propagate_spyre_tensor_layouts(
                 continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
+                mutation_target_view = (
+                    target if isinstance(target, ReinterpretView) else None
+                )
                 while isinstance(target, ReinterpretView):
                     target = target.data
                 target_name = target.get_name() if hasattr(target, "get_name") else ""
@@ -1666,6 +1671,33 @@ def propagate_spyre_tensor_layouts(
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
                 )
+                if mutation_target_view is not None and not isinstance(
+                    mutation_target_view.layout, FixedTiledLayout
+                ):
+                    # The mutation's iteration space matches the *view's* host
+                    # shape/rank (e.g. key_cache.view(32768, H, D)[slot_idxs] =
+                    # keys), not the fully-unwrapped buffer's. Stamp the view
+                    # itself with a FixedTiledLayout pairing its own host
+                    # FixedLayout with the just-resolved device_layout, so
+                    # later passes (propagate_mutation_layouts) that read this
+                    # view's layout see a rank-consistent FixedTiledLayout
+                    # instead of having to re-derive one from real_layout(),
+                    # which would return the buffer's (wrong) rank.
+                    # ReinterpretView is a frozen dataclass; object.__setattr__
+                    # is the pattern PyTorch core itself uses to mutate it
+                    # in-place (see ReinterpretView.__post_init__).
+                    view_layout = mutation_target_view.layout
+                    object.__setattr__(
+                        mutation_target_view,
+                        "layout",
+                        FixedTiledLayout(
+                            view_layout.device,
+                            view_layout.dtype,
+                            view_layout.size,
+                            view_layout.stride,
+                            target_stl,
+                        ),
+                    )
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
@@ -1734,6 +1766,36 @@ def propagate_spyre_tensor_layouts(
     _resolve_copy_back_candidates(operations)
 
 
+def _mutation_target_view(mutation_layout: MutationLayoutSHOULDREMOVE):
+    """Like ``MutationLayoutSHOULDREMOVE.get_buffer()``, but stop unwrapping at
+    the first view instead of discarding it.
+
+    ``get_buffer()``/``real_layout()`` walk ``target`` all the way down to the
+    raw storage ``Buffer`` (through ``BaseView.unwrap_view()``), so their
+    result always has the *buffer's* shape/rank. When the mutation target is
+    itself a view (e.g. ``key_cache.view(32768, H, D)[slot_idxs] = keys``),
+    the mutating op's own iteration space matches the *view's* shape, not the
+    buffer's -- assigning the fully-unwrapped layout produces a rank mismatch
+    between ``op.data.ranges`` and ``layout.stride``.
+
+    Mirrors ``get_buffer()``'s ``unwrap_views``, but only unwraps pure wrapper
+    layers (``MutationLayoutSHOULDREMOVE``, ``MutableBox``) and stops at the
+    first ``BaseView``, returning that view object itself instead of recursing
+    into ``unwrap_view()``. Returns ``None`` if there is no intervening view
+    (``real_layout()`` already matches the op's shape in that case).
+    """
+    target = mutation_layout.target
+    while True:
+        if isinstance(target, MutationLayoutSHOULDREMOVE):
+            target = target.target
+        elif isinstance(target, MutableBox):
+            target = target.data
+        elif isinstance(target, BaseView):
+            return target
+        else:
+            return None
+
+
 def propagate_mutation_layouts(
     nodes: list,
 ) -> list:
@@ -1745,6 +1807,15 @@ def propagate_mutation_layouts(
     mutation layout during its initialisation to set up mutation tracking.
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
+
+    The mutation target may itself be a view (e.g.
+    ``key_cache.view(32768, H, D)[slot_idxs] = keys``): the op's own iteration
+    space matches the view's shape, not the fully-unwrapped buffer's, so
+    real_layout() alone would assign a layout whose rank disagrees with
+    op.data.ranges. propagate_spyre_tensor_layouts already stamps a
+    FixedTiledLayout on that intervening view (pairing its host shape/stride
+    with the resolved device_layout) when it first resolves target_stl for
+    this mutation, so _mutation_target_view need only read it back here.
     """
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
@@ -1753,7 +1824,11 @@ def propagate_mutation_layouts(
             continue
         if isinstance(n.node.data, (Pointwise, Reduction)):
             real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout):
+            view = _mutation_target_view(n.node.layout)
+            view_layout = view.get_layout() if view is not None else None
+            if isinstance(view_layout, FixedTiledLayout):
+                n.node.layout = view_layout
+            elif isinstance(real, FixedTiledLayout):
                 n.node.layout = real
             else:
                 rw = n.read_writes
