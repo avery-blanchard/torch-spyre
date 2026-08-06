@@ -95,6 +95,52 @@ std::vector<int32_t> generic_stick_dim_order(int32_t num_dims) {
   return dim_order;
 }
 
+/* Like get_generic_stick_layout, but selects the stick dimension's tiling
+ * partner (the non-stick dim whose tile-count entry sits immediately before
+ * the stick's tile-count slot) by comparing host_size values rather than by
+ * fixed position: the partner is whichever non-stick host dim has the
+ * largest host_size entry (ties broken by lowest host dim index). All other
+ * structural rules match get_generic_stick_layout: the stick dim appears
+ * twice (tile-count slot + final inner-stick slot); all other non-stick dims
+ * appear once, in their original relative order (minus the selected
+ * partner, which moves next to the stick's tile-count slot).
+ *
+ * Ranks 0-2 and the sparse case (trailing -1 sentinel in host_dim_order, per
+ * get_generic_stick_layout's convention) have no meaningful choice to make
+ * or require sentinel-aware handling identical to get_generic_stick_layout,
+ * so they are delegated unchanged. The sparse case is still treated as
+ * "sparse" via a trailing -1 sentinel by default.
+ */
+auto get_generic_stick_layout_by_size(std::vector<int32_t> host_dim_order,
+                                      const std::vector<int64_t>& host_size)
+    -> std::vector<int32_t> {
+  auto rank = host_dim_order.size();
+  if (rank <= 2 || host_dim_order.back() == -1) {
+    return get_generic_stick_layout(host_dim_order);
+  }
+  TORCH_CHECK(rank >= 3 && rank <= 6,
+              "get_generic_stick_layout_by_size: unsupported rank ",
+              std::to_string(rank));
+
+  int32_t stick_dim = host_dim_order[rank - 1];
+  int32_t partner_dim = host_dim_order[0];
+  for (size_t i = 1; i + 1 < rank; i++) {
+    if (host_size[host_dim_order[i]] > host_size[partner_dim]) {
+      partner_dim = host_dim_order[i];
+    }
+  }
+
+  std::vector<int32_t> dim_map;
+  dim_map.reserve(rank + 1);
+  for (size_t i = 0; i + 1 < rank; i++) {
+    if (host_dim_order[i] != partner_dim) dim_map.push_back(host_dim_order[i]);
+  }
+  dim_map.push_back(partner_dim);
+  dim_map.push_back(stick_dim);
+  dim_map.push_back(stick_dim);
+  return dim_map;
+}
+
 static std::vector<int64_t> compute_host_stride(
     const std::vector<int64_t>& host_size) {
   int n = host_size.size();
@@ -129,12 +175,54 @@ static std::vector<int64_t> dim_map_to_stride_map(
   return stride_map;
 }
 
+static void finish_init_from_dim_map(spyre::SpyreTensorLayout& self,
+                                     const std::vector<int32_t>& dim_map,
+                                     bool sparse,
+                                     const std::vector<int64_t>& host_size,
+                                     const std::vector<int64_t>& host_strides) {
+  self.device_size.resize(dim_map.size());
+  auto elems_in_stick = sparse ? 1 : self.elems_per_stick();
+  auto stick_dim = dim_map.back();
+  self.device_size[dim_map.size() - 1] = self.elems_per_stick();
+  for (size_t i = 0; i < dim_map.size() - 1; i++) {
+    auto dim = dim_map[i];
+    if (dim == stick_dim) {
+      self.device_size[i] =
+          sparse ? 1 : (host_size[dim] + elems_in_stick - 1) / elems_in_stick;
+    } else {
+      self.device_size[i] = host_size[dim];
+    }
+  }
+  self.stride_map =
+      dim_map_to_stride_map(dim_map, host_size, host_strides, self.device_size);
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
-  int host_dims = static_cast<int32_t>(host_size.size());
   auto host_strides = compute_host_stride(host_size);
-  auto dim_order = generic_stick_dim_order(host_dims);
-  init(host_size, host_strides, dtype, dim_order);
+  init(host_size, host_strides, dtype);
+}
+
+void SpyreTensorLayout::init(std::vector<int64_t> host_size,
+                             std::vector<int64_t> host_strides,
+                             c10::ScalarType dtype) {
+  auto str_type = torchScalarToString[dtype];
+  const auto [sen_dtype_cpu, sen_dtype_dev] =
+      stringToDTDataFormatPair(str_type);
+  this->device_dtype = sen_dtype_dev;
+
+  if (host_size.size() == 0) {
+    // Degenerate case of 0-dimension tensor (ie, a scalar)
+    this->device_size = {1, this->elems_per_stick()};
+    this->stride_map = {-1, -1};
+    return;
+  }
+
+  auto dim_order =
+      generic_stick_dim_order(static_cast<int32_t>(host_size.size()));
+  auto dim_map = spyre::get_generic_stick_layout_by_size(dim_order, host_size);
+  finish_init_from_dim_map(*this, dim_map, /*sparse=*/false, host_size,
+                           host_strides);
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -153,37 +241,15 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
-    this->device_size.resize(2);
-    this->device_size[0] = 1;
-    this->device_size[1] = this->elems_per_stick();
-    this->stride_map.resize(2);
-    this->stride_map[0] = -1;
-    this->stride_map[1] = -1;
+    this->device_size = {1, this->elems_per_stick()};
+    this->stride_map = {-1, -1};
     return;
   }
 
   // Computing tiling
   auto dim_map = spyre::get_generic_stick_layout(dim_order);
-  this->device_size.resize(dim_map.size());
   bool sparse = dim_order.back() == -1;
-  auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
-  auto stick_dim = dim_map.back();
-  this->device_size[dim_map.size() - 1] = this->elems_per_stick();
-  for (int i = 0; i < dim_map.size() - 1; i++) {
-    auto dim = dim_map[i];
-    if (dim == stick_dim) {
-      if (sparse) {
-        this->device_size[i] = 1;
-      } else {
-        this->device_size[i] =
-            (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
-      }
-    } else {
-      this->device_size[i] = host_size[dim];
-    }
-  }
-  this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
-                                           this->device_size);
+  finish_init_from_dim_map(*this, dim_map, sparse, host_size, host_strides);
 }
 
 std::string SpyreTensorLayout::toString() const {

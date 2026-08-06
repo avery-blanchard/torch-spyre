@@ -31,6 +31,8 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
+std::vector<int32_t> get_generic_stick_layout_by_size(
+    std::vector<int32_t> host_dim_order, const std::vector<int64_t>& host_size);
 
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
@@ -95,10 +97,23 @@ class SpyreTensorLayout {
   /**
    * Construct a SpyreTensorLayout for the argument host_size with a row
    * major order of dimensions using the default device memory layout.
+   * The stick dimension is tiled together with whichever other host
+   * dimension has the largest size (ties broken by lowest host dim index).
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
   SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype) {
     init(host_size, dtype);
+  }
+
+  /**
+   * Construct a SpyreTensorLayout for the argument host_size and
+   * host_strides using the default (size-based) device memory layout.
+   * Used when explicit host_strides are available/needed but no explicit
+   * dim_order is being requested.
+   */
+  SpyreTensorLayout(std::vector<int64_t> host_size,
+                    std::vector<int64_t> host_strides, c10::ScalarType dtype) {
+    init(host_size, host_strides, dtype);
   }
 
   /**
@@ -141,6 +156,9 @@ class SpyreTensorLayout {
   }
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
+
+  void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
+            c10::ScalarType dtype);
 
   void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
             c10::ScalarType dtype, std::vector<int32_t> dim_order);
