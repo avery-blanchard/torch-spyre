@@ -95,50 +95,55 @@ std::vector<int32_t> generic_stick_dim_order(int32_t num_dims) {
   return dim_order;
 }
 
-/* Like get_generic_stick_layout, but selects the stick dimension's tiling
- * partner (the non-stick dim whose tile-count entry sits immediately before
- * the stick's tile-count slot) by comparing host_size values rather than by
- * fixed position: the partner is whichever non-stick host dim has the
- * largest host_size entry (ties broken by lowest host dim index). All other
- * structural rules match get_generic_stick_layout: the stick dim appears
- * twice (tile-count slot + final inner-stick slot); all other non-stick dims
- * appear once, in their original relative order (minus the selected
- * partner, which moves next to the stick's tile-count slot).
- *
- * Ranks 0-2 and the sparse case (trailing -1 sentinel in host_dim_order, per
- * get_generic_stick_layout's convention) have no meaningful choice to make
- * or require sentinel-aware handling identical to get_generic_stick_layout,
- * so they are delegated unchanged. The sparse case is still treated as
- * "sparse" via a trailing -1 sentinel by default.
+/* Build device dimension order (list of host dim indices) for a given layout
+ * policy. The device layout always has the stick dimension appear twice:
+ * once for the tile-count slot, once for the final inner-stick slot (always
+ * last). One non-stick dimension is selected to be tiled together with the
+ * stick (placed adjacent to the stick's tile-count slot). The selection
+ * policy is determined by the tiling_policy parameter:
+ *   - LARGEST_NON_STICK: select the non-stick dim with largest host_size
+ *     (ties broken by lowest host dim index). Ranks 3-6.
+ *   - For ranks 0-2 and sparse (trailing -1), delegates to old positional
+ *     get_generic_stick_layout unchanged.
  */
-auto get_generic_stick_layout_by_size(std::vector<int32_t> host_dim_order,
-                                      const std::vector<int64_t>& host_size)
-    -> std::vector<int32_t> {
+enum class TilingPolicy {
+  LARGEST_NON_STICK,
+};
+
+static std::vector<int32_t> build_device_dim_order(
+    std::vector<int32_t> host_dim_order, const std::vector<int64_t>& host_size,
+    TilingPolicy policy) {
   auto rank = host_dim_order.size();
   if (rank <= 2 || host_dim_order.back() == -1) {
     return get_generic_stick_layout(host_dim_order);
   }
   TORCH_CHECK(rank >= 3 && rank <= 6,
-              "get_generic_stick_layout_by_size: unsupported rank ",
+              "build_device_dim_order: unsupported rank ",
               std::to_string(rank));
 
   int32_t stick_dim = host_dim_order[rank - 1];
-  int32_t partner_dim = host_dim_order[0];
-  for (size_t i = 1; i + 1 < rank; i++) {
-    if (host_size[host_dim_order[i]] > host_size[partner_dim]) {
-      partner_dim = host_dim_order[i];
+  int32_t tiled_dim = host_dim_order[0];
+
+  if (policy == TilingPolicy::LARGEST_NON_STICK) {
+    for (size_t i = 0; i + 1 < rank; i++) {
+      if (host_size[host_dim_order[i]] > host_size[tiled_dim]) {
+        tiled_dim = host_dim_order[i];
+      }
     }
   }
 
-  std::vector<int32_t> dim_map;
-  dim_map.reserve(rank + 1);
+  std::vector<int32_t> device_dims;
+  device_dims.reserve(rank + 1);
+  // Add non-tiled, non-stick dims first
   for (size_t i = 0; i + 1 < rank; i++) {
-    if (host_dim_order[i] != partner_dim) dim_map.push_back(host_dim_order[i]);
+    if (host_dim_order[i] != tiled_dim)
+      device_dims.push_back(host_dim_order[i]);
   }
-  dim_map.push_back(partner_dim);
-  dim_map.push_back(stick_dim);
-  dim_map.push_back(stick_dim);
-  return dim_map;
+  // Then stick tile-count slot, tiled dim, stick inner slot
+  device_dims.push_back(stick_dim);
+  device_dims.push_back(tiled_dim);
+  device_dims.push_back(stick_dim);
+  return device_dims;
 }
 
 static std::vector<int64_t> compute_host_stride(
@@ -220,8 +225,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   auto dim_order =
       generic_stick_dim_order(static_cast<int32_t>(host_size.size()));
-  auto dim_map = spyre::get_generic_stick_layout_by_size(dim_order, host_size);
-  finish_init_from_dim_map(*this, dim_map, /*sparse=*/false, host_size,
+  auto device_dims = build_device_dim_order(dim_order, host_size,
+                                            TilingPolicy::LARGEST_NON_STICK);
+  finish_init_from_dim_map(*this, device_dims, /*sparse=*/false, host_size,
                            host_strides);
 }
 

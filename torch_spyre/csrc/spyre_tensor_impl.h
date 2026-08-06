@@ -31,8 +31,6 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-std::vector<int32_t> get_generic_stick_layout_by_size(
-    std::vector<int32_t> host_dim_order, const std::vector<int64_t>& host_size);
 
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
