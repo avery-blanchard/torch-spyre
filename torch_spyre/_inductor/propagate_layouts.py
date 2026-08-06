@@ -83,6 +83,7 @@ from .pass_utils import (
     indirect_info_from_op,
     is_stick_expr_offset_free,
     iter_var_id,
+    mutation_op_layout,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import matching_dim
@@ -1668,17 +1669,16 @@ def propagate_spyre_tensor_layouts(
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
                 )
-                if (
-                    mutation_target_view is not None
-                    and mutation_target_view.get_layout().offset == 0
-                ):
+                if mutation_target_view is not None:
                     # Mutation iterates over view's shape/rank, not buffer's
                     # (rank mismatch would cause crash). Stamp view-derived
                     # FixedTiledLayout onto op.layout (not the view node
-                    # itself, which may be frozen/shared IR). Only safe for
-                    # pure reshape views (offset==0); sliced views (offset!=0)
-                    # must use real_layout() since SpyreTensorLayout has no
-                    # offset field and Spyre codegen binds base pointer.
+                    # itself, which may be frozen/shared IR). Device-side offset
+                    # handling is delegated to the unconditional stick-dimension
+                    # check (_find_alt_target_stl, above) which already ran and
+                    # either succeeded, raised Unsupported, or reassigned
+                    # target_stl to an alt_stl. Host-side offset is forwarded
+                    # through and flows to device coordinates via MemoryDep.index.
                     view_layout = mutation_target_view.get_layout()
                     op.layout.view_layout = FixedTiledLayout(
                         view_layout.device,
@@ -1686,7 +1686,8 @@ def propagate_spyre_tensor_layouts(
                         view_layout.size,
                         view_layout.stride,
                         target_stl,
-                    )
+                        view_layout.offset,
+                    )  # type: ignore[call-arg]
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
@@ -1755,20 +1756,24 @@ def propagate_spyre_tensor_layouts(
     _resolve_copy_back_candidates(operations)
 
 
-def _mutation_target_view(mutation_layout: MutationLayoutSHOULDREMOVE):
-    """Like ``MutationLayoutSHOULDREMOVE.get_buffer()``, but does not unwrap the views.
+def _mutation_target_buffer_and_view(mutation_layout: MutationLayoutSHOULDREMOVE):
+    """Unwrap MutationLayoutSHOULDREMOVE target to buffer and optional view.
 
-    ``get_buffer()``/``real_layout()`` walk ``target`` all the way down to the
-    raw storage ``Buffer`` (through ``BaseView.unwrap_view()``), so their
-    result always has the *buffer's* shape/rank. When the mutation target is
-    itself a view,
-    the mutating op's own iteration space matches the *view's* shape, not the
-    buffer's -- assigning the fully-unwrapped layout produces a rank mismatch
-    between ``op.data.ranges`` and ``layout.stride``.
+    Returns (buffer, view_or_none) where:
+    - ``buffer`` is the fully-unwrapped raw storage (like ``real_layout()``).
+    - ``view_or_none`` is the first ``BaseView`` encountered, or None if no
+      intervening view exists.
 
-    Mirrors upstream``get_buffer()``'s ``unwrap_views``
+    When the mutation target is itself a view, the mutating op's own iteration
+    space matches the *view's* shape, not the buffer's -- we need both the view
+    (for host shape/stride) and the buffer (for device layout computation).
+
+    Mirrors ``MutationLayoutSHOULDREMOVE.get_buffer()``'s ``unwrap_views``,
+    but tracks the first view encountered and returns it alongside the final
+    buffer.
     """
     target = mutation_layout.target
+    view_or_none = None
     while True:
         if isinstance(target, MutationLayoutSHOULDREMOVE):
             target = target.target
@@ -1779,9 +1784,17 @@ def _mutation_target_view(mutation_layout: MutationLayoutSHOULDREMOVE):
         elif isinstance(target, StorageBox):
             target = target.data
         elif isinstance(target, BaseView):
-            return target
+            if view_or_none is None:
+                view_or_none = target
+            target = target.unwrap_view()
         else:
-            return None
+            return target, view_or_none
+
+
+def _mutation_target_view(mutation_layout: MutationLayoutSHOULDREMOVE):
+    """Wrapper for backward compatibility: return just the view, if any."""
+    _, view = _mutation_target_buffer_and_view(mutation_layout)
+    return view
 
 
 def propagate_mutation_layouts(
@@ -1815,13 +1828,9 @@ def propagate_mutation_layouts(
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
         if isinstance(n.node.data, (Pointwise, Reduction)):
-            real = n.node.layout.real_layout()
-            view_layout = getattr(n.node.layout, "view_layout", None)
-            if isinstance(view_layout, FixedTiledLayout):
-                n.node.layout = view_layout
-            elif isinstance(real, FixedTiledLayout):
-                n.node.layout = real
-            else:
+            try:
+                n.node.layout = mutation_op_layout(n.node)
+            except RuntimeError:
                 rw = n.read_writes
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
@@ -1829,13 +1838,12 @@ def propagate_mutation_layouts(
                 layouts = list(compute_layouts(n.node, output, output_dep, args))
                 n.node.layout = layouts[0]
         elif isinstance(n.node.data, Reduction):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout):
-                n.node.layout = real
-            else:
+            try:
+                n.node.layout = mutation_op_layout(n.node)
+            except RuntimeError:
                 logger.warning(
                     "propagate_mutation_layouts: unhandled mutation Reduction"
-                    f" op {n.node.get_name()}: real_layout is {type(real)}"
+                    f" op {n.node.get_name()}"
                 )
         else:
             logger.warning(
