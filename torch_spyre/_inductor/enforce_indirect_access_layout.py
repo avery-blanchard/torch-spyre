@@ -467,7 +467,11 @@ def _enforce_scatter_destination_layout(
     # the value producer. Resolve and look up the actual buffer.
     target_name, _ = _resolve_mutation_target(scatter_op)
     target_buf = graph.get_buffer(target_name)
-
+    logger.debug(
+        "scatter_destination_check: target_name=%r, target_buf type=%s",
+        target_name,
+        type(target_buf).__name__ if target_buf else "None",
+    )
     value_producer_rewritten = False
     if isinstance(target_buf, ComputedBuffer) and _can_mutate_producer_in_place(
         target_buf, graph.get_output_names()
@@ -506,8 +510,54 @@ def _enforce_scatter_destination_layout(
     # Build substitutions mapping scatter symbols to IndirectAccess markers.
     scatter_access_subs = {sym: IndirectAccess(sym) for sym in scatter_syms}
 
-    # Compute write coordinates and find positions of IndirectAccess markers.
-    write_coords = device_coordinates(output_stl, write_dep, None)
+    # For scatter destination compliance, check against the *target's* layout,
+    # not the output layout. The write side must conform to the target's committed
+    # device layout, which is where the scatter actually writes.
+    target_layout = target_buf.get_layout()
+    target_stl = None
+    if isinstance(target_layout, FixedTiledLayout):
+        target_stl = target_layout.device_layout
+    else:
+        # For non-tiled layouts (e.g., FixedLayout on graph inputs), try to get
+        # the SpyreTensorLayout from the TensorBox's .layouts attribute.
+        layouts = getattr(target_buf, "layouts", None)
+        if layouts:
+            target_stl = next(iter(layouts))
+        else:
+            # Target is a graph input with no device layout propagated yet,
+            # or some other non-tiled layout we cannot enforce on.
+            logger.debug(
+                "scatter_destination_check: skipping %s: mutation target %r has %s "
+                "with no device layout (cannot enforce)",
+                scatter_op.get_name(),
+                target_name,
+                type(target_layout).__name__,
+            )
+            return
+
+    if target_stl is None:
+        # Target is a graph input (FixedLayout) or other non-tiled layout.
+        # We cannot modify graph inputs, so skip enforcement.
+        logger.debug(
+            "scatter_destination_check: skipping %s: mutation target %r has %s "
+            "(not FixedTiledLayout, cannot enforce)",
+            scatter_op.get_name(),
+            target_name,
+            type(target_layout).__name__,
+        )
+        return
+
+    # Shortcut: if target and output have the same device layout, they're compliant.
+    if target_stl == output_stl:
+        logger.debug(
+            "scatter_destination_check: %s target and output layouts match, compliant",
+            scatter_op.get_name(),
+        )
+        return
+
+    # Compute write coordinates against the target's layout and find positions
+    # of IndirectAccess markers.
+    write_coords = device_coordinates(target_stl, write_dep, None)
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
         substituted = coord.xreplace(scatter_access_subs)
@@ -519,7 +569,7 @@ def _enforce_scatter_destination_layout(
     if indirect_stride_idxs:
         # Convert stride_idx (from right) to device_pos (from left).
         indirect_device_pos = sorted(
-            len(output_stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
+            len(target_stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
         )
         # Indirect dims must occupy the first N positions (0, 1, ..., N-1).
         expected_pos = list(range(len(indirect_stride_idxs)))
