@@ -23,6 +23,7 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 from torch._inductor.virtualized import V
 
 from .errors import Unsupported
+from .pass_utils import redistribute_core_slice
 
 
 def find_repeat_vars(index_exprs, var_ranges):
@@ -727,22 +728,24 @@ def align_tensors(
     # slice was actually split (not Integer(0)); reduction-only dims with
     # unsplit old_slice should stay unsplit across all segments.
     # Recompute core_id_to_work_slice based on the final iteration space order.
-    # When symbols are decomposed/reordered by align_tensors, the iteration order
-    # changes, which affects the modular arithmetic for core assignment. Redistributing
-    # the old mapping doesn't account for this order change, causing core misalignment
-    # between LX planning and SDSC codegen. Recomputing ensures consistency.
     new_core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
     if core_id_to_work_slice is not None:
-        from .pass_utils import core_to_slice_mapping
-
-        # Extract dims and splits from new_op_it_space_splits in iteration order
-        dims_list: list[sympy.Symbol] = list(new_op_it_space_splits.keys())
-        splits_list: list[int] = [new_op_it_space_splits[d] for d in dims_list]
-        num_cores = math.prod(splits_list) if splits_list else 1
-        # Recompute using the final iteration space order
-        new_core_id_to_work_slice = core_to_slice_mapping(
-            dims_list, splits_list, num_cores, contiguous_dim=None
-        )
+        # Get the full dimension list in iteration order for correct stride computation.
+        all_dims_list: list[sympy.Symbol] = list(new_op_it_space_splits.keys())
+        for var, old_slice in core_id_to_work_slice.items():
+            segments = remap.get(var)
+            if segments is None:
+                new_core_id_to_work_slice[var] = old_slice
+            else:
+                # Redistribute across all segments. redistribute_core_slice handles
+                # unsplit slices (Integer(0)) correctly by returning all zeros.
+                # Pass all_dims so it can compute correct stride accounting for
+                # dimensions that come before these segments in the iteration order.
+                new_core_id_to_work_slice.update(
+                    redistribute_core_slice(
+                        old_slice, segments, new_op_it_space_splits, all_dims_list
+                    )
+                )
 
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []

@@ -1040,7 +1040,7 @@ def commit_core_mapping(
     order (K/reduction dim last for matmuls, matching
     ``iteration_space_from_op``/``iteration_space``).
     """
-    dims = tuple(dim_splits)
+    dims = tuple(dim_splits.keys())
     splits = tuple(dim_splits.values())
     num_cores = math.prod(splits)
     contiguous_dim = (
@@ -1074,6 +1074,7 @@ def redistribute_core_slice(
     old_slice: sympy.Expr,
     segments: list[sympy.Symbol],
     segment_splits: dict[sympy.Symbol, int],
+    all_dims: list[sympy.Symbol] | None = None,
 ) -> dict[sympy.Symbol, sympy.Expr]:
     """Re-key one var's ``core_id_to_work_slice`` entry across the sub-dims
     ``align_tensors`` decomposed it into.
@@ -1085,12 +1086,24 @@ def redistribute_core_slice(
     ``old_slice`` is the pre-simplification slice expression for that one
     symbol; this walks ``segments`` the same way ``core_to_slice_mapping``
     walks dims -- accumulating ``stride`` innermost to outermost -- starting
-    from the old symbol's own stride so the recombined segments reproduce the
-    same core->work assignment the old single-symbol split described.
+    from the stride of dimensions that come before the segments. If ``all_dims``
+    is provided (the full iteration order), stride is computed correctly even
+    when other dimensions come before these segments.
     """
     stride, split = _parse_core_slice_expr(old_slice)
     if split <= 1:
         return {seg: sympy.Integer(0) for seg in segments}
+
+    # If all_dims provided, compute the stride by multiplying splits of all
+    # dimensions that come before the first segment (innermost to outermost).
+    if all_dims is not None:
+        first_seg_idx = next((i for i, d in enumerate(all_dims) if d in segments), -1)
+        if first_seg_idx >= 0:
+            # Compute stride from dimensions before first_seg_idx
+            stride = 1
+            for i in range(first_seg_idx):
+                stride *= segment_splits.get(all_dims[i], 1)
+
     core_id = sympy.Symbol("core_id")
     result: dict[sympy.Symbol, sympy.Expr] = {}
     for seg in segments:
