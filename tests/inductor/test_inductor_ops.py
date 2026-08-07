@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import math
 import pytest
 import unittest
 import torch
 import torch.nn.functional as F
+
 
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -27,8 +28,10 @@ from utils_inductor import (
     make_param_dict,
     unique_randn_along_dim,
     shapes2key,
+    compare_with_pytorch,
 )
 import utils_inductor
+from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
 
@@ -104,6 +107,25 @@ COMMON_REDUCTION_KEEPDIM_PARAM_SETS = {
     "pad_4d_dim_1": (1, cached_randn((3, 7, 9, 32), scale=0.1)),
     "pad_4d_dim_2": (2, cached_randn((3, 7, 9, 32), scale=0.1)),
     "pad_4d_dim_3": (3, cached_randn((3, 7, 9, 32), scale=0.1)),
+}
+
+
+# Shapes for the shared-input two-reduction regression (see
+# SHARED_INPUT_TWO_REDUCTION_PAIRS). The reduced dim is deliberately never the
+# trailing one: the hazard needs a *non-trailing* reduction, since only then do
+# the per-core work slices of the shared input carry more than one split dim.
+SHARED_INPUT_TWO_REDUCTION_PARAM_SETS = {
+    # The three geometries whose aminmax cases regressed on 2.13 before the
+    # producer-alignment fix (test_aminmax_keepdim{0,1}_aminmax_pad_{2,3,4}d_dim_0).
+    # Unaligned trailing dims put these on the SDSC padding path.
+    "pad_2d_dim_0": (0, cached_randn((63, 129), scale=0.1)),
+    "pad_3d_dim_0": (0, cached_randn((3, 7, 9), scale=0.1)),
+    "pad_4d_dim_0": (0, cached_randn((3, 7, 9, 32), scale=0.1)),
+    # Stick-aligned trailing dim, so the padding path is not involved.
+    "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
+    # Interior dim rather than dim 0, so the split that must agree is not the
+    # outermost one either.
+    "4d_dim_1": (1, cached_randn((6, 7, 12, 256), scale=0.1)),
 }
 
 
@@ -231,6 +253,58 @@ def _get_spyre_mode_support(op):
     )
 
 
+# How an LX-resident buffer appears in generated code, e.g. "allocation={'lx': 0}".
+_LX_ALLOCATION_MARKER = "allocation={'lx'"
+
+
+def _assert_keeps_lx_residency(fn, x, case):
+    """Assert the compiled graph still pins at least one buffer into LX.
+
+    Comparing values cannot detect a regression in
+    ``align_lx_producer_loop_order``: if an LX buffer's producer and consumers
+    stop agreeing on core->slice, ``demote_incoherent_lx_buffers`` clears the LX
+    allocation and the results come out correct anyway -- just served from HBM.
+    Residency is therefore the only observable that separates "aligned" from
+    "demoted", so assert it directly.
+
+    Measured on the shapes in SHARED_INPUT_TWO_REDUCTION_PARAM_SETS: with the
+    aligner in place every case keeps 3 LX allocations (4 for the three-consumer
+    pair); with it removed the pad_* cases drop to 0.
+    """
+    torch._dynamo.reset_code_caches()
+    torch._inductor.codecache.FxGraphCache.clear()
+    _, source_codes = run_and_get_code(
+        torch.compile(fn, dynamic=False), x.to(utils_inductor.DEVICE)
+    )
+    assert source_codes, f"{case}: no generated source captured"
+    assert source_codes[0].count(_LX_ALLOCATION_MARKER) > 0, (
+        f"{case}: no buffer left in LX. The values may still be correct, but an "
+        f"LX buffer whose users disagree on core->slice gets demoted to HBM -- so "
+        f"this is the signature of the producer/consumer loop-order alignment "
+        f"regressing (see align_lx_producer_loop_order, #3374/#3387)."
+    )
+
+
+# Pairs of reductions applied to the *same* input over the same dim. Each pair is
+# built from two separately-dispatched ops rather than from a single fused op such
+# as aminmax, so the graph shape under test survives any change to how a tuple
+# reduction decomposes.
+SHARED_INPUT_TWO_REDUCTION_PAIRS = {
+    # Closest analogue to aminmax, the op that originally surfaced this.
+    "amin_amax": lambda x, dim: (torch.amin(x, dim=dim), torch.amax(x, dim=dim)),
+    # Mixed reduction kinds: an accumulating reduction beside a comparing one.
+    "sum_amax": lambda x, dim: (torch.sum(x, dim=dim), torch.amax(x, dim=dim)),
+    "mean_amin": lambda x, dim: (torch.mean(x, dim=dim), torch.amin(x, dim=dim)),
+    # Three consumers, so a single mismatched pair cannot be masked by the other
+    # two happening to agree.
+    "amin_amax_sum": lambda x, dim: (
+        torch.amin(x, dim=dim),
+        torch.amax(x, dim=dim),
+        torch.sum(x, dim=dim),
+    ),
+}
+
+
 def _compare_op_with_cpu(fn, op, *args, **kwargs):
     support = _get_spyre_mode_support(op)
     if not support["compiled"] and not support["eager"]:
@@ -258,6 +332,8 @@ TO_DTYPE_OP_SHAPES_UNALIGNED = [
     (68,),  # 1D unaligned: 68 > 1 fp16 stick (64 elems), not a multiple of 64
     (4, 16),
     (4, 68),
+    (4, 32),  # exactly 1 fp32 stick -- shape[-1] < 32 check should NOT apply here
+    (4, 63),  # just under 1 fp16 stick, but > 1 fp32 stick (not a multiple of 32)
 ]
 
 TO_DTYPE_OP_SHAPES_ALIGNED = [
@@ -287,7 +363,7 @@ TO_DTYPE_OP_PARAMS_SETS = {
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if src not in (torch.bool, torch.float8_e4m3fn) and dst != torch.bool
+    if src != torch.float8_e4m3fn
 }
 
 
@@ -300,6 +376,7 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     if (
         shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
         or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+        or (src == torch.float32 and shape[-1] < 32)
     )
 ]
 
@@ -308,15 +385,32 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
         cached_randn(shape, dtype=src),
         dst,
     )
-    for src, dst in [(torch.float16, torch.float32)]
+    for src in [torch.float16, torch.float32]
+    for dst in [torch.float16, torch.float32]
+    if src != dst
     for shape in TO_DTYPE_OP_SHAPES
 }
 
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in [(torch.float16, torch.float32)]
+    for src in [torch.float16, torch.float32]
+    for dst in [torch.float16, torch.float32]
+    if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
+
+TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
+
+TO_DTYPE_REDUCTION_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src),
+        dst,
+    )
+    for src in TO_DTYPE_REDUCTION_DTYPES
+    for dst in TO_DTYPE_REDUCTION_DTYPES
+    if src != dst
+    for shape in TO_DTYPE_OP_SHAPES_ALIGNED
+}
 
 # Mixed element arrangements across a graph boundary: one operand is a native
 # fp32 (STANDARD) input, the other is fp16 upcast to fp32 in-graph (staggered
@@ -362,6 +456,39 @@ TO_DTYPE_OP_MIXED_EA_BROADCAST_PARAMS_SETS = {
     for big, small in [((4, 128), (4, 1)), ((2, 4, 64), (2, 4, 1))]
 }
 
+# M x K x N -> [M, K] @ [K, N]
+_SCALED_MM_SHAPES = [
+    (128, 128, 128),
+    (1, 128, 128),
+    (2, 128, 128),
+    (3, 128, 128),
+    (4, 128, 1024),
+    (1, 4096, 4096),
+    (2, 4096, 4096),
+    (4, 4096, 4096),
+]
+
+# scale_a, scale_b
+_SCALED_MM_PARAMS = [
+    (1.0, 1.0, 0.0),  # unit scales, no bias — baseline
+    (2.0, 1.0, 0.0),  # non-unit scale_a
+    (1.0, 3.0, 0.0),  # non-unit scale_b
+    (2.0, 3.0, 0.0),  # both non-unit scales
+    (1.0, 1.0, 5.0),  # unit scales with bias
+    (2.0, 3.0, 0.5),  # non-unit scales with bias
+]
+
+SCALED_MM_TESTS = {
+    f"{shapes2key([shape])}_{sa}_{sb}_{b}": (
+        torch.rand((shape[0], shape[1]), dtype=torch.float16),
+        torch.rand((shape[1], shape[2]), dtype=torch.float16),
+        torch.tensor(sa, dtype=torch.float16),
+        torch.tensor(sb, dtype=torch.float16),
+        torch.tensor(b, dtype=torch.float16),
+    )
+    for shape in _SCALED_MM_SHAPES
+    for sa, sb, b in _SCALED_MM_PARAMS
+}
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
@@ -631,6 +758,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 256),) * 2,
                     ((67, 71, 256),) * 2,
                     ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
                 ]
             ),
         },
@@ -1148,6 +1277,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": INDEX_REDUCTION_KEEPDIM_PARAM_SETS,
         },
+        # Regression guard for the LX producer/consumer core->slice agreement
+        # (#3374, #3387). Two device reductions over one LX-pinned input reducing
+        # a non-trailing dim get a positional core->slice mapping from
+        # core_to_slice_mapping; if the clone that pins the input into LX walks it
+        # in a different dim order than the reductions read it, each core reads a
+        # slice another core wrote and the result is silently wrong. Through 2.12
+        # Inductor's loop_ordering_after_fusion happened to rewrite the clone into
+        # the consumers' order; 2.13 computes that reorder and discards it, which
+        # is what exposed it. aminmax was merely the first op to show it, so these
+        # cases assert the general shape.
+        (
+            "test_shared_input_two_reductions",
+            "test_shared_input_two_reductions_base",
+        ): {
+            "ops_dict": SHARED_INPUT_TWO_REDUCTION_PAIRS,
+            "param_sets": SHARED_INPUT_TWO_REDUCTION_PARAM_SETS,
+        },
         ("test_vector_norm_keepdim0", "test_norm_keepdim0_cpu"): {
             "ops_dict": {
                 "vector_norm": torch.linalg.vector_norm,
@@ -1261,6 +1407,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
             "expect_fail": ["49159x4096"],
+        },
+        # Reversal along a non-stick dim works; the stick (last) dim needs a
+        # gather along the stick dimension, which the backend cannot do, and
+        # a rank-1 flip is always a stick-dim flip. Before issue #3558 the
+        # dim-0 cases compiled clean and returned the last slice broadcast
+        # over the whole axis.
+        ("test_flip", "test_flip_cpu"): {
+            "param_sets": {
+                "2d_dim_0": ([0], cached_randn((67, 256))),
+                "2d_dim_neg2": ([-2], cached_randn((67, 256))),
+                "2d_dim_0_aligned": ([0], cached_randn((64, 256))),
+                "3d_dim_0": ([0], cached_randn((3, 5, 256))),
+                "3d_dim_1": ([1], cached_randn((3, 5, 256))),
+                "3d_dim_0_1": ([0, 1], cached_randn((3, 5, 256))),
+                "4d_dim_0_2": ([0, 2], cached_randn((2, 3, 5, 256))),
+                "2d_size1_dim_0": ([0], cached_randn((1, 256))),
+                "2d_no_dims": ([], cached_randn((67, 256))),
+                # Stick-dim reversals: unsupported, but must fail loudly.
+                "2d_dim_1_stick": ([1], cached_randn((67, 256))),
+                "1d_stick": ([0], cached_randn((256,))),
+            },
+            "expect_fail": ["2d_dim_1_stick", "1d_stick"],
         },
         ("test_transpose_2d", "test_transpose_2d_cpu"): {
             "param_sets": {
@@ -2062,6 +2230,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
             },
+            # PT 2.12: the 3D fp16 (8, 16, 256) shape drifts a single element
+            # (~0.34 abs, 1/32768 elems) past tolerance under exp → sin (CPU
+            # fallback) → exp. 1D/2D pass. This is a PT 2.12 CPU-reference
+            # numerics change (the baseline the test compares against), not a
+            # Spyre kernel regression — one of the pre-existing edge cases
+            # documented and xfailed in commit 3a2d482.
+            "expect_fail": ["3d"],
         },
         (
             "test_arange",
@@ -3131,6 +3306,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            # PT 2.12: the fp16 sum-reduction over the sliced (128, 192, 256)
+            # input drifts a single element (1/16384) by ~0.11 (>0.1 tol). The
+            # reduction path is byte-identical to main; PT 2.12 shifted the CPU
+            # reference numerics enough to push an already-marginal fp16
+            # accumulation over the line. Same class as the cases xfailed in
+            # commit 3a2d482. amax on the same shape passes, so target sum only.
+            "expect_fail": ["sum_3d128_01"],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -4374,6 +4556,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
         (
             "test_round_trip_to_dtype_implicit",
             "test_round_trip_to_dtype_implicit_cpu",
@@ -4381,6 +4567,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
+        (
+            "test_reduction_with_to_dtype",
+            "test_reduction_with_to_dtype_cpu",
+        ): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": TO_DTYPE_REDUCTION_PARAMS_SETS,
         },
         (
             "test_round_trip_to_dtype_implicit_invalid",
@@ -4484,6 +4677,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                 ),
+            },
+        },
+        ("test_avg_pool2d", "test_avg_pool2d_base"): {
+            "ops_dict": {
+                "k2s2": lambda x: F.avg_pool2d(x, kernel_size=2, stride=2),
+                "k4s4": lambda x: F.avg_pool2d(x, kernel_size=4, stride=4),
+            },
+            "param_sets": {
+                "1x3x8x8": (cached_randn((1, 3, 8, 8)),),
+                "1x3x24x24": (cached_randn((1, 3, 24, 24)),),
+                "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
             },
         },
         ("test_repeat", "test_repeat_cpu"): {
@@ -4603,6 +4807,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim0": (0, cached_randn((2, 4, 8, 64))),
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
+        },
+        ("test_fp8_scaled_mm", "test_fp8_scaled_mm_cpu"): {
+            "param_sets": SCALED_MM_TESTS,
         },
         (
             "test_multiops_split",
@@ -4732,6 +4939,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         self.compare_with_cpu(op, a, b)
+
+    def test_binary_op_stick_crossing_last_dim(self):
+        """A pointwise binary op whose stick (last) dim spans multiple sticks
+        with an extent coprime with the committed core split must stay
+        bit-exact.
+
+        When the stick dim occupies S>1 sticks and the outer dims are too small
+        to absorb the core split, work division splits the stick dim across S
+        cores. If the element count N is coprime with S (e.g. N=67 over S=2
+        sticks, or N=130 over S=3), the iteration-space realignment used to
+        re-intersect that split against N instead of S and collapse it to a
+        single core -- the layout the backend then miscompiled, corrupting
+        every element past the first stick.
+        """
+
+        # neg keeps both add operands LX-resident: the collapsed single-core
+        # layout only misaddresses the second stick when its operands come from
+        # LX (single per-core base). Feeding the add plain graph inputs would
+        # keep them in HBM, whose per-core addressing masks the bug even when
+        # the split still collapses.
+        def fn(x, y):
+            return torch.neg(x) + torch.neg(y)
+
+        # Last dim > 64 and coprime with the core split; outer dims kept small
+        # so work division divides the stick dim, not the outer.
+        shapes = [
+            (67,),  # 1D, 2 sticks, odd -> gcd(2,67)=1
+            (127,),  # 1D, 2 sticks, odd
+            (130,),  # 1D, 3 sticks, gcd(3,130)=1
+            (193,),  # 1D, 4 sticks, gcd(4,193)=1
+            (3, 67),  # 2D, stick dim split across cores
+            (4, 193),  # 2D, 4-stick coprime last dim
+            (2, 3, 67),  # 3D
+            (3, 5, 127),  # 3D
+            (2, 3, 2, 127),  # 4D
+        ]
+
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                n = math.prod(shape)
+                # Distinct exact-fp16 integer patterns so a per-element
+                # permutation or a dropped trailing stick shows up as a value
+                # mismatch rather than washing out.
+                x = (torch.arange(n) % 251).to(torch.float16).reshape(shape)
+                y = ((torch.arange(n) + 100) % 251).to(torch.float16).reshape(shape)
+
+                result = torch.compile(fn, dynamic=False)(
+                    x.to("spyre"), y.to("spyre")
+                ).cpu()
+                torch.testing.assert_close(result, fn(x, y))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):
@@ -4904,6 +5161,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_tuple_reduce_keepdim1_cpu(self, op, dim, x):
         _compare_op_with_cpu(lambda x: op(x, dim=dim, keepdim=True), op, x)
+
+    def test_shared_input_two_reductions_base(self, op, dim, x):
+        """Two or more reductions over one shared input, reducing a non-trailing dim.
+
+        A wrong core->slice agreement shows up as values from another core's
+        slice, so this compares every output element rather than just a shape.
+
+        Compiled path only: LX planning is an Inductor-side pass, and Spyre eager
+        does not implement these reductions (they return NotImplemented).
+
+        Values are only half the guard -- see _assert_keeps_lx_residency for why
+        the LX allocation itself has to be asserted too.
+        """
+
+        def fn(t):
+            return op(t, dim)
+
+        self.compare_with_cpu(fn, x, run_eager=False, cpu_compile=True)
+        _assert_keeps_lx_residency(fn, x, self.id().rsplit(".", 1)[-1])
 
     def test_norm_keepdim0_cpu(self, op, ord, dim, x):
         _compare_op_with_cpu(lambda x: op(x, ord=ord, dim=dim, keepdim=False), op, x)
@@ -5427,6 +5703,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
         self.compare_with_cpu(lambda x: x.t().contiguous(), x, run_eager=False)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_flip_cpu(self, dims, x):
+        # Spyre decomposes aten.flip into index_select gathers with a
+        # descending index (see spyre_flip); the arange building that index
+        # falls back to CPU, hence the filtered FallbackWarning.
+        self.compare_with_cpu(lambda x: torch.flip(x, dims), x)
+
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
@@ -5595,7 +5878,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(dst, src):
             dst = dst.clone()
             result = op(dst, src)
-            assert id(result) == id(dst)
+            assert result.data_ptr() == dst.data_ptr()
             return result
 
         # Eager mode hangs/crashes when executing inplace operations on Spyre tensors
@@ -6205,6 +6488,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_round_trip_to_dtype_copy_cpu(self, s, dst_dtype):
+        d = torch.zeros_like(s, dtype=dst_dtype)
+
+        def fn(d, s):
+            d.copy_(s)
+            return d.to(s.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            d,
+            s,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
     def test_round_trip_to_dtype_cpu(self, op, x, dst_dtype):
         def fn(op, x, dst_dtype):
             y = x.to(dst_dtype)
@@ -6233,6 +6531,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             op,
             x,
             y,
+            dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_reduction_with_to_dtype_cpu(self, op, x, dst_dtype):
+        def fn(op, x, dst_dtype):
+            return op(x, dtype=dst_dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
             dst_dtype,
             cpu_compile=False,
             run_eager=False,
@@ -6316,6 +6627,89 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert torch.equal(output_cpu, expected_output), (
             f"Bool conversion failed: got {output_cpu.sum().item()}/{64} True, expected {expected_output.sum().item()}/{64}"
         )
+
+    def test_bool_fp16_src_to_fp32_cpu(self):
+        # A bool produced from an fp16 comparison is physically SEN169_FP16.
+        # Converting it to fp32 must resolve via DL16TOFP32_OP (issue #1482).
+        def fn(x, y):
+            return (x > y).to(dtype=torch.float32)
+
+        x = cached_randn((64,), dtype=torch.float16)
+        y = cached_randn((64,), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    def test_bool_fp32_src_to_fp32_cpu(self):
+        # A bool produced from an fp32 comparison is physically IEEE_FP32.
+        # Converting it to fp32 is an identity reinterpret. Asserting on the
+        # op_spec debug log (not just numeric correctness) confirms Spyre
+        # actually emits IDENTITY_OP for this conversion, rather than e.g.
+        # silently falling back to CPU and happening to match.
+        def fn(x, y):
+            return (x > y).to(dtype=torch.float32)
+
+        x = cached_randn((64,), dtype=torch.float32)
+        y = cached_randn((64,), dtype=torch.float32)
+        with self.assertLogs("spyre.inductor.spyre_kernel", level="DEBUG") as logs:
+            self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+        self.assertTrue(
+            any("op_spec: identity," in message for message in logs.output),
+            f"Expected an identity op_spec, got: {logs.output}",
+        )
+
+    def test_bool_fp32_src_to_fp16_cpu(self):
+        # A bool produced from an fp32 comparison is physically IEEE_FP32.
+        # Converting it to fp16 must resolve via FP32TODL16_OP.
+        def fn(x, y):
+            return (x > y).to(dtype=torch.float16)
+
+        x = cached_randn((64,), dtype=torch.float32)
+        y = cached_randn((64,), dtype=torch.float32)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    def test_bool_host_to_fp32_cpu(self):
+        # Literal repro from issue #1482: a host-created bool tensor (always
+        # physically SEN169_FP16 on device) converted to fp32.
+        def fn(x):
+            return x.to(dtype=torch.float32)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_bool_host_reshaped_to_fp32_cpu(self):
+        # Same as test_bool_host_to_fp32_cpu, but through a reshape view first.
+        def fn(x):
+            return x.reshape(8, 8).to(dtype=torch.float32)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_bool_host_to_fp16_cpu(self):
+        # Host-created bool tensors are DMA-copied (always physically
+        # SEN169_FP16 on device, same as test_bool_host_to_fp32_cpu above).
+        # Unlike the fp32 case, converting to float16 resolves via
+        # IDENTITY_OP -- a pure byte copy, no value computation -- so there's
+        # no output-ordering convention for a DMA copy to mismatch against.
+        def fn(x):
+            return x.to(dtype=torch.float16)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_avg_pool2d_base(self, op, x):
+        # Spyre stores C as the stick (innermost) dim, so the op must see a
+        # physically-NHWC tensor viewed as NCHW.  Pass an NHWC-contiguous input
+        # (its layout is preserved by .to("spyre")) and do the NHWC→NCHW permute
+        # inside fn so the compiled graph carries it — this lets us use the
+        # standard compare_with_cpu harness (cpu fn(x_nhwc) == op(x)).
+        #
+        # run_eager=False: Spyre has no eager avg_pool2d kernel
+        # (aten::avg_pool2d.out is unregistered for the 'spyre' backend), so only
+        # the compiled path is valid for this op.
+        def fn(t):
+            return op(t.permute(0, 3, 1, 2))
+
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
@@ -6489,7 +6883,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
+        """Test _scaled_mm with FP8 inputs."""
+
+        def spyre_fn(a, b, scale_a, scale_b, bias):
+            q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
+            q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale_b)
+            return torch.ops.aten._scaled_mm(
+                q_a,
+                q_b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                bias=bias,
+                out_dtype=torch.float16,
+            )
+
+        def pytorch_fn(a, b, scale_a, scale_b, bias):
+            q_a = (
+                (a / scale_a)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            q_b = (
+                (b / scale_b)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            return (q_a @ q_b) * (scale_a * scale_b) + bias
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, a, b, scale_a, scale_b, bias, atol=0.1, rtol=0.1
+        )
+
     def test_is_nonzero_cpu(self, *args):
         """Test torch.is_nonzero on Spyre tensors"""
         if len(args) == 1:

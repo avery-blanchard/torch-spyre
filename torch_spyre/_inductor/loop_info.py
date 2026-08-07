@@ -21,11 +21,97 @@ and consumed by the scheduler, kernel codegen, and buffer-propagation pass.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+
+import sympy
 
 if TYPE_CHECKING:
-    import sympy
     from torch._inductor.ir import ComputedBuffer
+
+
+@dataclass(frozen=True)
+class ReductionPlan:
+    """Planned shape/identity/nesting data for a tiled-reduction op.
+
+    Computed once during planning (``_plan_tiling_propagation``) from pure
+    functions of already-known shape data, and consumed by transformation's
+    reduction-machinery pass to build the actual accumulator/fill/combine
+    buffers -- the objects themselves don't exist until then, only the
+    decisions about their shape/identity/nesting front-load.
+
+    Attributes
+    ----------
+    reduction_type:
+        ``op.data.reduction_type`` (e.g. ``"sum"``, ``"max"``).
+    identity:
+        Monoid identity value for ``reduction_type``, from
+        ``_reduction_identity_value``.
+    is_nested:
+        True when an outer level tiles an output dim and an inner level
+        tiles a reduction dim, requiring separate tile-sized and full-sized
+        accumulators (see ``_compute_fill_loop_info``). False for a flat
+        (reduction-dim-only) tiling.
+    full_output_ranges:
+        Full (pre-division) output shape for the accumulation buffer --
+        planning runs before ``_apply_plan`` divides ``op.data.ranges``, so
+        this is just ``op.data.ranges`` at planning time, unchanged.
+    per_tile_ranges:
+        Per-outer-tile output shape: ``op.data.ranges`` at planning time with
+        every tiled dim divided by its ``loop_count`` (mirrors the division
+        ``_divide_ranges`` performs later, in place, during transformation).
+    outer_fill_loop_info:
+        ``CoarseTileInfo`` covering only the outer output-dim levels, to
+        stamp on the fill op for a nested tiling (``_compute_fill_loop_info``).
+        ``None`` for a flat tiling, where the fill runs once before all loops.
+        Its ``loop_group_id`` is planning-time, pre-offset numbering --
+        transformation must re-slice it from the op's own real, stamped
+        ``loop_group_id`` before use (see ``_propagate_tiled_reduction_op``).
+    """
+
+    reduction_type: str
+    identity: float | int
+    is_nested: bool
+    full_output_ranges: list[sympy.Expr]
+    per_tile_ranges: list[sympy.Expr]
+    outer_fill_loop_info: "CoarseTileInfo | None"
+
+
+@dataclass(frozen=True)
+class PropagationPlan:
+    """Decision for how a tiled op's result crosses its loop boundary.
+
+    Computed once during planning (``_plan_tiling_propagation``) and
+    consumed by transformation's fixed pass sequence, which only acts on
+    these decisions -- it never makes new ones.
+
+    Attributes
+    ----------
+    kind:
+        ``"loop_internal"``: the op's own buffer is scratch reused every
+        iteration; its write must not advance at any level.
+        ``"copy_out"``: the op's result is consumed outside its loop group
+        (or is a graph output) and needs a full-sized buffer + copy op.
+        ``"reduction"``: the op is a Reduction tiled over a reduction dim;
+        see ``reduction`` for the accumulator/fill/combine shape decisions.
+    full_ranges:
+        Full (pre-division) iteration ranges for the copy-out's full buffer.
+        Only set when ``kind == "copy_out"``.
+    reduction:
+        Shape/identity/nesting decisions for the reduction machinery. Only
+        set when ``kind == "reduction"``.
+    outside_consumer_names:
+        Names (not object references -- see ``_find_outside_consumers``, and
+        the module docstring on name stability) of ComputedBuffers outside
+        this op's own outermost loop group that read this op's result.
+    is_graph_output:
+        True if this op's buffer name appears in the graph's output names.
+    """
+
+    kind: Literal["loop_internal", "copy_out", "reduction"]
+    full_ranges: list[sympy.Expr] | None = None
+    reduction: ReductionPlan | None = None
+    outside_consumer_names: tuple[str, ...] = ()
+    is_graph_output: bool = False
 
 
 @dataclass
@@ -50,12 +136,43 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
+    tiled_dims_per_read:
+        One entry per read dependency in ``op.get_read_writes().reads`` (in
+        that iteration order, filtered to ``MemoryDep`` -- same positional
+        convention the deleted ``tile_advance_exprs`` used). Each entry is a
+        list of per-nesting-level ``(op_dim_index, extent)`` pairs,
+        outermost level first (matching ``loop_count``/``loop_tiled_dims``):
+        the host-range positional dims (or ``n_output_dims + reduction_pos``
+        for reduction dims, matching ``loop_tiled_dims``'s own numbering)
+        tiled *for this dependency* at that level, paired with that level's
+        own tile extent: for a dim tiled at more than one level, an outer
+        level's extent equals the final (innermost) extent times the
+        product of every more-inner level's own count that also tiles that
+        dim.
+        An empty per-level list means the dep is loop-invariant at that
+        level. This is a tiling *decision*, not a substituted index
+        expression -- deferred substitution into the dependency's actual
+        (possibly later-rewritten) index expression happens in
+        spyre_kernel.py at OpSpec/TensorArg construction time, when the
+        index is guaranteed final.
+    output_tiled_dims:
+        The analogous per-level ``(op_dim_index, extent)`` list for this
+        op's own write dependency. Defaults to ``[]`` (no levels tiled).
+    propagation:
+        Planned decision for how this op's result crosses its loop
+        boundary, computed by ``_plan_tiling_propagation``. ``None`` until
+        that planning stage runs (or for ops it doesn't cover).
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    tiled_dims_per_read: list[list[list[tuple[int, sympy.Expr]]]] = field(
+        default_factory=list
+    )
+    output_tiled_dims: list[list[tuple[int, sympy.Expr]]] = field(default_factory=list)
+    propagation: "PropagationPlan | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -69,15 +186,20 @@ _SPYRE_METADATA_ATTRS = (
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
+    # Links a tiled reduction op to its accumulation buffer; set by
+    # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
+    # insert_restickify.py to overwrite accum_full's generic layout.
+    "_tiled_reduction_accum_name",
 )
 
 
 def copy_op_metadata(src: "ComputedBuffer", dst: "ComputedBuffer") -> None:
-    """Copy all Spyre pass metadata from src to dst.
+    """Copy non-provenance Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
     dim_hints, work-division hint metadata, and coarse-tiling attrs are not
-    silently dropped.
+    silently dropped. Source provenance is owned by the helpers in
+    ``provenance.py`` and is deliberately excluded from this bulk copy.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):
