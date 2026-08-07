@@ -48,7 +48,11 @@ def core_to_slice_mapping(
         )
 
     dim_order = list(range(len(dims)))
-    if contiguous_dim is not None and splits[contiguous_dim] > 1:
+    if (
+        contiguous_dim is not None
+        and 0 <= contiguous_dim < len(dims)
+        and splits[contiguous_dim] > 1
+    ):
         dim_order.remove(contiguous_dim)
         dim_order.insert(0, contiguous_dim)
 
