@@ -531,11 +531,25 @@ def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: list[Dict[str, list[sympy.Expr]]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    core_id_to_work_slice: "dict[sympy.Symbol, sympy.Expr] | None" = None,
 ) -> tuple[
-    (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
+    (
+        dict[sympy.Symbol, tuple[sympy.Expr, int]],
+        list[dict[str, list[sympy.Expr]]],
+        dict[sympy.Symbol, sympy.Expr],
+    )
 ]:
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
+
+    ``core_id_to_work_slice``, if given, is the pre-simplification symbol ->
+    core-slice-expr mapping (see pass_utils.commit_core_mapping). Any symbol
+    this function factors into multiple new symbols (via ``remap``) has its
+    slice expression redistributed across those new symbols so the mapping
+    stays consistent with the returned iteration space; symbols that pass
+    through unchanged keep their existing entry. Returned as the third tuple
+    element, keyed by the *new* symbols (absent entries default to 0 --
+    unsplit).
     """
 
     # Concretize range values for the algorithm: align_tensors performs
@@ -550,7 +564,7 @@ def align_tensors(
     orig_ranges = {var: val[0] for var, val in iteration_space.items()}
     # local import: pass_utils imports compute_coordinates/matching_dim from
     # this module, so importing at module scope would create a cycle.
-    from .pass_utils import finite_upper_or_none
+    from .pass_utils import finite_upper_or_none, redistribute_core_slice
 
     def _bounded_or_hint(expr, hint):
         """Return ``expr`` unless it's an unbounded symbolic expression.
@@ -704,6 +718,23 @@ def align_tensors(
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
+
+    # Redistribute core_id_to_work_slice across whatever new symbols each old
+    # var was factored into (remap), so the mapping stays keyed correctly
+    # against the iteration space this function returns. Vars with no entry
+    # in remap passed through unchanged (the `else` branch above) and keep
+    # their existing slice, if any.
+    new_core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
+    if core_id_to_work_slice is not None:
+        for var, old_slice in core_id_to_work_slice.items():
+            segments = remap.get(var)
+            if segments is None:
+                new_core_id_to_work_slice[var] = old_slice
+            else:
+                new_core_id_to_work_slice.update(
+                    redistribute_core_slice(old_slice, segments, new_op_it_space_splits)
+                )
+
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
@@ -821,8 +852,11 @@ def align_tensors(
         for k, v in new_var_ranges.items()
         if k not in indirect_syms
     }
+    new_core_id_to_work_slice = {
+        k: v for k, v in new_core_id_to_work_slice.items() if k not in indirect_syms
+    }
 
-    return new_iteration_space, new_tensors
+    return new_iteration_space, new_tensors, new_core_id_to_work_slice
 
 
 def tiling_expr_to_device_expr(

@@ -1053,6 +1053,58 @@ def commit_core_mapping(
     op.core_id_to_work_slice = slice_by_index_coeff(by_symbol, write_index, read_index)
 
 
+def _parse_core_slice_expr(expr: sympy.Expr) -> tuple[int, int]:
+    """Recover the ``(stride, split)`` pair ``core_to_slice_mapping`` encoded
+    into ``expr``, one of its three possible shapes: ``Integer(0)``,
+    ``Mod(core_id, split)`` (stride == 1), or
+    ``Mod(floor(core_id/stride), split)``.
+    """
+    if expr == 0:
+        return 1, 1
+    inner, split = expr.args
+    if inner.func is sympy.floor:
+        coeff, _ = inner.args[0].as_coeff_Mul()
+        stride = int(1 / coeff)
+    else:
+        stride = 1
+    return stride, int(split)
+
+
+def redistribute_core_slice(
+    old_slice: sympy.Expr,
+    segments: list[sympy.Symbol],
+    segment_splits: dict[sympy.Symbol, int],
+) -> dict[sympy.Symbol, sympy.Expr]:
+    """Re-key one var's ``core_id_to_work_slice`` entry across the sub-dims
+    ``align_tensors`` decomposed it into.
+
+    ``align_tensors`` can factor a single iteration-space symbol's range (and
+    the split factor riding on it) across several new symbols -- ``segments``
+    (innermost first, matching ``remap[var]``) with per-segment split factors
+    in ``segment_splits`` (``align_tensors``'s ``new_op_it_space_splits``).
+    ``old_slice`` is the pre-simplification slice expression for that one
+    symbol; this walks ``segments`` the same way ``core_to_slice_mapping``
+    walks dims -- accumulating ``stride`` innermost to outermost -- starting
+    from the old symbol's own stride so the recombined segments reproduce the
+    same core->work assignment the old single-symbol split described.
+    """
+    stride, split = _parse_core_slice_expr(old_slice)
+    if split <= 1:
+        return {seg: sympy.Integer(0) for seg in segments}
+    core_id = sympy.Symbol("core_id")
+    result: dict[sympy.Symbol, sympy.Expr] = {}
+    for seg in segments:
+        seg_split = segment_splits.get(seg, 1)
+        if seg_split <= 1:
+            result[seg] = sympy.Integer(0)
+        elif stride == 1:
+            result[seg] = sympy.Mod(core_id, seg_split)
+        else:
+            result[seg] = sympy.Mod(sympy.floor(core_id / stride), seg_split)
+        stride *= seg_split
+    return result
+
+
 # The following restickify helpers are used only by the restickify
 # but are here to avoid circular dependences in those files
 

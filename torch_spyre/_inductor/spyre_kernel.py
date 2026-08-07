@@ -1467,15 +1467,17 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
     it_space = op_spec.iteration_space
 
-    new_op_space_splits, new_tensors = align_tensors(
+    new_op_space_splits, new_tensors, new_core_id_to_work_slice = align_tensors(
         it_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
             for arg in op_spec.args
         ],
         indirect_sizes,
+        op_spec.core_id_to_work_slice,
     )
     op_spec.iteration_space = new_op_space_splits
+    op_spec.core_id_to_work_slice = new_core_id_to_work_slice
 
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]

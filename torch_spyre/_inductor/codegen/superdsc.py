@@ -1196,6 +1196,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
+        # The pool hardware accumulates the full kernel window on each core.
+        # Splitting ki/kj across cores produces partial sums, giving wrong results.
+        for _k_sym in (Symbol("ki"), Symbol("kj")):
+            if _k_sym in dim_splits:
+                dim_splits[_k_sym] = 1
+                work_slices[_k_sym] = 1
+                core_id_to_work_slice[_k_sym] = Integer(0)
+        num_cores = math.prod(dim_splits.values())
 
     # Defensive: every sdsc_iteration_space dim must have a slice entry. All
     # known injection sites (mb_sym, stick_sym, missing_dim, RESTICKIFY
