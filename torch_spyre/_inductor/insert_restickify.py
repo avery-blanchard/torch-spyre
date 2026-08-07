@@ -48,8 +48,8 @@ logger = get_inductor_logger("insert_restickify")
 
 def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
     return FixedTiledLayout(
-        layout.device, layout.dtype, layout.size, layout.stride, stl
-    )
+        layout.device, layout.dtype, layout.size, layout.stride, stl, layout.offset
+    )  # type: ignore[call-arg]
 
 
 def _record_restickify(
