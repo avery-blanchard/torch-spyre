@@ -23,7 +23,6 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 from torch._inductor.virtualized import V
 
 from .errors import Unsupported
-from .pass_utils import redistribute_core_slice
 
 
 def find_repeat_vars(index_exprs, var_ranges):
@@ -730,6 +729,8 @@ def align_tensors(
     # Recompute core_id_to_work_slice based on the final iteration space order.
     new_core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
     if core_id_to_work_slice is not None:
+        from .pass_utils import redistribute_core_slice
+
         # Get the full dimension list in iteration order for correct stride computation.
         all_dims_list: list[sympy.Symbol] = list(new_op_it_space_splits.keys())
         for var, old_slice in core_id_to_work_slice.items():
