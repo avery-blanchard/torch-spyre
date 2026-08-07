@@ -872,12 +872,14 @@ def _commit_op_core_mapping(op: Operation, coeff_splits: tuple[dict, dict]) -> N
     for the LX-planning commit sites that write ``op.op_it_space_splits``
     directly instead of going through ``apply_splits``.
     """
+    from torch._inductor.dependencies import StarDep
+
     rw = op_read_writes(op)
     write = next(iter(rw.writes), None)
-    if write is None:
+    if write is None or isinstance(write, StarDep):
         return
     write_index = write.index
-    first_read = next(iter(rw.reads), None)
+    first_read = next((r for r in rw.reads if not isinstance(r, StarDep)), None)
     read_index = first_read.index if first_read is not None else write_index
     it_space = iteration_space_from_op(op)
     dim_splits = apply_splits_from_index_coeff(
