@@ -18,6 +18,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 
+import regex
 import torch
 import sympy
 from sympy import Expr
@@ -481,15 +482,43 @@ def _build_indirect_store_subs(
         read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
         dep_by_name = {d.name: d for d in read_deps}
 
+        # Recover each symbol's relative creation order from its numeric
+        # tmp<N> suffix. Inductor's LoopBody.add_indirect assigns indirect
+        # placeholder symbols with a monotonic counter as output_indexer
+        # iterates over `indices` in position order (lowering.py's
+        # index_output_size_and_inner_fn), and the placeholder is later
+        # substituted 1:1 with the real tmp<N> CSE variable. So sorting by
+        # suffix recovers the same order as `indices` -- free_symbols itself
+        # is an unordered set and cannot be zipped directly.
+        def _sym_sort_key(s: sympy.Symbol) -> tuple[int, int, str]:
+            m = regex.search(r"(\d+)$", s.name)
+            return (0, int(m.group(1)), "") if m else (1, 0, s.name)
+
+        ordered_syms = sorted(scatter_index_syms, key=_sym_sort_key)
+
+        # CSE can dedupe two indices entries that load the same buffer at the
+        # same index expression, so len(ordered_syms) may be < len(indices).
+        # Only pair positionally when counts agree -- pairing at a mismatched
+        # count would silently attribute one index buffer's symbol to
+        # another, which is the exact bug this replaces.
         subs = {}
-        for index_buf_name in index_buf_names:
-            if index_buf_name not in dep_by_name:
-                continue
-            index_dep = dep_by_name[index_buf_name]
-            # Map scatter symbols to this index buffer.
-            for sym in scatter_index_syms:
-                if sym not in subs:
-                    subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
+        if len(ordered_syms) == len(index_buf_names):
+            for sym, index_buf_name in zip(ordered_syms, index_buf_names):
+                if index_buf_name not in dep_by_name:
+                    continue
+                index_dep = dep_by_name[index_buf_name]
+                subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
+        else:
+            logger.warning(
+                "_build_indirect_store_subs: %d scatter symbols but %d index "
+                "buffers (CSE likely deduped identical index loads) -- "
+                "cannot safely pair symbols to buffers positionally; "
+                "falling back to placeholder subs. symbols=%s indices=%s",
+                len(ordered_syms),
+                len(index_buf_names),
+                ordered_syms,
+                index_buf_names,
+            )
         if subs:
             return subs, None
 
