@@ -652,6 +652,7 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
     def _make_symbolic_op_spec(self) -> OpSpec:
         c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
         s0 = sympy.Symbol("s0", integer=True, positive=True)
+        core_id = sympy.Symbol("core_id")
         coords = [c_col // 64, c_row, sympy.Mod(c_col, 64)]
 
         def _tensor_arg(is_input, arg_index, hbm_base):
@@ -664,7 +665,7 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
                 allocation={"hbm": hbm_base},
             )
 
-        return OpSpec(
+        op_spec = OpSpec(
             op="add",
             is_reduction=False,
             iteration_space={
@@ -679,6 +680,13 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
             op_info={},
             symbolic_dim_bounds={"s0": (512, 64)},
         )
+        # Populate core_id_to_work_slice: c_row is split across NUM_CORES,
+        # c_col is unsplit (split=1).
+        op_spec.core_id_to_work_slice = {
+            c_row: sympy.Mod(core_id, self._NUM_CORES),
+            c_col: sympy.Integer(0),
+        }
+        return op_spec
 
     def test_per_core_symbolic_addresses_emitted(self):
         op_spec = self._make_symbolic_op_spec()

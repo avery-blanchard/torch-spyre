@@ -855,6 +855,10 @@ def align_tensors(
     new_core_id_to_work_slice = {
         k: v for k, v in new_core_id_to_work_slice.items() if k not in indirect_syms
     }
+    # Ensure consistency: every iteration-space symbol should have a slice entry.
+    # For any missing (shouldn't happen, but defensive), default to unsplit (0).
+    for sym in new_iteration_space:
+        new_core_id_to_work_slice.setdefault(sym, sympy.Integer(0))
 
     return new_iteration_space, new_tensors, new_core_id_to_work_slice
 
