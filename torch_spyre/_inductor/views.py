@@ -564,7 +564,7 @@ def align_tensors(
     orig_ranges = {var: val[0] for var, val in iteration_space.items()}
     # local import: pass_utils imports compute_coordinates/matching_dim from
     # this module, so importing at module scope would create a cycle.
-    from .pass_utils import finite_upper_or_none, redistribute_core_slice
+    from .pass_utils import finite_upper_or_none
 
     def _bounded_or_hint(expr, hint):
         """Return ``expr`` unless it's an unbounded symbolic expression.
@@ -723,17 +723,26 @@ def align_tensors(
     # var was factored into (remap), so the mapping stays keyed correctly
     # against the iteration space this function returns. Vars with no entry
     # in remap passed through unchanged (the `else` branch above) and keep
-    # their existing slice, if any.
+    # their existing slice, if any. IMPORTANT: only redistribute if the old
+    # slice was actually split (not Integer(0)); reduction-only dims with
+    # unsplit old_slice should stay unsplit across all segments.
+    # Recompute core_id_to_work_slice based on the final iteration space order.
+    # When symbols are decomposed/reordered by align_tensors, the iteration order
+    # changes, which affects the modular arithmetic for core assignment. Redistributing
+    # the old mapping doesn't account for this order change, causing core misalignment
+    # between LX planning and SDSC codegen. Recomputing ensures consistency.
     new_core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
     if core_id_to_work_slice is not None:
-        for var, old_slice in core_id_to_work_slice.items():
-            segments = remap.get(var)
-            if segments is None:
-                new_core_id_to_work_slice[var] = old_slice
-            else:
-                new_core_id_to_work_slice.update(
-                    redistribute_core_slice(old_slice, segments, new_op_it_space_splits)
-                )
+        from .pass_utils import core_to_slice_mapping
+
+        # Extract dims and splits from new_op_it_space_splits in iteration order
+        dims_list: list[sympy.Symbol] = list(new_op_it_space_splits.keys())
+        splits_list: list[int] = [new_op_it_space_splits[d] for d in dims_list]
+        num_cores = math.prod(splits_list) if splits_list else 1
+        # Recompute using the final iteration space order
+        new_core_id_to_work_slice = core_to_slice_mapping(
+            dims_list, splits_list, num_cores, contiguous_dim=None
+        )
 
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
