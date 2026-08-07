@@ -739,20 +739,26 @@ def apply_splits(
 ) -> None:
     """Commit splits to op.
 
-    Does nothing when the product of splits is 1 (no parallelism).
+    Always commits core_id_to_work_slice (even for single-core ops, which get
+    all-unsplit mappings). Only commits op_it_space_splits when parallelized.
     """
     cores_used = math.prod(splits.values())
-    if cores_used <= 1:
-        return
 
     rw = op_read_writes(op)
     write_index = output_td.dep.index
     first_read = next(iter(rw.reads), None)
     read_index = first_read.index if first_read is not None else write_index
-    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+
+    # Always commit core_id_to_work_slice for all ops, even single-core ones.
+    # Single-core ops get all-unsplit (Integer(0)) mappings.
     commit_core_mapping(
         op, splits, write_index, read_index, is_matmul=_is_matmul_op(op)
     )
+
+    if cores_used <= 1:
+        return
+
+    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
 def enumerate_work_division_candidates(
