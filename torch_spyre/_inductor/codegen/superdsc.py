@@ -74,7 +74,6 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
-    per_tile_fixed: bool = False
     shared_base: bool = False
     device_tile_advance_expr: Expr | None = None
 
@@ -802,7 +801,6 @@ def _create_sdsc_tensors(
                 arg_index=arg.arg_index,
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
-                per_tile_fixed=arg.per_tile_fixed,
                 # shared_base is True for:
                 #   gather  — the value table input (its row dim carries IndirectAccess
                 #             in device_coords, so is_indirect_value_tensor returns True)
