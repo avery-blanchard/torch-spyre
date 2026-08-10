@@ -1043,9 +1043,9 @@ def commit_core_mapping(
     dims = tuple(dim_splits.keys())
     splits = tuple(dim_splits.values())
     num_cores = math.prod(splits)
-    contiguous_dim = (
-        len(dims) - 1 if is_matmul and config.core_id_k_fast_emission else None
-    )
+    contiguous_dim = None
+    if len(dims) > 0 and is_matmul and config.core_id_k_fast_emission:
+        contiguous_dim = len(dims) - 1
     by_name = core_to_slice_mapping(
         dims, splits, num_cores, contiguous_dim=contiguous_dim
     )
