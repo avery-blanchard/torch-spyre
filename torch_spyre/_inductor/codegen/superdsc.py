@@ -74,7 +74,6 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
-    shared_base: bool = False
     device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
@@ -97,7 +96,6 @@ class SDSCArgs:
             f"  backGap={self.backGap}\n"
             f"  is_index_tensor={self.is_index_tensor}\n"
             f"  related_value_tensor_idx={self.related_value_tensor_idx}\n"
-            f"  shared_base={self.shared_base}\n"
             f")"
         )
 
@@ -801,14 +799,6 @@ def _create_sdsc_tensors(
                 arg_index=arg.arg_index,
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
-                # shared_base is True for:
-                #   gather  — the value table input (its row dim carries IndirectAccess
-                #             in device_coords, so is_indirect_value_tensor returns True)
-                #   scatter — the destination output (work_division._build_output_td
-                #             injects IndirectAccess into its coords, so
-                #             is_indirect_value_tensor also returns True here, keeping
-                #             the destination at a shared base address across all cores)
-                shared_base=has_indirect_access and is_indirect_value_tensor(arg),
                 device_tile_advance_expr=arg.device_tile_advance_expr,
             )
         )

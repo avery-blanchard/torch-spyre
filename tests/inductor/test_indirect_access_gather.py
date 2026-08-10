@@ -452,16 +452,25 @@ class _GatherScenarios:
         self.name_dims(j, {"P": 32})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "per-core tensor span 512 MB (B=2, S=128, D=512, F=2048, fp16) "
-            "exceeds 256 MB hardware limit; work-division cannot split the "
-            "S=128 coordinate further"
-        )
-    )
     def test_moe(self):
-        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
-        E, D, F, B, S = 8, 512, 2048, 2, 128
+        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index.
+
+        A gather splits its OUTPUT across cores, and the per-core slice must stay
+        within the 256 MB per-core addressable span or the backend aborts
+        (Immediate value out of boundary in dxp). With >1 core the full-size MoE
+        output B*S*D*F*2 = 2*128*512*2048*2 = 512 MB splits and each core's slice
+        fits, so we keep the realistic F=2048 there. At SENCORES=1 nothing splits
+        -- one core must span the whole output -- so F is shrunk to 512, giving a
+        128 MB output (half the limit) that fits on a single core. Either way the
+        source row is deeply multi-stick (D*F/64 = 16384 or 4096 sticks), so the
+        indexed-dim-outermost relayout is exercised.
+        """
+        from torch_spyre._inductor import config
+
+        E, D, B, S = 8, 512, 2, 128
+        # 512 MB unsplit output overflows the 256 MB single-core span; shrink it
+        # only for SENCORES=1, where the output cannot be split across cores.
+        F = 512 if config.sencores == 1 else 2048
         expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
         expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(expert_w, {"E": E, "D": D, "F": F})
@@ -576,7 +585,7 @@ class _GatherScenarios:
 
     def test_gather_after_producer_exp_4d(self):
         """x.exp()[i] -- 4D gather with producer layout rewrite."""
-        M, N, K, L, P = 32, 32, 32, 64, 8
+        M, N, K, L, P = 128, 4, 4, 64, 8
         x = self.to_spyre(torch.rand(M, N, K, L, dtype=torch.float16))
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N, "K": K, "L": L})
@@ -1200,6 +1209,36 @@ class _GatherScenarios:
         _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
         self.assert_indexed_dim_split(source_codes[0], index_size=1000, data_size=64)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    # -- shared value table: cross-core read correctness ------------------
+    def test_gather_cross_core_shared_value(self):
+        """Every output row gathers a value row in a DIFFERENT core's work slice,
+        and must still be correct -- the value table is shared, not partitioned.
+
+        The table is row-identifying (weight[r, :] == r, exact in fp16 for
+        r < 2048), and the index maps output row i -> value row (i + V/2) % V:
+        always a half-table hop, so under any multi-core split the fetched row
+        belongs to another core's slice (e.g. at SENCORES=32 core 4 reads core
+        20's region, and vice versa). The gather must match the CPU reference
+        exactly (expect_close=True) -- if the shared value tensor's per-core base
+        ever drifted with the work-division slice, a core would read a shifted
+        row and diverge. Swept across SENCORES, so the cross-core read is checked
+        at every core count, up to a full 32-way split at SENCORES=32.
+        """
+        V, E = 1024, 128
+        weight = self.to_spyre(
+            torch.arange(V, dtype=torch.float16).unsqueeze(1).repeat(1, E)
+        )
+        idx = ((torch.arange(V) + V // 2) % V).to(torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": V})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i),
+            weight,
+            idx,
+            expect=GATHER_OP_SPEC,
+            expect_close=True,
+        )
 
 
 # Generate TestGather_cores1 .. TestGather_cores32, one per SENCORES value, so

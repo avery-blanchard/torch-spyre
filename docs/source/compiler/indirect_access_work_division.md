@@ -135,7 +135,7 @@ left for a single core.
 
 ## The proposed fix
 
-Six changes, in order of importance.
+Five changes, in order of importance.
 
 ### 1. Forbid splitting the shared table's data dims — the correctness fix
 
@@ -152,7 +152,7 @@ coordinates:
 `shared_indirect_data_syms` then takes the non-`IndirectAccess` coordinate
 symbols of those tensors — the same extraction for both directions. The split
 passes consult it through `indirect_forbidden_split_syms`, which combines it with
-the partial-last-stick rule ([fix #6](#6-stick-align-the-index-entry-split-partial-last-stick));
+the partial-last-stick rule ([fix #5](#5-stick-align-the-index-entry-split-partial-last-stick));
 `_default_split` removes the resulting symbols from the output and reduction
 priority lists, so the core budget is distributed only over the index-entry
 dims — **divide by the index, not the table.**
@@ -180,26 +180,7 @@ direct `src` load selected by `_first_non_indirect_read_index` — and
 This is gated on the [uniqueness condition](#the-scatter-only-correctness-condition-index-uniqueness):
 `indirect_store_entry_syms` returns dims only for overwrite scatters.
 
-### 3. Shared-base addressing
-
-`SDSCArgs.shared_base`
-([codegen/superdsc.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py))
-marks the shared table — set for any tensor carrying `IndirectAccess`, which is
-the value table for a gather and the destination for a scatter. In
-`core_idx_to_slice_offset`
-([codegen/compute_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/compute_ops.py))
-a `shared_base` tensor keeps its per-core base at the static offset (address 0)
-instead of advancing with the work-division slice. The addressed row comes from
-the runtime `IndirectAccess`; the index and the regular tensor (output for
-gather, src for scatter) keep the normal per-core base advance. This makes the
-shared-table addressing correct by construction rather than relying on the
-backend to tolerate a stale per-core base.
-
-This change required no scatter-specific work: `is_indirect_value_tensor` already
-recognizes any `IndirectAccess`-carrying tensor, so the scatter destination gets
-`shared_base` through the same path as the gather value table.
-
-### 4. Shared-table span guard (defensive)
+### 3. Shared-table span guard (defensive)
 
 The shared table's coordinates carry `IndirectAccess` (via
 `collect_indirect_value_tds` for a gather, `_build_output_td` for a scatter), so
@@ -214,7 +195,7 @@ This is conservative: a 512 MB table read correctly in testing, so the limit's
 applicability to indirect tables is not firmly established. The guard surfaces a
 potential hardware-limit violation as a compile-time warning rather than failing.
 
-### 5. Deterministic split round-trip
+### 4. Deterministic split round-trip
 
 The split plan is encoded with the coefficients of the read/write index
 expressions. An indirect read carries data-dependent symbols whose coefficients
@@ -224,7 +205,7 @@ decode sites (`work_distribution_pass`, `create_op_spec`) prefer the first
 `_first_non_indirect_read_index`. This same reference also carries a scatter's
 entry-dim split (fix #2).
 
-### 6. Stick-align the index-entry split (partial last stick)
+### 5. Stick-align the index-entry split (partial last stick)
 
 Enabling the index-entry split (fixes #1–2) exposes a second hazard when the
 entry count is **not a whole multiple of the index stick** (32 int32 entries per
@@ -314,7 +295,7 @@ In both cases parallelism is set by the index size in sticks:
 `cores = core_split(ceil(Q / 32), SENCORES)` for a 1-D index — the largest
 divisor of the index's stick count that fits the core budget (`Q = 256 → 8
 sticks → 8`, `Q = 1024 → 32`; a partial count like `Q = 40` pads to `2` sticks →
-`2` cores ([fix #6](#6-stick-align-the-index-entry-split-partial-last-stick)),
+`2` cores ([fix #5](#5-stick-align-the-index-entry-split-partial-last-stick)),
 and a non-power-of-two `SENCORES = 6` rounds `8` sticks down to `4`). A spatial
 (non-stick) index dimension splits directly. A small index (the scatter `Q = 5`
 here) runs correct-but-serial.
@@ -404,11 +385,10 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=8 python examples/paged_attention_
 
 | File | Change |
 |---|---|
-| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`, `indirect_entry_output_dim` + `IndirectEntryDim` (partial-stick, fix #6) |
-| `_inductor/work_division.py` | `collect_shared_indirect_tds` (gather reads + scatter destination), `shared_indirect_data_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule, fix #6), `_non_indirect_coord_syms`, `_build_output_td`, `collect_indirect_value_tds`, `indirect_store_entry_syms`, `forbidden_split_syms` + `force_output_syms` in `_default_split`, `IndirectAccess` span guard |
-| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — grows a partial-stick gather output's entry-dim `device_size` to a whole stick (fix #6) |
-| `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for any `IndirectAccess`-carrying tensor (gather value, scatter destination); grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #6) |
-| `_inductor/codegen/compute_ops.py` | `core_idx_to_slice_offset` honours `shared_base` |
+| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`, `indirect_entry_output_dim` + `IndirectEntryDim` (partial-stick, fix #5) |
+| `_inductor/work_division.py` | `collect_shared_indirect_tds` (gather reads + scatter destination), `shared_indirect_data_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule, fix #5), `_non_indirect_coord_syms`, `_build_output_td`, `collect_indirect_value_tds`, `indirect_store_entry_syms`, `forbidden_split_syms` + `force_output_syms` in `_default_split`, `IndirectAccess` span guard |
+| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — grows a partial-stick gather output's entry-dim `device_size` to a whole stick (fix #5) |
+| `_inductor/codegen/superdsc.py` | grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #5) |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
 | `examples/gather_multicore_exp.py` | three-scenario multicore validation example (gather) |
 | `examples/scatter_multicore_exp.py` | three-scenario multicore example (scatter) — **WIP** |
