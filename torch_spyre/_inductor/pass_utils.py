@@ -1075,34 +1075,60 @@ def redistribute_core_slice(
     segments: list[sympy.Symbol],
     segment_splits: dict[sympy.Symbol, int],
     all_dims: list[sympy.Symbol] | None = None,
+    old_iteration_order: list[sympy.Symbol] | None = None,  # noqa: ARG001
 ) -> dict[sympy.Symbol, sympy.Expr]:
     """Re-key one var's ``core_id_to_work_slice`` entry across the sub-dims
     ``align_tensors`` decomposed it into.
 
-    ``align_tensors`` can factor a single iteration-space symbol's range (and
-    the split factor riding on it) across several new symbols -- ``segments``
-    (innermost first, matching ``remap[var]``) with per-segment split factors
-    in ``segment_splits`` (``align_tensors``'s ``new_op_it_space_splits``).
-    ``old_slice`` is the pre-simplification slice expression for that one
-    symbol; this walks ``segments`` the same way ``core_to_slice_mapping``
-    walks dims -- accumulating ``stride`` innermost to outermost -- starting
-    from the stride of dimensions that come before the segments. If ``all_dims``
-    is provided (the full iteration order), stride is computed correctly even
-    when other dimensions come before these segments.
+    When a single iteration-space variable is split into multiple new symbols
+    by ``align_tensors``, or when the iteration order changes, this function
+    recomputes the stride for each segment based on what comes before it in
+    the *final* iteration order (``all_dims``). This ensures all ops accessing
+    the same buffer compute coherent strides based on the same final order,
+    fixing mismatches introduced by different work divisions or reorderings.
+
+    However, K-fast (and other special orderings where a dim gets stride=1
+    despite not being first) are detected and preserved: if the old stride is
+    1 but the expected stride from position in ``all_dims`` is > 1, we keep
+    the old stride=1, preserving the special ordering.
+
+    ``all_dims`` is the final iteration order (``new_op_it_space_splits.keys()``).
+    For the first segment, we compute the expected stride from dimensions that
+    precede it in this order. If that differs from the old stride in a way that
+    suggests special ordering (old=1, expected>1), we preserve. Otherwise, we
+    use the expected stride to ensure coherence. Then we walk the new segments
+    accumulating stride from that starting point.
+
+    ``old_iteration_order`` is accepted for backward compatibility but is not used.
     """
     stride, split = _parse_core_slice_expr(old_slice)
     if split <= 1:
         return {seg: sympy.Integer(0) for seg in segments}
 
-    # Compute stride from preceding dimensions only for normal iteration order (stride=1).
-    # Preserve stride > 1 (K-fast or other special ordering) unchanged.
-    if all_dims is not None and stride == 1:
-        first_seg_idx = next((i for i, d in enumerate(all_dims) if d in segments), -1)
-        if first_seg_idx >= 0:
-            # Compute stride from dimensions before first_seg_idx
-            stride = 1
+    # Recompute stride from the first segment's position in all_dims (final
+    # iteration order) to ensure coherence. However, detect and preserve K-fast
+    # (or other special orderings) by checking if the old stride is 1 but the
+    # expected stride from position is > 1. This signature indicates a dim that
+    # was assigned stride=1 despite not being first (e.g., K-fast via
+    # contiguous_dim), so we preserve that assignment.
+    if all_dims is not None and segments:
+        first_seg = segments[0]
+        if first_seg in all_dims:
+            first_seg_idx = all_dims.index(first_seg)
+            expected_stride = 1
             for i in range(first_seg_idx):
-                stride *= segment_splits.get(all_dims[i], 1)
+                expected_stride *= segment_splits.get(all_dims[i], 1)
+
+            # If old stride is 1 but expected from position is > 1, this looks
+            # like K-fast or another special ordering (stride=1 despite not being
+            # first in iteration order). Preserve the old stride=1 to keep the
+            # special ordering intact. Otherwise, use the expected stride.
+            if stride == 1 and expected_stride > 1:
+                # Likely K-fast or similar; preserve stride=1
+                pass  # keep old stride=1
+            else:
+                # Normal case: use expected stride from final iteration order
+                stride = expected_stride
 
     core_id = sympy.Symbol("core_id")
     result: dict[sympy.Symbol, sympy.Expr] = {}

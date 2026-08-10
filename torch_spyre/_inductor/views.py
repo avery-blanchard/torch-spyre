@@ -726,12 +726,13 @@ def align_tensors(
     # their existing slice, if any. IMPORTANT: only redistribute if the old
     # slice was actually split (not Integer(0)); reduction-only dims with
     # unsplit old_slice should stay unsplit across all segments.
-    # Recompute core_id_to_work_slice based on the final iteration space order.
+    # Recompute core_id_to_work_slice based on the final iteration space order
+    # so strides are coherent across all ops accessing the same buffer.
     new_core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
     if core_id_to_work_slice is not None:
         from .pass_utils import redistribute_core_slice
 
-        # Get the full dimension list in iteration order for correct stride computation.
+        # Get the full dimension list in final iteration order for stride computation.
         all_dims_list: list[sympy.Symbol] = list(new_op_it_space_splits.keys())
         for var, old_slice in core_id_to_work_slice.items():
             segments = remap.get(var)
@@ -740,8 +741,7 @@ def align_tensors(
             else:
                 # Redistribute across all segments. redistribute_core_slice handles
                 # unsplit slices (Integer(0)) correctly by returning all zeros.
-                # Pass all_dims so it can compute correct stride accounting for
-                # dimensions that come before these segments in the iteration order.
+                # Recompute strides from all_dims so they're consistent across ops.
                 new_core_id_to_work_slice.update(
                     redistribute_core_slice(
                         old_slice, segments, new_op_it_space_splits, all_dims_list
