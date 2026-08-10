@@ -1094,9 +1094,9 @@ def redistribute_core_slice(
     if split <= 1:
         return {seg: sympy.Integer(0) for seg in segments}
 
-    # If all_dims provided, compute the stride by multiplying splits of all
-    # dimensions that come before the first segment (innermost to outermost).
-    if all_dims is not None:
+    # Compute stride from preceding dimensions only for normal iteration order (stride=1).
+    # Preserve stride > 1 (K-fast or other special ordering) unchanged.
+    if all_dims is not None and stride == 1:
         first_seg_idx = next((i for i, d in enumerate(all_dims) if d in segments), -1)
         if first_seg_idx >= 0:
             # Compute stride from dimensions before first_seg_idx
@@ -1622,6 +1622,7 @@ class _ViewPrep(NamedTuple):
     num_stick: int
     num_stick_stride: int
     is_matmul: bool
+    k_dim: Optional["sympy.Symbol"]  # K (reduction) dimension for K-fast matmuls
 
 
 def _prepare_per_core_view(
@@ -1686,6 +1687,30 @@ def _prepare_per_core_view(
     # covers every symbol the per-candidate path can ask for.
     dep_coeff = {sym: concretize_expr(dep.index.coeff(sym)) for sym in iter_space}
 
+    # For matmuls, find the K (reduction) dimension using the same logic as work_division:
+    # K is any iteration var NOT in the output tensor's device coordinates (excluding stick).
+    # For matmuls there should be exactly one reduction dim (the contraction dimension).
+    k_dim = None
+    is_matmul_op_val = _is_matmul_op(op)
+    if is_matmul_op_val:
+        try:
+            rw = op_read_writes(op)
+            write_dep = next(iter(rw.writes), None)
+            if write_dep is not None and isinstance(write_dep, MemoryDep):
+                output_buf = V.graph.get_buffer(write_dep.name)
+                if hasattr(output_buf.layout, "device_layout"):
+                    dev_layout = output_buf.layout.device_layout
+                    coord_vars = {
+                        v for e in dev_layout.device_coords[:-1] for v in e.free_symbols
+                    }
+                    reduction_vars = [
+                        sym for sym in iter_space if sym not in coord_vars
+                    ]
+                    if len(reduction_vars) == 1:
+                        k_dim = reduction_vars[0]
+        except Exception:
+            pass
+
     return _ViewPrep(
         iter_space=iter_space,
         write_index=write_index,
@@ -1699,7 +1724,8 @@ def _prepare_per_core_view(
         num_stick_dim=num_stick_dim,
         num_stick=num_stick,
         num_stick_stride=num_stick_stride,
-        is_matmul=_is_matmul_op(op),
+        is_matmul=is_matmul_op_val,
+        k_dim=k_dim,
     )
 
 
@@ -1749,7 +1775,6 @@ def _per_core_view_from_prep(
     num_stick_dim = prep.num_stick_dim
     num_stick = prep.num_stick
     num_stick_stride = prep.num_stick_stride
-    iter_space = prep.iter_space
 
     # Step 3: place each split on a device dim via stride lookup.
     #
@@ -1823,13 +1848,13 @@ def _per_core_view_from_prep(
     # requires producer and consumer to assign each slice to the same physical
     # core; matching split factors alone is insufficient.
     num_cores = int(math.prod(per_sym.values()))
-    iter_symbols = tuple(iter_space)
+    iter_symbols = tuple(per_sym.keys())
     dim_splits = tuple(int(per_sym[sym]) for sym in iter_symbols)
-    contiguous_dim = (
-        len(dim_splits) - 1
-        if prep.is_matmul and config.core_id_k_fast_emission
-        else None
-    )
+    # For K-fast matmuls, find K's current position in reordered iteration space.
+    contiguous_dim = None
+    if prep.is_matmul and config.core_id_k_fast_emission and prep.k_dim is not None:
+        if prep.k_dim in iter_symbols:
+            contiguous_dim = iter_symbols.index(prep.k_dim)
     core_to_slot_by_name = core_to_slice_mapping(
         iter_symbols,
         dim_splits,
