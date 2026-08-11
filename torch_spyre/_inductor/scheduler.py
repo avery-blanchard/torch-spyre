@@ -395,6 +395,26 @@ def align_lx_producer_loop_order(
                     node.get_name(),
                     read.name,
                 )
+                # After reordering loops, recompute core_id_to_work_slice to
+                # reflect the new iteration order.
+                from .pass_utils import (
+                    iteration_space,
+                    recompute_core_mapping_from_iteration_space,
+                    apply_splits_from_index_coeff,
+                )
+
+                op = producer.node
+                if hasattr(op, "op_it_space_splits"):
+                    new_it_space = iteration_space(producer)
+                    # Convert coeff-keyed splits to scheduler-symbol format
+                    write_index = write.index
+                    read_index = read.index
+                    symbol_splits = apply_splits_from_index_coeff(
+                        op.op_it_space_splits, write_index, read_index, new_it_space
+                    )
+                    recompute_core_mapping_from_iteration_space(
+                        op, new_it_space, symbol_splits, write_index, read_index
+                    )
 
     return nodes
 

@@ -1022,6 +1022,35 @@ def apply_slice_from_index_coeff(
     return result
 
 
+def recompute_core_mapping_from_iteration_space(
+    op: Operation,
+    iteration_space: dict[sympy.Symbol, sympy.Expr],
+    op_it_space_splits: dict[sympy.Symbol, int],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> None:
+    """Recompute and update core_id_to_work_slice when iteration order changes.
+
+    Used after loop reordering to reflect the new iteration space order in the
+    core mapping. Takes the new iteration space (as scheduler symbols) and
+    recomputes the mapping using the current splits and indices.
+    """
+    dims = tuple(iteration_space.keys())
+    splits = tuple(op_it_space_splits.get(sym, 1) for sym in dims)
+    num_cores = math.prod(splits)
+
+    is_matmul = _is_matmul_op(op)
+    contiguous_dim = None
+    if len(dims) > 0 and is_matmul and config.core_id_k_fast_emission:
+        contiguous_dim = len(dims) - 1
+
+    by_name = core_to_slice_mapping(
+        dims, splits, num_cores, contiguous_dim=contiguous_dim
+    )
+    by_symbol = {sym: by_name[str(sym)] for sym in dims}
+    op.core_id_to_work_slice = slice_by_index_coeff(by_symbol, write_index, read_index)
+
+
 def commit_core_mapping(
     op: Operation,
     dim_splits: dict[sympy.Symbol, int],
