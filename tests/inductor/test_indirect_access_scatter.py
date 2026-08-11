@@ -33,6 +33,7 @@ import os
 import sys
 
 import torch
+from torch.spyre import SpyreTensorLayout
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -41,6 +42,7 @@ from indirect_access_common import (  # noqa: E402
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
     IndirectAccessTestCase,
+    canonical_device_layout,
 )
 
 from torch_spyre._inductor import config  # noqa: E402
@@ -65,6 +67,43 @@ class TestScatter(IndirectAccessTestCase):
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
         index = torch.randint(0, M, (P, N), dtype=dtype).to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(index, {"P": P, "N": N})
+        return out, src, index
+
+    def _row_store_shape(self, M=128, N=256, P=3, dtype=torch.int32):
+        """Shape-parameterized row-store operands, like _row_store but with a
+        unique (non-repeating) 1-D index -- torch.randint can repeat a row,
+        which is fine for accumulating ops but makes a non-accumulating
+        scatter's CPU reference order-dependent. randperm guarantees distinct
+        target rows so the e2e comparison is unambiguous regardless of P.
+
+        `out` gets an explicit STL matching the canonical layout the compiler
+        would pick anyway (the indexed row dim M is already outermost for a
+        plain 2-D tensor) -- spelled out rather than implicit."""
+        out_layout = canonical_device_layout((M, N), torch.float16)
+        out = torch.zeros(M, N, dtype=torch.float16).to(device_layout=out_layout)
+        src = torch.rand(P, N, dtype=torch.float16).to("spyre")
+        idx = torch.randperm(M)[:P].to(dtype).to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+        return out, src, idx
+
+    def _full_index_store_shape(self, M=128, N=256, P=3, dtype=torch.int32):
+        """Shape-parameterized full-index-store operands, like
+        _full_index_store but with a unique index per column (each column of
+        `index` is an independent randperm) so a non-accumulating scatter's
+        CPU reference does not depend on write order.
+
+        `out` gets an explicit STL matching the canonical layout (see
+        _row_store_shape)."""
+        out_layout = canonical_device_layout((M, N), torch.float16)
+        out = torch.zeros(M, N, dtype=torch.float16).to(device_layout=out_layout)
+        src = torch.rand(P, N, dtype=torch.float16).to("spyre")
+        index = torch.stack([torch.randperm(M)[:P] for _ in range(N)], dim=1).to(dtype)
+        index = index.to("spyre")
         self.name_dims(out, {"M": M, "N": N})
         self.name_dims(src, {"P": P, "N": N})
         self.name_dims(index, {"P": P, "N": N})
@@ -188,6 +227,303 @@ class TestScatter(IndirectAccessTestCase):
             return torch.scatter_add(out, 0, index, src)
 
         self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+
+    # ------------- Shape / index coverage for working scatters -------------
+    # The scenarios above all share one fixed shape (M=128, N=256, P=3) from
+    # _row_store/_full_index_store. These pin the same already-working ops
+    # (index_put, scatter, scatter_add, index_copy, index_add) across stick
+    # alignment, rank, index count, and index dtype so a shape-specific
+    # regression surfaces here instead of only at the one baseline shape.
+    def test_index_put_stick_aligned(self):
+        """out[idx] = src, 1 stick per row (N=64), single-index edge (P=1)."""
+        out, src, idx = self._row_store_shape(M=64, N=64, P=1)
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_put_non_stick_aligned(self):
+        """out[idx] = src, non-stick-aligned row width (N=100)."""
+        out, src, idx = self._row_store_shape(M=67, N=100, P=5)
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_put_multistick_row(self):
+        """out[idx] = src, row spans multiple sticks (N=512, 8 sticks)."""
+        out, src, idx = self._row_store_shape(M=128, N=512, P=8)
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_put_all_rows(self):
+        """out[idx] = src where P == M -- every row of out is scattered into,
+        the boundary opposite of the P=1 single-index edge."""
+        out, src, idx = self._row_store_shape(M=16, N=64, P=16)
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_put_int64_index(self):
+        """out[idx] = src with an int64 index (vs. the int32 baseline)."""
+        out, src, idx = self._row_store_shape(dtype=torch.int64)
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_put_3d(self):
+        """out[idx] = src on a 3-D out/src, indexing dim 0 -- the row-store
+        pattern one rank up from the 2-D baseline."""
+        A, B, C, P = 32, 8, 64, 4
+        out_layout = canonical_device_layout((A, B, C), torch.float16)
+        out = torch.zeros(A, B, C, dtype=torch.float16).to(device_layout=out_layout)
+        src = torch.rand(P, B, C, dtype=torch.float16).to("spyre")
+        idx = torch.randperm(A)[:P].to(torch.int32).to("spyre")
+        self.name_dims(out, {"A": A, "B": B, "C": C})
+        self.name_dims(src, {"P": P, "B": B, "C": C})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(out, src, idx):
+            out[idx] = src
+            return out
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_paged_kv_store(self):
+        """Paged KV-cache store: cache.view(CS*BS, H, D)[slot_idxs] = keys.
+
+        Mirrors test_paged_kv in the gather file (same cache shape, same
+        slot-index scheme) but for the write side: writing new KV entries into
+        a flattened paged cache at scattered slot positions, the store half of
+        a paged-attention KV cache update.
+
+        The cache row (H*D = 1024 elems = 16 sticks) is indirectly accessed
+        along the leading (cache, block) dims, so those dims need an explicit
+        STL with cache & block as the OUTERMOST device dims -- dim_order
+        [2, 0, 1, 3] on [cache_size, block_size, H, D] gives device dims
+        [cache_size, D//64, block_size, H, 64] (stick stays on D). Without
+        this the scatter only writes the first stick of each row.
+        """
+        cache_size, block_size, H, D, Lk = 512, 64, 8, 128, 64
+        total_slots = cache_size * block_size
+        kv_cache_layout = SpyreTensorLayout(
+            [cache_size, block_size, H, D],
+            [block_size * H * D, H * D, D, 1],
+            torch.float16,
+            [2, 0, 1, 3],
+        )
+        cache = torch.zeros(cache_size, block_size, H, D, dtype=torch.float16).to(
+            device_layout=kv_cache_layout
+        )
+        keys = torch.rand(Lk, H, D, dtype=torch.float16).to("spyre")
+        slot_idxs = torch.randperm(total_slots)[:Lk].to(torch.int64).to("spyre")
+
+        def kernel(cache, keys, slot_idxs):
+            cache.view(total_slots, H, D)[slot_idxs] = keys
+            return cache
+
+        self._stage_and_e2e(
+            kernel, cache, keys, slot_idxs, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_stick_aligned(self):
+        """torch.scatter(out, 0, index, src), 1 stick per row (N=64)."""
+        out, src, index = self._full_index_store_shape(
+            M=64, N=64, P=1, dtype=torch.int64
+        )
+
+        def kernel(out, src, index):
+            return torch.scatter(out, 0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_non_stick_aligned(self):
+        """torch.scatter(out, 0, index, src), non-stick-aligned row (N=100)."""
+        out, src, index = self._full_index_store_shape(
+            M=67, N=100, P=5, dtype=torch.int64
+        )
+
+        def kernel(out, src, index):
+            return torch.scatter(out, 0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_multistick_row(self):
+        """torch.scatter(out, 0, index, src), row spans multiple sticks (N=512)."""
+        out, src, index = self._full_index_store_shape(
+            M=128, N=512, P=8, dtype=torch.int64
+        )
+
+        def kernel(out, src, index):
+            return torch.scatter(out, 0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_all_rows(self):
+        """torch.scatter(out, 0, index, src) where P == M."""
+        out, src, index = self._full_index_store_shape(
+            M=16, N=64, P=16, dtype=torch.int64
+        )
+
+        def kernel(out, src, index):
+            return torch.scatter(out, 0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_add_stick_aligned(self):
+        """y.scatter_add_(0, index, src), 1 stick per row (N=64)."""
+        out, src, index = self._full_index_store_shape(M=64, N=64, P=1)
+
+        def kernel(out, src, index):
+            return out.scatter_add_(0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_add_non_stick_aligned(self):
+        """y.scatter_add_(0, index, src), non-stick-aligned row (N=100)."""
+        out, src, index = self._full_index_store_shape(M=67, N=100, P=5)
+
+        def kernel(out, src, index):
+            return out.scatter_add_(0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_add_small_table(self):
+        """y.scatter_add_(0, index, src), small out table (M=8, N=64)."""
+        out, src, index = self._full_index_store_shape(M=8, N=64, P=4)
+
+        def kernel(out, src, index):
+            return out.scatter_add_(0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_scatter_add_large_table(self):
+        """y.scatter_add_(0, index, src), large out table (M=256, N=256)."""
+        out, src, index = self._full_index_store_shape(M=256, N=256, P=32)
+
+        def kernel(out, src, index):
+            return out.scatter_add_(0, index, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_copy_stick_aligned(self):
+        """torch.index_copy(out, 0, idx, src), 1 stick per row (N=64)."""
+        out, src, idx = self._row_store_shape(M=64, N=64, P=1, dtype=torch.int64)
+
+        def kernel(out, src, idx):
+            return torch.index_copy(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_copy_non_stick_aligned(self):
+        """torch.index_copy(out, 0, idx, src), non-stick-aligned row (N=100)."""
+        out, src, idx = self._row_store_shape(M=67, N=100, P=5, dtype=torch.int64)
+
+        def kernel(out, src, idx):
+            return torch.index_copy(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_copy_multistick_row(self):
+        """torch.index_copy(out, 0, idx, src), row spans multiple sticks (N=512)."""
+        out, src, idx = self._row_store_shape(M=128, N=512, P=8, dtype=torch.int64)
+
+        def kernel(out, src, idx):
+            return torch.index_copy(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_add_stick_aligned(self):
+        """out.index_add_(0, idx, src), 1 stick per row (N=64)."""
+        out, src, idx = self._row_store_shape(M=64, N=64, P=1)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_add_non_stick_aligned(self):
+        """out.index_add_(0, idx, src), non-stick-aligned row (N=100)."""
+        out, src, idx = self._row_store_shape(M=67, N=100, P=5)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_add_small_table(self):
+        """out.index_add_(0, idx, src), small out table (M=8, N=64)."""
+        out, src, idx = self._row_store_shape(M=8, N=64, P=4)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_add_large_table(self):
+        """out.index_add_(0, idx, src), large out table (M=256, N=256)."""
+        out, src, idx = self._row_store_shape(M=256, N=256, P=32)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
     def test_scatter_reduce_amax(self):
