@@ -14,19 +14,17 @@
 
 """Consolidated scatter-style indirect-access tests (one file per op family).
 
-Each scenario routes its compile through
-self._stage_and_e2e(...): it asserts across every capture-path stage --
-classification, op-spec structure (IndirectAccess on the output), and SDSC
-fields -- and then runs the kernel end-to-end on the real backend. The e2e run
-reports an expected failure (pytest.xfail) on the value divergence / backend
-abort the backend currently produces for indirect scatter, while the
-capture-path checks above stay strict (a stage regression fails red).
+Each scenario routes its compile through self._stage_and_e2e(...): it asserts
+across every capture-path stage -- classification, op-spec structure
+(IndirectAccess on the output), and SDSC fields -- and then runs the kernel
+end-to-end on the real backend with expect_close=True to verify correctness
+against the CPU reference.
 
 All scatter scenarios run with SENCORES=1.
 
 Status (validated on hardware build): index-tensor scatters reach a real op
-spec with IndirectAccess on the output (SCATTER_OP_SPEC); the deeptools backend
-diverges from / aborts on the bundle, surfaced here as xfail.
+spec with IndirectAccess on the output (SCATTER_OP_SPEC) and run end-to-end
+with correct results.
 """
 
 import os
@@ -54,7 +52,7 @@ class TestScatter(IndirectAccessTestCase):
         """Common row-store operands: out[M,N], src[P,N], 1-D idx[P], all named."""
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, M, (P,), dtype=dtype).to("spyre")
+        idx = torch.randperm(M, dtype=dtype)[:P].to("spyre")
         self.name_dims(out, {"M": M, "N": N})
         self.name_dims(src, {"P": P, "N": N})
         self.name_dims(idx, {"P": P})
@@ -64,7 +62,10 @@ class TestScatter(IndirectAccessTestCase):
         """Operands for scatter with a full [P,N] index tensor: out[M,N], src[P,N]."""
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
-        index = torch.randint(0, M, (P, N), dtype=dtype).to("spyre")
+        # Each column needs its own unique set of row indices, so permute per
+        # column rather than across the whole [P, N] tensor.
+        columns = [torch.randperm(M, dtype=dtype)[:P] for _ in range(N)]
+        index = torch.stack(columns, dim=1).to("spyre")
         self.name_dims(out, {"M": M, "N": N})
         self.name_dims(src, {"P": P, "N": N})
         self.name_dims(index, {"P": P, "N": N})
@@ -79,7 +80,9 @@ class TestScatter(IndirectAccessTestCase):
             out[idx] = src
             return out
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_with_exp(self):
         """out[idx] = src.exp() -- index_put fused with a unary operation."""
@@ -89,7 +92,9 @@ class TestScatter(IndirectAccessTestCase):
             out[idx] = src.exp()
             return out
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, op="exp")
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, op="exp", expect_close=True
+        )
 
     def test_scatter(self):
         """torch.scatter(out, 0, index, src)"""
@@ -98,7 +103,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return torch.scatter(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_method_without_unary(self):
         """out.scatter_(0, index, src) -- in-place method form without a unary."""
@@ -107,7 +114,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_with_exp(self):
         """y.scatter_(0, index, src.exp()) -- fused unary, exp runs on Spyre.
@@ -129,6 +138,7 @@ class TestScatter(IndirectAccessTestCase):
             expect=SCATTER_OP_SPEC,
             op="exp",
             detected=False,
+            expect_close=True,
         )
 
     def test_scatter_add(self):
@@ -138,7 +148,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_add_(0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_copy(self):
         """torch.index_copy(out, 0, idx, src).
@@ -151,7 +163,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return torch.index_copy(out, 0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_add(self):
         """out.index_add_(0, idx, src)"""
@@ -160,7 +174,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_reduce(self):
         """out.scatter_reduce_(0, index, src, "sum")"""
@@ -169,7 +185,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return out.scatter_reduce_(0, index, src, "sum")
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_accumulate(self):
         """out.index_put_((idx,), src, accumulate=True) -- out[idx] += src."""
@@ -178,7 +196,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, idx):
             return out.index_put_((idx,), src, accumulate=True)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter_add_functional(self):
         """torch.scatter_add(out, 0, index, src) -- functional accumulating scatter."""
@@ -187,7 +207,9 @@ class TestScatter(IndirectAccessTestCase):
         def kernel(out, src, index):
             return torch.scatter_add(out, 0, index, src)
 
-        self._stage_and_e2e(kernel, out, src, index, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, out, src, index, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     # ------------- Not Detected As Indirect Access Scatter -------------
     def test_scatter_reduce_amax(self):
@@ -221,7 +243,7 @@ class TestScatter(IndirectAccessTestCase):
     def test_index_fill_crashes(self):
         """out.index_fill_(0, idx, 0.0) -- scalar fill -> rank-0 Constant codegen."""
         out = torch.rand(128, 256, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, 128, (3,), dtype=torch.int32).to("spyre")
+        idx = torch.randperm(128, dtype=torch.int32)[:3].to("spyre")
         self.name_dims(out, {"M": 128, "N": 256})
         self.name_dims(idx, {"P": 3})
 
