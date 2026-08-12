@@ -255,13 +255,6 @@ class _GatherScenarios:
         x, i = self._xi(P=32, dtype=torch.int64)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "dxp_standalone SIGABRT: !allocNode->layoutDimOrder_.empty() — "
-            "P=1 gather collapses the mb loop, leaving the KERNEL_IDX with an "
-            "empty layoutDimOrder_; fix pending in SDSC coordinate generation"
-        )
-    )
     def test_advanced_indexing_single_row(self):
         x, i = self._xi(P=1)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
@@ -374,13 +367,6 @@ class _GatherScenarios:
         x, i = self._xi3d(P=32, dtype=torch.int64)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "dxp_standalone SIGABRT: !allocNode->layoutDimOrder_.empty() — "
-            "P=1 gather collapses the mb loop, leaving the KERNEL_IDX with an "
-            "empty layoutDimOrder_; fix pending in SDSC coordinate generation"
-        )
-    )
     def test_advanced_indexing_3d_single_row(self):
         x, i = self._xi3d(P=1)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)

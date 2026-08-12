@@ -52,13 +52,10 @@ from .pass_utils import (
     concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
-    indirect_entry_output_dim,
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     indirect_access_subs_from_op,
-    indirect_store_subs_from_op,
-    indirect_store_sizes,
     indirect_sizes_from_op,
     _fixed_read_layout,
     op_read_writes,
@@ -673,30 +670,6 @@ def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     return layout
 
 
-def _build_output_td(op: ComputedBuffer) -> TensorDep:
-    """Build the output tensor dependency, handling scatter destinations specially.
-
-    For scatter operations, the destination row is chosen at runtime, so we mark
-    it with IndirectAccess. This tells the work division planner to keep the row
-    dimension at full size (never split it) and only split the data dimensions.
-    Regular operations just get their normal coordinates unchanged.
-    """
-    output_td = TensorDep(next(iter(op.get_read_writes().writes)), _resolve_layout(op))
-    store_subs = indirect_store_subs_from_op(op)
-    if store_subs:
-        # device_coordinates needs the *integer* row extent for each indirect
-        # symbol, not the IndirectAccess marker map. Compute coordinates with
-        # the raw store symbol treated as a normal loop var, then xreplace
-        # store_subs to mark the runtime-chosen destination row — the same
-        # order used for the gather value table in collect_indirect_value_tds.
-        ind_sizes = indirect_store_sizes(output_td.dep, output_td.layout)
-        coords = device_coordinates(
-            output_td.layout.device_layout, output_td.dep, ind_sizes
-        )
-        output_td.device_coords = [c.xreplace(store_subs) for c in coords]
-    return output_td
-
-
 def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
 ) -> tuple[list[TensorDep], TensorDep]:
@@ -735,115 +708,6 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
             td.device_coords = [c.xreplace(subs) for c in coords]
             tds.append(td)
     return tds
-
-
-def collect_shared_indirect_tds(op: ComputedBuffer) -> list[TensorDep]:
-    """Get all tensors that are shared across cores with runtime-chosen rows.
-
-    This covers both gather (reads from a shared value table) and scatter
-    (writes to a shared destination). These tensors stay at the same base
-    address on all cores, with the row selected at runtime. Their row dimension
-    is marked with IndirectAccess, and their data dimensions must not be split.
-    Returns empty for regular operations.
-    """
-    tds = collect_indirect_value_tds(op)
-    if indirect_store_subs_from_op(op):
-        tds.append(_build_output_td(op))
-    return tds
-
-
-def _non_indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
-    """Extract coordinate symbols, skipping the runtime-chosen row dimension."""
-    syms: set[Symbol] = set()
-    for coord in coords:
-        if hasattr(coord, "has") and coord.has(IndirectAccess):
-            continue
-        syms |= coord.free_symbols
-    return syms
-
-
-def shared_indirect_data_syms(op: ComputedBuffer) -> set[Symbol]:
-    """Find data dimensions of shared tables that must not be split.
-
-    These are the column/stick dimensions of tables shared across cores (gather
-    value tables or scatter destinations). We can't split these dimensions
-    because the table needs to stay at the same base address on every core.
-    Splitting a data dimension would require different base addresses per core,
-    breaking the shared access pattern. Returns empty for regular operations.
-    """
-    syms: set[Symbol] = set()
-    for td in collect_shared_indirect_tds(op):
-        syms |= _non_indirect_coord_syms(td.device_coords)
-    return syms
-
-
-def indirect_forbidden_split_syms(op: ComputedBuffer) -> set[Symbol]:
-    """Iteration dims that must not be core-split for an indirect op.
-
-    1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
-       table must not advance per core (all cores share the same base address).
-
-    2. **Partial-last-stick entry dims** — splitting a partial last index stick
-       across cores straddles the stick boundary. Forbidden unless the gather
-       output was already padded to a stick boundary by
-       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
-       output rows are chosen at runtime so can never be padded; they stay unsplit.
-    """
-    syms = shared_indirect_data_syms(op)  # (1)
-
-    # (2a) ADD: forbid a partial-last-stick index-entry dim, for BOTH gather and
-    # scatter (indirect_access_subs_from_op merges load+store subs). This keys
-    # off the INDEX's *logical* entry count (d.ranges[stick_var], e.g. 40), which
-    # is NEVER padded -- the stick-alignment fix grows the gather OUTPUT's
-    # device_size, not the index -- so this add fires for every partial-stick
-    # indirect op, gather included. It is the safe default: forbid unless the
-    # output is later proven stick-aligned (2b).
-    subs = indirect_access_subs_from_op(op)
-    index_names = {e.args[0].name for e in subs.values() if e.args}
-    for d in op.get_read_writes().reads:
-        if not (isinstance(d, MemoryDep) and d.name in index_names):
-            continue
-        layout = _fixed_read_layout(V.graph.get_buffer(d.name))
-        stick_expr = device_coordinates(layout.device_layout, d, None)[-1]
-        if len(stick_expr.free_symbols) != 1:
-            continue
-        stick_var = next(iter(stick_expr.free_symbols))
-        eps = layout.device_layout.elems_per_stick()
-        if stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0:
-            syms.add(stick_var)
-
-    # (2b) DISCARD: lift (2a)'s forbiddance when the GATHER output WAS padded up
-    # to a whole stick by enforce_indirect_access_layout (out_extent grows to a
-    # multiple of eps), which makes the stick-aligned split legal. So for a
-    # normally-padded gather (2a) adds and (2b) removes -- a deliberate no-op:
-    # (2a) can't see the padding (it reads the unpadded index count) while (2b)
-    # reads the padded OUTPUT extent. The add+discard together mean "split only
-    # when the output is provably stick-aligned." It stays forbidden when the
-    # output is NOT padded: a SCATTER (indirect_entry_output_dim returns None --
-    # its in-place dest can't be resized) or a gather whose output the pass could
-    # not grow -- those must fall back to a single core, not miscompile.
-    entry = indirect_entry_output_dim(op)
-    if entry is not None and entry.out_extent % entry.eps == 0:
-        syms.discard(entry.stick_var)
-
-    return syms
-
-
-def indirect_store_entry_syms(op: ComputedBuffer) -> set[Symbol]:
-    """Find which dimensions of a scatter can be safely parallelized.
-
-    For scatter operations, we can split along the index-entry dimension (giving
-    each core different source rows to write). The destination stays shared with
-    its row chosen at runtime. This is safe because each core writes to different
-    entries.
-    """
-    from torch._inductor.ir import Scatter
-
-    if not isinstance(op.data, Scatter) or op.data.scatter_mode is not None:
-        return set()
-    if not indirect_store_subs_from_op(op):
-        return set()
-    return set(iteration_space_from_op(op)) - indirect_forbidden_split_syms(op)
 
 
 def _first_non_indirect_read_index(rw, default):
@@ -933,6 +797,7 @@ def enumerate_work_division_candidates(
     )
     blocked = constraint_result.blocked
     pinned = constraint_result.pinned
+    forbidden = constraint_result.forbidden
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
@@ -960,6 +825,10 @@ def enumerate_work_division_candidates(
             return False
         if any(  # a coordinate-masked dim cannot be split across cores
             splits[v] > 1 for v in blocked
+        ):
+            return False
+        if any(  # a shared-table data dim must never be split (hard-forbidden)
+            splits[v] > 1 for v in forbidden
         ):
             return False
         if any(  # a pinned dim's split must equal exactly its pinned value
@@ -1142,11 +1011,29 @@ def span_reduction_pass(
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
         it_space, all_tds, symbol_meta
     )
-    # Shared indirect tables (gather value tables, scatter destinations) must
-    # never be split along their data dimensions — all cores must see the same
-    # base address. Pass the forbidden set into must_split_vars so span
-    # reduction never commits a split that would break shared-table addressing.
-    forbidden = indirect_forbidden_split_syms(op) or None
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    # The two constraint kinds are needed at different points, so collect twice.
+    # `forbidden` (e.g. shared gather/scatter table data dims) must gate
+    # must_split_vars' candidate selection so span reduction never commits a
+    # split that would break shared-table addressing — read it up front
+    # (structural; no committed splits exist yet).
+    forbidden = (
+        collect_work_division_constraints(
+            WorkDivConstraintContext(
+                op=op,
+                it_space=it_space,
+                it_space_adjusted=it_space_adjusted,
+                output_td=output_td,
+                input_tds=input_tds,
+                stick_vars=stick_vars,
+                reduction_vars=reduction_vars,
+                committed_splits={},
+            )
+        ).forbidden
+        or None
+    )
     min_splits = must_split_vars(
         all_tds,
         it_space,
@@ -1157,8 +1044,6 @@ def span_reduction_pass(
         forbidden_split_syms=forbidden,
     )
 
-    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -1387,8 +1272,8 @@ def work_distribution_pass(
         max_cores,
         symbol_meta,
         blocked,
-        forbidden_split_syms=indirect_forbidden_split_syms(op),
-        force_output_syms=indirect_store_entry_syms(op),
+        forbidden_split_syms=constraint_result.forbidden,
+        force_output_syms=constraint_result.force_output,
     )
 
     apply_splits(op, splits, output_td)
@@ -1936,7 +1821,14 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     blocked = constraint_result.blocked
     committed_splits.update(constraint_result.pinned)
     default_splits, _, _ = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
+        it_space_adjusted,
+        output_td,
+        committed_splits,
+        max_cores,
+        symbol_meta,
+        blocked,
+        forbidden_split_syms=constraint_result.forbidden,
+        force_output_syms=constraint_result.force_output,
     )
     splits = _cost_model_matmul_planner(
         op,

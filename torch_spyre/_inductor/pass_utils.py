@@ -20,7 +20,7 @@ from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 
 import torch
 import sympy
-from sympy import Expr
+from sympy import Expr, Symbol
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -943,6 +943,152 @@ def indirect_entry_output_dim(op) -> "IndirectEntryDim | None":
     except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
         return None
     return None
+
+
+def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
+    """Device-coordinate lists for tensors shared across cores with runtime rows.
+
+    Covers gather value tables (indirect reads) and scatter destinations
+    (indirect writes). Each returned list is the device_coordinates of one shared
+    tensor, with the runtime-chosen row marked by IndirectAccess. These tensors
+    stay at the same base address on every core, so their data dimensions must
+    not be split. Returns empty for regular operations.
+    """
+    coords_lists: list[list[Expr]] = []
+
+    # Gather value tables: filtered out of the normal arg list, recovered here.
+    # device_coordinates needs the *integer* index range for each indirect symbol
+    # (indirect_sizes), not the IndirectAccess marker map. Compute the coordinates
+    # with the raw indirect symbol treated as a normal loop var, then xreplace the
+    # subs to mark the runtime-chosen row.
+    subs = indirect_access_subs_from_op(op)
+    if subs:
+        ind_sizes = indirect_sizes_from_op(op)
+        for d in op.get_read_writes().reads:
+            if isinstance(d, MemoryDep) and d.is_indirect():
+                layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+                coords = device_coordinates(layout.device_layout, d, ind_sizes)
+                coords_lists.append([c.xreplace(subs) for c in coords])
+
+    # Scatter destination: the write, with its runtime-chosen row marked the same
+    # way (integer row extent for coordinates, then xreplace to IndirectAccess).
+    store_subs = indirect_store_subs_from_op(op)
+    if store_subs:
+        write = next(iter(op.get_read_writes().writes))
+        # Resolve the scatter destination's layout, leniently unwrapping the
+        # in-place-mutation layout (mirrors work_division._resolve_layout; inlined
+        # to avoid a pass_utils -> work_division import cycle). _fixed_read_layout
+        # is too strict here — it rejects a scatter's mutation output.
+        layout = op.get_layout()
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            layout = layout.real_layout()
+        ind_sizes = indirect_store_sizes(write, layout)
+        coords = device_coordinates(layout.device_layout, write, ind_sizes)
+        coords_lists.append([c.xreplace(store_subs) for c in coords])
+
+    return coords_lists
+
+
+def _non_indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
+    """Extract coordinate symbols, skipping the runtime-chosen row dimension."""
+    syms: set[Symbol] = set()
+    for coord in coords:
+        if hasattr(coord, "has") and coord.has(IndirectAccess):
+            continue
+        syms |= coord.free_symbols
+    return syms
+
+
+def shared_indirect_data_syms(op: "ComputedBuffer") -> set[Symbol]:
+    """Find data dimensions of shared tables that must not be split.
+
+    These are the column/stick dimensions of tables shared across cores (gather
+    value tables or scatter destinations). We can't split these dimensions
+    because the table needs to stay at the same base address on every core.
+    Splitting a data dimension would require different base addresses per core,
+    breaking the shared access pattern. Returns empty for regular operations.
+    """
+    syms: set[Symbol] = set()
+    for coords in _shared_indirect_coords(op):
+        syms |= _non_indirect_coord_syms(coords)
+    return syms
+
+
+def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
+    """Iteration dims that must not be core-split for an indirect op.
+
+    1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
+       table must not advance per core (all cores share the same base address).
+
+    2. **Partial-last-stick entry dims** — splitting a partial last index stick
+       across cores straddles the stick boundary. Forbidden unless the gather
+       output was already padded to a stick boundary by
+       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
+       output rows are chosen at runtime so can never be padded; they stay unsplit.
+    """
+    syms = shared_indirect_data_syms(op)  # (1)
+
+    # (2a) ADD: forbid a partial-last-stick index-entry dim, for BOTH gather and
+    # scatter (indirect_access_subs_from_op merges load+store subs). This keys
+    # off the INDEX's *logical* entry count (d.ranges[stick_var], e.g. 40), which
+    # is NEVER padded -- the stick-alignment fix grows the gather OUTPUT's
+    # device_size, not the index -- so this add fires for every partial-stick
+    # indirect op, gather included. It is the safe default: forbid unless the
+    # output is later proven stick-aligned (2b).
+    subs = indirect_access_subs_from_op(op)
+    index_names = {e.args[0].name for e in subs.values() if e.args}
+    for d in op.get_read_writes().reads:
+        if not (isinstance(d, MemoryDep) and d.name in index_names):
+            continue
+        layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+        stick_expr = device_coordinates(layout.device_layout, d, None)[-1]
+        if len(stick_expr.free_symbols) != 1:
+            continue
+        stick_var = next(iter(stick_expr.free_symbols))
+        eps = layout.device_layout.elems_per_stick()
+        if stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0:
+            syms.add(stick_var)
+
+    # (2b) DISCARD: lift (2a)'s forbiddance when the GATHER output WAS padded up
+    # to a whole stick by enforce_indirect_access_layout (out_extent grows to a
+    # multiple of eps), which makes the stick-aligned split legal. So for a
+    # normally-padded gather (2a) adds and (2b) removes -- a deliberate no-op:
+    # (2a) can't see the padding (it reads the unpadded index count) while (2b)
+    # reads the padded OUTPUT extent. The add+discard together mean "split only
+    # when the output is provably stick-aligned." It stays forbidden when the
+    # output is NOT padded: a SCATTER (indirect_entry_output_dim returns None --
+    # its in-place dest can't be resized) or a gather whose output the pass could
+    # not grow -- those must fall back to a single core, not miscompile.
+    entry = indirect_entry_output_dim(op)
+    if entry is not None and entry.out_extent % entry.eps == 0:
+        syms.discard(entry.stick_var)
+
+    return syms
+
+
+def indirect_store_entry_syms(
+    op: "ComputedBuffer", forbidden: "set[Symbol] | None" = None
+) -> set[Symbol]:
+    """Find which dimensions of a scatter can be safely parallelized.
+
+    For scatter operations, we can split along the index-entry dimension (giving
+    each core different source rows to write). The destination stays shared with
+    its row chosen at runtime. This is safe because each core writes to different
+    entries.
+
+    ``forbidden`` may be a precomputed ``indirect_forbidden_split_syms(op)`` to
+    avoid recomputing it (the caller often already has it); it is computed here
+    when omitted.
+    """
+    from torch._inductor.ir import Scatter
+
+    if not isinstance(op.data, Scatter) or op.data.scatter_mode is not None:
+        return set()
+    if not indirect_store_subs_from_op(op):
+        return set()
+    if forbidden is None:
+        forbidden = indirect_forbidden_split_syms(op)
+    return set(iteration_space_from_op(op)) - forbidden
 
 
 def iter_var_id(stick_expr) -> int:
