@@ -137,25 +137,51 @@ left for a single core.
 
 Five changes, in order of importance.
 
+### Where the rules live: the work-division constraint framework
+
+The split rules are expressed as a single op constraint in the centralized
+work-division constraint framework
+([work_division_constraints.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division_constraints.py)).
+`indirect_access_constraints(ctx)` returns a `ConstraintResult` with two sets:
+
+* **`forbidden`** — the shared-table data dims that must never be split (fix #1),
+  combined with the partial-last-stick rule (fix #5). This is a **hard**
+  constraint: unlike the framework's soft `blocked` (which span reduction may
+  override to meet the memory-span limit), a `forbidden` dim is removed from the
+  span-reduction candidate set too, so it is never split under any circumstance.
+* **`force_output`** — a scatter's index-entry dim, promoted to output-split
+  priority (fix #2).
+
+`collect_work_division_constraints` merges this with the other op constraints
+(coordinate-mask, conv-spatial, QFP8WT), and the split passes consume the merged
+result: `span_reduction_pass` feeds `forbidden` into `must_split_vars`' candidate
+filter, and `work_distribution_pass` passes `forbidden` / `force_output` into
+`_default_split`. The computation itself lives in
+[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
+(`indirect_forbidden_split_syms`, `indirect_store_entry_syms`), so it is reusable
+and has no dependency on `work_division.py`.
+
 ### 1. Forbid splitting the shared table's data dims — the correctness fix
 
-Both directions are unified behind `collect_shared_indirect_tds`
-([work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)),
-which returns every shared indirect tensor of an op with `IndirectAccess`-aware
-coordinates:
+Both directions are unified behind `_shared_indirect_coords`
+([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)),
+which returns the `IndirectAccess`-aware device coordinates of every shared
+indirect tensor of an op:
 
-* gather — each indirect value *read*, via `collect_indirect_value_tds`;
-* scatter — the indirect destination *write*, built by `_build_output_td`
-  applying `indirect_store_subs_from_op` so the row axis becomes an
-  `IndirectAccess` and only its data dims remain as coordinate symbols.
+* gather — each indirect value *read*;
+* scatter — the indirect destination *write*, applying `indirect_store_subs_from_op`
+  so the row axis becomes an `IndirectAccess` and only its data dims remain as
+  coordinate symbols.
 
 `shared_indirect_data_syms` then takes the non-`IndirectAccess` coordinate
-symbols of those tensors — the same extraction for both directions. The split
+symbols of those coordinates — the same extraction for both directions. The split
 passes consult it through `indirect_forbidden_split_syms`, which combines it with
-the partial-last-stick rule ([fix #5](#5-stick-align-the-index-entry-split-partial-last-stick));
-`_default_split` removes the resulting symbols from the output and reduction
-priority lists, so the core budget is distributed only over the index-entry
-dims — **divide by the index, not the table.**
+the partial-last-stick rule ([fix #5](#5-stick-align-the-index-entry-split-partial-last-stick))
+and surfaces the result as the `forbidden` set of `indirect_access_constraints`.
+`span_reduction_pass` excludes those symbols from `must_split_vars`' candidate set
+and `_default_split` removes them from the output and reduction priority lists, so
+the core budget is distributed only over the index-entry dims — **divide by the
+index, not the table.**
 
 When the index dim cannot absorb all the cores, the op falls back to fewer cores
 rather than splitting a data dim. **Correct-but-serial is the intended
@@ -168,7 +194,8 @@ by default. A scatter's index-entry dim is **absent** from the destination's
 direct coordinates (the row is data-dependent), so `prioritize_dimensions`
 classifies it as a *reduction* dim, which a non-reduction op never splits.
 `indirect_store_entry_syms` returns those entry dims (the iteration symbols left
-after removing the data dims), and `_default_split`'s `force_output_syms`
+after removing the data dims); they become the `force_output` set of
+`indirect_access_constraints`, and `_default_split`'s `force_output_syms`
 promotes them to output priority so the distributor splits them.
 
 The split round-trips through the existing coefficient encoding without new
@@ -182,13 +209,12 @@ This is gated on the [uniqueness condition](#the-scatter-only-correctness-condit
 
 ### 3. Shared-table span guard (defensive)
 
-The shared table's coordinates carry `IndirectAccess` (via
-`collect_indirect_value_tds` for a gather, `_build_output_td` for a scatter), so
-it is visible to the per-core span check with `get_per_core_span` treating an
-`IndirectAccess` coordinate as contributing its full device extent (any core may
-touch any row) and never splitting it. A gather's value table is pulled in as an
-extra TensorDep (it is not in `args`); a scatter's destination is the output
-TensorDep, already covered. `warn_if_per_core_overflow` then logs a
+The shared table's coordinates carry `IndirectAccess`, so it is visible to the
+per-core span check with `get_per_core_span` treating an `IndirectAccess`
+coordinate as contributing its full device extent (any core may touch any row)
+and never splitting it. A gather's value table is pulled in as an extra TensorDep
+(it is not in `args`), via `collect_indirect_value_tds`; a scatter's destination
+is the output TensorDep, already covered. `warn_if_per_core_overflow` then logs a
 critical message if the table would exceed the documented 256 MB per-core span.
 
 This is conservative: a 512 MB table read correctly in testing, so the limit's
@@ -227,7 +253,7 @@ the padded size **before** `_create_sdsc_tensors` computes strides; otherwise th
 base lands element-aligned (mid-stick) and the split still miscompiles.
 
 `indirect_forbidden_split_syms`
-([work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py))
+([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
 enforces the invariant, **forbid unless provably padded**:
 
 * it **forbids** a partial-last-stick entry dim by default — reading the index's
@@ -385,8 +411,9 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=8 python examples/paged_attention_
 
 | File | Change |
 |---|---|
-| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`, `indirect_entry_output_dim` + `IndirectEntryDim` (partial-stick, fix #5) |
-| `_inductor/work_division.py` | `collect_shared_indirect_tds` (gather reads + scatter destination), `shared_indirect_data_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule, fix #5), `_non_indirect_coord_syms`, `_build_output_td`, `collect_indirect_value_tds`, `indirect_store_entry_syms`, `forbidden_split_syms` + `force_output_syms` in `_default_split`, `IndirectAccess` span guard |
+| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`, `indirect_entry_output_dim` + `IndirectEntryDim` (partial-stick, fix #5); the split-rule computation: `_shared_indirect_coords` (gather reads + scatter destination), `shared_indirect_data_syms`, `_non_indirect_coord_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule), `indirect_store_entry_syms` |
+| `_inductor/work_division_constraints.py` | `indirect_access_constraints` — registers the split rules as one op constraint; `ConstraintResult.forbidden` (hard, never-split) / `.force_output` fields, merged by `collect_work_division_constraints` and consumed by every split pass |
+| `_inductor/work_division.py` | consumes `constraint_result.forbidden` / `.force_output` (feeds `forbidden` into `must_split_vars`; `forbidden_split_syms` + `force_output_syms` in `_default_split`); `collect_indirect_value_tds` + `IndirectAccess` span guard; `_resolve_layout` |
 | `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — grows a partial-stick gather output's entry-dim `device_size` to a whole stick (fix #5) |
 | `_inductor/codegen/superdsc.py` | grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #5) |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
