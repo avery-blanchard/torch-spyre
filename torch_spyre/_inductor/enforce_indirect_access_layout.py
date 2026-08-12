@@ -60,8 +60,8 @@ logger = get_inductor_logger("enforce_indirect_access_layout")
 
 def _scatter_access_subs_and_sizes(
     scatter_op: ComputedBuffer, output_layout, write_dep: MemoryDep
-) -> tuple[dict, dict]:
-    """Build access substitutions and sizes for scatter op index symbols.
+) -> tuple[dict, dict | None]:
+    """Build access substitutions for scatter op index symbols.
 
     _build_indirect_store_subs keys its result by the scatter index symbol
     itself (e.g. tmp0 in `d1 + 1024*tmp0`), mapping it to the index buffer's
@@ -69,9 +69,9 @@ def _scatter_access_subs_and_sizes(
     write_dep.index (symbols that appear in the write but NOT in write_dep's
     loop ranges) and build IndirectAccess mappings for each one.
 
-    For each scatter symbol, compute its device dimension via device_coordinates
-    to find the corresponding size in output_layout.device_size.
-    Returns ({sym: IndirectAccess(...)}, {sym: size}).
+    Returns ({sym: IndirectAccess(...)}, None). Sizes are not recoverable from
+    op alone (like gather's _build_indirect_store_subs); device_coordinates
+    handles None gracefully per its contract.
     """
 
     store_subs, _ = _build_indirect_store_subs(scatter_op)
@@ -88,24 +88,7 @@ def _scatter_access_subs_and_sizes(
         if sym in store_subs and hasattr(store_subs[sym], "base")
     }
 
-    # Compute device coordinates to find the actual device dimension for each
-    # scatter symbol, then look up its size from output_layout.device_size.
-    sizes: dict[sympy.Symbol, int] = {}
-    if output_layout.size and output_layout.stride:
-        # For each scatter symbol, find which host dimension it multiplies
-        # (by matching the stride of that dimension in output_layout.stride).
-        for sym in access_subs:
-            # Extract the coefficient of this symbol in write_dep.index
-            coeff = write_dep.index.coeff(sym)
-            if coeff is not None:
-                # Find which host dimension has this stride
-                for dim_idx, stride in enumerate(output_layout.stride):
-                    if stride == coeff:
-                        if 0 <= dim_idx < len(output_layout.size):
-                            sizes[sym] = output_layout.size[dim_idx]
-                        break
-
-    return access_subs, sizes
+    return access_subs, None
 
 
 def _real_layout(buf) -> FixedTiledLayout:
@@ -324,12 +307,12 @@ def _insert_mutation_relayout_copy(
             output_stl.device_size,
             output_stl.stride_map,
         )
-        # For scatter, get access subs and sizes, then find indirect in write coords
-        scatter_access_subs, scatter_sizes = _scatter_access_subs_and_sizes(
+        # For scatter, get access subs (sizes are not recoverable from op alone)
+        scatter_access_subs, _ = _scatter_access_subs_and_sizes(
             mutation_op, _output_real_layout(mutation_op), write_dep
         )
         write_stride_idx = _indirect_stride_idx(
-            device_coordinates(output_stl, write_dep, scatter_sizes),
+            device_coordinates(output_stl, write_dep, None),
             scatter_access_subs,
         )
     else:

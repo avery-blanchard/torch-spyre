@@ -112,7 +112,9 @@ class TestScatter(IndirectAccessTestCase):
             y[:, idx] = src
             return y
 
-        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, y, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
@@ -128,7 +130,9 @@ class TestScatter(IndirectAccessTestCase):
             y[idx] = src
             return y
 
-        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, y, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_3d_dim0(self):
         """y[idx] = src -- 3-D scatter on dim 0.
@@ -148,7 +152,9 @@ class TestScatter(IndirectAccessTestCase):
             y[idx] = src
             return y
 
-        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, y, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_index_put_4d_dim0(self):
         """y[idx] = src -- 4-D scatter on dim 0.
@@ -168,7 +174,31 @@ class TestScatter(IndirectAccessTestCase):
             y[idx] = src
             return y
 
-        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(
+            kernel, y, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
+
+    def test_index_put_degenerate_dim(self):
+        """y[idx] = src -- scatter with degenerate (size-1) dimension.
+
+        y[M,1,N], src[P,1,N], 1-D idx[P]: tests stride-matching with duplicate
+        strides (size-1 dims may share strides with adjacent dimensions).
+        """
+        M, N, P = 16, 256, 5
+        y = torch.rand(M, 1, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, 1, N, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "D1": 1, "N": N})
+        self.name_dims(src, {"P": P, "D1": 1, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(
+            kernel, y, src, idx, expect=SCATTER_OP_SPEC, expect_close=True
+        )
 
     def test_scatter(self):
         """torch.scatter(out, 0, index, src)"""
