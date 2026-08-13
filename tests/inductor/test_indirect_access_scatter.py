@@ -119,7 +119,7 @@ class TestScatter(IndirectAccessTestCase):
         M, N, P = 16, 1024, 7
         y = torch.rand(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
         self.name_dims(y, {"M": M, "N": N})
         self.name_dims(src, {"P": P, "N": N})
         self.name_dims(idx, {"P": P})
@@ -139,7 +139,7 @@ class TestScatter(IndirectAccessTestCase):
         M, N, K, P = 32, 64, 128, 8
         y = torch.rand(M, N, K, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, K, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
         self.name_dims(y, {"M": M, "N": N, "K": K})
         self.name_dims(src, {"P": P, "N": N, "K": K})
         self.name_dims(idx, {"P": P})
@@ -159,7 +159,7 @@ class TestScatter(IndirectAccessTestCase):
         M, N, K, L, P = 16, 32, 64, 256, 6
         y = torch.rand(M, N, K, L, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, K, L, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
         self.name_dims(y, {"M": M, "N": N, "K": K, "L": L})
         self.name_dims(src, {"P": P, "N": N, "K": K, "L": L})
         self.name_dims(idx, {"P": P})
