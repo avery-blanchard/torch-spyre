@@ -195,6 +195,7 @@ jobs:
       artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
       pytorch_sha: ${{ inputs.pytorch_sha }}
       pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
+      mode: validate
 
   # ---------------------------------------------------------------------------
   # Aggregate the per-suite JUnit XMLs the `test` matrix uploaded (one per
