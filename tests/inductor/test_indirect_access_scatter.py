@@ -210,7 +210,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def test_index_copy_e2e(self):
         """torch.compile(index_copy) against a paged-KV-cache-shaped device
-        layout ([576, 8, 128] with L tiled into stick groups), run e2e and
+        layout ([576, 8, 128]), run e2e and
         require the result to match the CPU reference."""
         cache, src, idx = self._paged_kv_cache_operands()
 
