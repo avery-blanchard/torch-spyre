@@ -66,7 +66,10 @@ class TestScatter(IndirectAccessTestCase):
         return out, src, idx
 
     def _full_index_store(self, M=128, N=256, P=3, dtype=torch.int32):
-        """Operands for scatter with a full [P,N] index tensor: out[M,N], src[P,N]."""
+        """Operands for scatter with a full [P,N] index tensor: out[M,N], src[P,N].
+        Index is uniform per row (all N columns in a row scatter to the same target
+        row) to ensure collision-free unique indices; per-element variation within
+        a row is not exercised."""
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
         index = (
@@ -190,11 +193,19 @@ class TestScatter(IndirectAccessTestCase):
 
     def _assert_compiled_matches_cpu(self, kernel, *dev_args):
         """Run `kernel` through torch.compile on device and require the result
-        to match the CPU eager reference -- a hard assertion, not an xfail."""
+        to match the CPU eager reference -- a hard assertion, not an xfail.
+        Compute CPU reference from pristine inputs before compiled run to catch
+        mutations that corrupt non-indexed regions."""
+        cpu_args = [
+            a.cpu()
+            if isinstance(a, torch.Tensor) and a.device.type == "spyre"
+            else a.clone()
+            if isinstance(a, torch.Tensor)
+            else a
+            for a in dev_args
+        ]
+        reference = kernel(*cpu_args)
         result = torch.compile(kernel, dynamic=False)(*dev_args)
-        reference = kernel(
-            *[a.cpu() if isinstance(a, torch.Tensor) else a for a in dev_args]
-        )
         torch.testing.assert_close(result.cpu(), reference)
 
     def test_index_copy_e2e(self):
