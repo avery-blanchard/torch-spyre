@@ -576,7 +576,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
@@ -611,7 +612,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
@@ -713,10 +715,11 @@ class SuperDSCScheduling(BaseScheduling):
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
+            method = "ktir" if _spyre_config.ktir_emitter else "sdsc"
+            kernel_name = "_".join([method, fused_name, wrapper.next_kernel_suffix()])
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
-            buf.writeline(f"async_compile.sdsc('{kernel_name}',")
+            buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
             buf.writeline(")")
