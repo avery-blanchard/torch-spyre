@@ -722,6 +722,12 @@ def align_tensors(
                 size.append(dim_size)
                 coordinates.append(offset)
                 continue
+            # Skip decomposition for indexed variables (no splits collected).
+            if not splits[var]:
+                # Indexed variable: no splits, keep the dimension as-is.
+                size.append(dim_size)
+                coordinates.append(var + offset)
+                continue
             # decompose dimension according to splits and tiling of stick dim
             low = (
                 0
