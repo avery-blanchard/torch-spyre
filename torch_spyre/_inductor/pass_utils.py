@@ -1014,18 +1014,17 @@ def _indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
 
 
 def shared_indirect_data_syms(op: "ComputedBuffer") -> set[Symbol]:
-    """Find data and indexed dimensions of shared tables that must not be split.
+    """Find data dimensions of shared tables that must not be split.
 
-    These include both:
-    - Non-indexed data dims (column/stick dimensions): stay at same base address.
-    - Indexed dims: all cores need the full range to dereference the table.
-
-    Splitting either would miscompile. Returns empty for regular operations.
+    These are the column/stick dimensions of tables shared across cores (gather
+    value tables or scatter destinations). We can't split these dimensions
+    because the table needs to stay at the same base address on every core.
+    Splitting a data dimension would require different base addresses per core,
+    breaking the shared access pattern. Returns empty for regular operations.
     """
     syms: set[Symbol] = set()
     for coords in _shared_indirect_coords(op):
         syms |= _non_indirect_coord_syms(coords)
-        syms |= _indirect_coord_syms(coords)
     return syms
 
 

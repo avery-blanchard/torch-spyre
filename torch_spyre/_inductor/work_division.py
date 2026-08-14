@@ -36,8 +36,8 @@ from torch._inductor.ir import (
 )
 
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
+from torch._inductor.graph import GraphLowering
 from torch_spyre._C import ElementArrangement
 
 from .errors import Unsupported
@@ -326,10 +326,33 @@ def adjust_it_space_for_sticks(
     symbol_meta = symbol_meta or {}
 
     # Collect indexed dimension symbols for indirect-access ops (excluded from adjustment).
+    # This includes both value-tensor indexed dims AND index-tensor stick dims.
     indexed_syms: set[Symbol] = set()
     if op is not None:
+        # Value/scatter tensor's indexed coords.
         for coords in _shared_indirect_coords(op):
             indexed_syms |= _indirect_coord_syms(coords)
+
+        # Index tensor stick dimensions (the index tensor's own stick dim).
+        subs = indirect_access_subs_from_op(op)
+        index_names = {e.args[0].name for e in subs.values() if e.args}
+        for d in op.get_read_writes().reads:
+            if isinstance(d, MemoryDep) and d.name in index_names:
+                # This is an index tensor; its stick dim should not be adjusted.
+                layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+                stick_expr = device_coordinates(layout.device_layout, d, None)[-1]
+                if len(stick_expr.free_symbols) == 1:
+                    stick_sym = next(iter(stick_expr.free_symbols))
+                    # Match by name in it_space since Symbol objects may differ
+                    for it_sym in it_space:
+                        if str(it_sym) == str(stick_sym):
+                            indexed_syms.add(it_sym)
+                            break
+
+        if indexed_syms:
+            logger.debug(
+                f"adjust_it_space_for_sticks: skipping stick adjustment for indexed dims {indexed_syms}"
+            )
 
     # Pass 1: find the largest elems_per_stick per stick variable.
     adjusted_space = dict(it_space)
