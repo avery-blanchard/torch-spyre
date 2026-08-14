@@ -52,6 +52,7 @@ from .pass_utils import (
     concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
+    indirect_info_from_op,
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
@@ -288,6 +289,7 @@ def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
     symbol_meta: SymbolMeta | None = None,
+    op: ComputedBuffer | None = None,
 ) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
     """
     Return a copy of it_space with stick variables converted from elements to
@@ -306,6 +308,12 @@ def adjust_it_space_for_sticks(
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
     fewer cores assigned to the stick dimension).
 
+    Ops with indirect (gather/scatter-style) access skip the adjustment
+    entirely: the indexed dim's per-core coordinate depends on runtime data,
+    not a static per-core offset (mirrors indirect_access_pinned_vars in
+    work_division_constraints.py), so treating sticks as atomic units here
+    does not apply.
+
     TODO: As of now, the stick dim cannot be symbolic. Granularity
     on a symbolic stick var would have to additionally be a multiple of
     ``elems_per_stick`` for the stick-count conversion to stay coherent; that
@@ -314,6 +322,9 @@ def adjust_it_space_for_sticks(
 
     The original it_space is not mutated.
     """
+    if indirect_info_from_op(op)[0]:
+        return dict(it_space), {}
+
     symbol_meta = symbol_meta or {}
 
     # Pass 1: find the largest elems_per_stick per stick variable.
@@ -776,7 +787,7 @@ def enumerate_work_division_candidates(
 
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, all_tds, symbol_meta, op
     )
 
     # Reduction (K) dims are the iteration vars absent from the output tensor's
@@ -1009,7 +1020,7 @@ def span_reduction_pass(
     symbol_meta = _collect_symbol_metadata(it_space)
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, all_tds, symbol_meta, op
     )
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
@@ -1189,7 +1200,7 @@ def work_distribution_pass(
     symbol_meta = _collect_symbol_metadata(it_space)
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, input_tds + [output_td], symbol_meta
+        it_space, all_tds, symbol_meta, op
     )
 
     # Recover splits committed by span_reduction_pass using the same
@@ -1789,7 +1800,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
             f"ops only."
         )
 
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds, op=op)
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
     # runs before this pass, and work_distribution — which would overwrite it —
