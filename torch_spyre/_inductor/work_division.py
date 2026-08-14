@@ -52,13 +52,14 @@ from .pass_utils import (
     concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
-    indirect_info_from_op,
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     indirect_access_subs_from_op,
     indirect_sizes_from_op,
     _fixed_read_layout,
+    _shared_indirect_coords,
+    _indirect_coord_syms,
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
@@ -308,11 +309,11 @@ def adjust_it_space_for_sticks(
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
     fewer cores assigned to the stick dimension).
 
-    Ops with indirect (gather/scatter-style) access skip the adjustment
-    entirely: the indexed dim's per-core coordinate depends on runtime data,
-    not a static per-core offset (mirrors indirect_access_pinned_vars in
-    work_division_constraints.py), so treating sticks as atomic units here
-    does not apply.
+    For indirect (gather/scatter-style) access ops, indexed dimensions are
+    excluded from stick adjustment: the indexed dim's per-core coordinate depends
+    on runtime data, not a static per-core offset, so the stick-atomic-unit
+    constraint does not apply to them. Data dimensions (non-indexed) are still
+    converted to stick units as normal.
 
     TODO: As of now, the stick dim cannot be symbolic. Granularity
     on a symbolic stick var would have to additionally be a multiple of
@@ -322,10 +323,13 @@ def adjust_it_space_for_sticks(
 
     The original it_space is not mutated.
     """
-    if indirect_info_from_op(op)[0]:
-        return dict(it_space), {}
-
     symbol_meta = symbol_meta or {}
+
+    # Collect indexed dimension symbols for indirect-access ops (excluded from adjustment).
+    indexed_syms: set[Symbol] = set()
+    if op is not None:
+        for coords in _shared_indirect_coords(op):
+            indexed_syms |= _indirect_coord_syms(coords)
 
     # Pass 1: find the largest elems_per_stick per stick variable.
     adjusted_space = dict(it_space)
@@ -445,9 +449,19 @@ def warn_if_per_core_overflow(
     splits: dict[Symbol, int],
     op_name: str,
     symbol_meta: SymbolMeta,
+    op: ComputedBuffer | None = None,
 ) -> None:
-    """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
+    """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES.
+
+    Skips indirect value tensors (shared reads): their spans don't scale with
+    output splitting, so they're not constrained by the limit.
+    """
+    indirect_coords_lists = _shared_indirect_coords(op) if op else []
     for td in tensor_deps:
+        # Skip indirect value tensors.
+        if any(td.device_coords == coords for coords in indirect_coords_lists):
+            continue
+
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
@@ -468,6 +482,7 @@ def must_split_vars(
     max_cores: int,
     symbol_meta: SymbolMeta,
     forbidden_split_syms: "set[Symbol] | None" = None,
+    op: ComputedBuffer | None = None,
 ) -> dict[Symbol, int]:
     """Return the minimum splits per iteration variable to keep each tensor's
     memory span within MAX_SPAN_BYTES.
@@ -487,6 +502,9 @@ def must_split_vars(
     runtime bucket evenly. The span check itself uses ``max_size`` as the
     worst-case footprint.
 
+    Indirect value tensors (shared reads) are skipped: their indexed dimension
+    never splits, so they don't constrain output-dimension splitting.
+
     Args:
         tensor_deps: List of tensor dependencies to check
         it_space_orig: Original iteration space (element-valued)
@@ -494,6 +512,7 @@ def must_split_vars(
         stick_vars: Mapping of stick variables to elements per stick
         max_cores: Maximum number of cores available
         symbol_meta: Per-symbol (max_size, granularity) for symbolic dims
+        op: ComputedBuffer to identify indirect value tensors
 
     Returns a dict mapping Symbol -> number of slices.
     """
@@ -501,7 +520,14 @@ def must_split_vars(
     # for symbolic path. Refer to #2287 for details.
     accumulated_splits: dict[Symbol, int] = {}
 
+    # Collect indirect value tensor coordinate lists.
+    indirect_coords_lists = _shared_indirect_coords(op) if op else []
+
     for td in tensor_deps:
+        # Skip span check for indirect value tensors (shared reads with indexed dims).
+        if any(td.device_coords == coords for coords in indirect_coords_lists):
+            continue
+
         if (
             get_per_core_span(td, accumulated_splits, it_space_orig, symbol_meta)
             <= MAX_SPAN_BYTES
@@ -1053,6 +1079,7 @@ def span_reduction_pass(
         max_cores,
         symbol_meta,
         forbidden_split_syms=forbidden,
+        op=op,
     )
 
     constraint_result = collect_work_division_constraints(
@@ -1272,7 +1299,7 @@ def work_distribution_pass(
                     f"op_it_space_splits={op_splits}"
                 )
             warn_if_per_core_overflow(
-                all_tds, it_space, user_splits, op.get_name(), symbol_meta
+                all_tds, it_space, user_splits, op.get_name(), symbol_meta, op
             )
             return
 
@@ -1305,7 +1332,7 @@ def work_distribution_pass(
             f"op_it_space_splits={op.op_it_space_splits}"
         )
 
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta, op)
 
 
 _PT_ROWS = 8  # PT block rows per corelet
@@ -1855,7 +1882,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
 
     apply_splits(op, splits, output_td)
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta, op)
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
