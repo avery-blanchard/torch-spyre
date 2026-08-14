@@ -693,12 +693,11 @@ def align_tensors(
             # Synthetic vars (z0, z1, …) are introduced by normalize_coordinates
             # for restored size-1 dims and are not in orig_ranges; fall back to
             # the concretized value (always 1) for those.
-            new_var_ranges[var] = _bounded_or_hint(
-                orig_ranges.get(var, var_ranges[var]), var_ranges[var]
-            )
             # var can be a loop var or an indirect symbol
             if var in var_ranges:
-                new_var_ranges[var] = var_ranges[var]
+                new_var_ranges[var] = _bounded_or_hint(
+                    orig_ranges.get(var, var_ranges[var]), var_ranges[var]
+                )
             elif indirect_sizes is not None and var in indirect_sizes:
                 new_var_ranges[var] = indirect_sizes[var]
             else:
