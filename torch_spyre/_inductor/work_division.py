@@ -377,7 +377,10 @@ def adjust_it_space_for_sticks(
             max_elems[stick_var] = elems_per_stick
 
     # Pass 2: adjust each variable once using the maximum.
+    # Skip indexed dimensions for indirect-access ops (they're not split).
     for stick_var, elems_per_stick in max_elems.items():
+        if stick_var in indexed_syms:
+            continue
         # FIXME: here we assume padding to a full stick. It may not always be
         #        the case and we should use a more robust way of computing the
         #        number of sticks
@@ -456,10 +459,13 @@ def warn_if_per_core_overflow(
     Skips indirect value tensors (shared reads): their spans don't scale with
     output splitting, so they're not constrained by the limit.
     """
-    indirect_coords_lists = _shared_indirect_coords(op) if op else []
     for td in tensor_deps:
-        # Skip indirect value tensors.
-        if any(td.device_coords == coords for coords in indirect_coords_lists):
+        # Skip indirect value tensors: check if first coord has IndirectAccess.
+        if (
+            td.device_coords
+            and hasattr(td.device_coords[0], "has")
+            and td.device_coords[0].has(IndirectAccess)
+        ):
             continue
 
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
