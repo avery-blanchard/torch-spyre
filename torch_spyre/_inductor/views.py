@@ -627,9 +627,23 @@ def align_tensors(
     # Indexed dims stay full-size across cores since the index tensor is not split.
     indexed_vars = set(indirect_sizes.keys()) if indirect_sizes else set()
 
+    # Also skip splits for iteration variables used in index tensor coordinates.
+    # Index tensors are not split in multi-core indirect access.
+    index_tensor_vars = set()
+    if indirect_sizes and len(all_terms) > 0:
+        # First tensor in all_terms is typically the index tensor for gathers
+        # Check if it has coordinates that reference iteration vars
+        for term in all_terms[0]:
+            if term.var is not None:
+                index_tensor_vars.add(term.var)
+
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
-            if var is not None and var not in indexed_vars:
+            if (
+                var is not None
+                and var not in indexed_vars
+                and var not in index_tensor_vars
+            ):
                 if den != stick_size[i] or var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
                     splits[var].add(den)
