@@ -623,9 +623,13 @@ def align_tensors(
 
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
+    # For indirect access ops, don't decompose indexed variables (those in indirect_sizes).
+    # Indexed dims stay full-size across cores since the index tensor is not split.
+    indexed_vars = set(indirect_sizes.keys()) if indirect_sizes else set()
+
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
-            if var is not None:
+            if var is not None and var not in indexed_vars:
                 if den != stick_size[i] or var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
                     splits[var].add(den)
