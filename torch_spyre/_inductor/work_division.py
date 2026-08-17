@@ -1557,9 +1557,11 @@ def _divide_topk_op(
 ) -> None:
     """Apply multi-core work division for topk ops.
 
-    Splits only k, across the smallest number of cores d with
+    k is split across the smallest number of cores d with
     k / d <= _TOPK_MAX_K_PER_CORE. Raises Unsupported if no such d exists
-    within max_cores.
+    within max_cores. The search-space (reduction) dimension is never split.
+    Any remaining core budget is then distributed across the other
+    batch/output dims, sharing the same max_cores budget with the k-split.
     """
     input_tds, output_td = collect_tensor_deps(op, args)
 
@@ -1584,17 +1586,27 @@ def _divide_topk_op(
         )
     required_k_cores = valid_k_splits[0]
 
-    # Commit only the k-split, leaving all other dims at split=1.
-    splits = {sym: 1 for sym in it_space}
-    splits[k_sym] = required_k_cores
+    # Commit the k-split, then distribute any remaining core budget across
+    # the other output/batch dims. The search-space (reduction) dim is
+    # never a candidate -- pass reduction_dims=[] so multi_dim_iteration_
+    # space_split's reduction-dim pass never runs.
+    other_output_dims = [d for d in output_dims if d != k_sym]
+    splits = multi_dim_iteration_space_split(
+        it_space_adjusted,
+        max_cores,
+        other_output_dims,
+        [],
+        min_splits={k_sym: required_k_cores},
+    )
     apply_splits(op, splits, output_td)
 
     logger.debug(
-        "_divide_topk_op %s: k=%d, k_cores=%d, k_per_core=%d",
+        "_divide_topk_op %s: k=%d, k_cores=%d, k_per_core=%d, splits=%s",
         op.get_name(),
         k_val,
         required_k_cores,
         k_val // required_k_cores,
+        splits,
     )
 
 
