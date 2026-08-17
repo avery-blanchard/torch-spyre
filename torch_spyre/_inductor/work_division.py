@@ -1557,9 +1557,9 @@ def _divide_topk_op(
 ) -> None:
     """Apply multi-core work division for topk ops.
 
-    Splits only k, across the smallest number of cores d with
-    k / d <= _TOPK_MAX_K_PER_CORE. Raises Unsupported if no such d exists
-    within max_cores.
+    Splits k and optionally other output dims (batch, etc.), but never the
+    search-space dim. Chooses the split with the smallest k-split factor
+    (minimizing cores used by k constraint).
     """
     input_tds, output_td = collect_tensor_deps(op, args)
 
@@ -1582,11 +1582,45 @@ def _divide_topk_op(
             f"k_per_core <= {_TOPK_MAX_K_PER_CORE}, so k cannot be split "
             f"across at most {max_cores} cores"
         )
-    required_k_cores = valid_k_splits[0]
 
-    # Commit only the k-split, leaving all other dims at split=1.
+    # For each valid k-split, find the best divisor considering both k and
+    # other splittable dims. Pick the one using the most cores overall.
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    other_output_dims = [v for v in output_dims if v != k_sym]
+
+    best_k_cores = valid_k_splits[0]
+    best_total_cores = best_k_cores
+
+    for k_cores in valid_k_splits:
+        remaining = max_cores // k_cores
+        total_cores = k_cores
+        # Try to split other output dims with remaining cores.
+        for other_dim in other_output_dims:
+            dim_size = concretize_expr(it_space_adjusted[other_dim])
+            # Find largest divisor of dim_size that fits in remaining cores.
+            divisor_options = sorted(
+                [d for d in divisors(dim_size) if d <= remaining], reverse=True
+            )
+            if divisor_options:
+                divisor = divisor_options[0]
+                total_cores *= divisor
+                remaining //= divisor
+        if total_cores > best_total_cores:
+            best_total_cores = total_cores
+            best_k_cores = k_cores
+
+    required_k_cores = best_k_cores
+
+    # Commit k-split; search-space dims stay at 1. Other dims may split via
+    # span_reduction/work_distribution with remaining cores.
     splits = {sym: 1 for sym in it_space}
     splits[k_sym] = required_k_cores
+
+    for var in reduction_vars:
+        if var != k_sym:
+            splits[var] = 1
+
     apply_splits(op, splits, output_td)
 
     logger.debug(
@@ -1607,7 +1641,7 @@ def divide_reduction_op(
     red: Reduction = op.data
 
     if red.reduction_type in TOPK_OPS:
-        # span_reduction/work_distribution don't apply to topk; split directly.
+        # Topk splits only k, never the search space. Handle via direct split.
         _divide_topk_op(op, args, max_cores)
         return
 

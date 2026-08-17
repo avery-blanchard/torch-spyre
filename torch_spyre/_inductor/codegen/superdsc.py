@@ -62,7 +62,7 @@ from torch_spyre._inductor.op_spec import (
     TensorWorkDivision,
     is_lx_relayout_identity,
 )
-from torch_spyre._inductor.pass_utils import coeff_through_floor
+from torch_spyre._inductor.pass_utils import coeff_through_floor, concretize_expr
 
 from .compute_ops import SymbolKind, generate_sdsc, num_bytes
 
@@ -1755,6 +1755,29 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: wk_slice if not has_indirect_access else 1
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
+
+    # For topk: k's split is not via work slices; instead, adjust k's iteration
+    # space to k_per_core. Find k as the output dim absent from input coords.
+    if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
+        input_arg = op_spec.args[0]
+        output_arg = op_spec.args[-1]
+        input_dim_order, _ = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
+        output_dim_order, _ = _get_device_dim_order(output_arg, symbol_mapping, op_spec)
+        k_dims = [d for d in output_dim_order if d not in input_dim_order]
+        if k_dims:
+            k_dim = k_dims[0]
+            # k_dim is the sdsc name; find its corresponding symbol in iteration_space.
+            k_sym = None
+            for sym, sdsc_name in symbol_mapping.items():
+                if sdsc_name == k_dim:
+                    k_sym = sym
+                    break
+            if k_sym is not None and k_sym in dim_splits and dim_splits[k_sym] > 1:
+                # k is split across dim_splits[k_sym] cores. Adjust iteration space.
+                k_total, _ = op_spec.iteration_space[k_sym]
+                k_per_core = concretize_expr(k_total) // dim_splits[k_sym]
+                sdsc_iteration_space[k_dim] = k_per_core
+                work_slices[k_dim] = 1
 
     # Inject implicit kernel dimensions for conv2d when kernel_size=1. This is
     # the depthwise-conv (#3510) path only: forward conv2d (#3284) sources its
