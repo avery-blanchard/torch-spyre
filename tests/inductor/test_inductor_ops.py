@@ -1242,6 +1242,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     32,
                     2,
                 ),
+                "2d_k8_dim_0_fp16": (
+                    unique_randn_along_dim((32, 192), dim=0),
+                    8,
+                    0,
+                ),
+                "3d_k16_dim_1_fp16": (
+                    unique_randn_along_dim((4, 64, 192), dim=1),
+                    16,
+                    1,
+                ),
+                "4d_k10_dim2_fp16": (
+                    unique_randn_along_dim((2, 4, 64, 64), dim=2),
+                    10,
+                    2,
+                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
