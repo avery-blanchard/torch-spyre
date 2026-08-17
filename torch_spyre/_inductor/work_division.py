@@ -696,18 +696,15 @@ def enumerate_work_division_candidates(
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
-    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
-    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    For ``TOPK`` reductions, k's factors are restricted to divisors ``d``
+    with ``k / d <= _TOPK_MAX_K_PER_CORE`` (mirrors ``_divide_topk_op``), and
+    the search-space dim is pinned to 1 -- topk splits k only.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
-
-    # TOPK reductions run single-core (see divide_reduction_op): the only
-    # permissible "division" is the unsplit one.
-    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
-        return [{v: 1 for v in it_space}]
+    is_topk = isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS
 
     input_tds, output_td = collect_tensor_deps(
         op, get_mem_deps_from_rw(op_read_writes(op))
@@ -723,6 +720,15 @@ def enumerate_work_division_candidates(
     # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    topk_k_sym = None
+    if is_topk:
+        output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
+        topk_k_sym = _find_topk_k_symbol(output_dims, input_tds)
+        if topk_k_sym is None:
+            # k=1: inductor optimizes away the size-1 loop, so k has no symbol.
+            return [{v: 1 for v in it_space}]
+
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -737,10 +743,16 @@ def enumerate_work_division_candidates(
     )
     blocked = constraint_result.blocked
     pinned = constraint_result.pinned
+    if is_topk:
+        # Topk never splits the search space itself -- only k.
+        pinned = {**pinned, **{v: 1 for v in reduction_vars}}
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
     def factors(v: Symbol) -> list[int]:
+        if is_topk and v == topk_k_sym:
+            k_val = concretize_expr(it_space[v])
+            return _topk_valid_k_splits(k_val, max_cores) or [1]
         if v in symbol_meta:
             basis = symbol_meta[v][1]  # granularity
         elif v in stick_vars:
@@ -1504,63 +1516,85 @@ def divide_pointwise_op(
 _TOPK_MAX_K_PER_CORE = 4
 
 
+def _find_topk_k_symbol(
+    output_dims: list[Symbol], input_tds: list[TensorDep]
+) -> Symbol | None:
+    """Return the output symbol absent from every input's device coords.
+
+    ``_topk_reduction_kwargs`` (lowering.py) substitutes the reduction loop
+    var for k in every input load, so k's symbol never appears in an input's
+    device coords -- unlike batch/other output dims, which pass through
+    unchanged. This distinguishes k independent of size.
+
+    Returns None if no such symbol exists, or more than one does (should not
+    happen for a well-formed topk op).
+    """
+    input_syms = {
+        s for td in input_tds for e in td.device_coords[:-1] for s in e.free_symbols
+    }
+    candidates = [d for d in output_dims if d not in input_syms]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _topk_valid_k_splits(k_val: int, max_cores: int) -> list[int]:
+    """Return every divisor of k_val that is a legal per-core k-split.
+
+    A divisor ``d`` is legal iff ``d <= max_cores`` and
+    ``k_val // d <= _TOPK_MAX_K_PER_CORE``. ``d=1`` is included iff
+    ``k_val <= _TOPK_MAX_K_PER_CORE``. Results are sorted ascending.
+    """
+    return [
+        d
+        for d in sorted(divisors(k_val))
+        if d <= max_cores and k_val // d <= _TOPK_MAX_K_PER_CORE
+    ]
+
+
 def _divide_topk_op(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
 ) -> None:
-    """Apply multi-core work division for topk ops where k > _TOPK_MAX_K_PER_CORE.
+    """Apply multi-core work division for topk ops.
 
-    The topk backend processes at most _TOPK_MAX_K_PER_CORE output rows per
-    core.  When k exceeds this limit the k dimension must be split across
-    cores, with each core computing k/num_cores output rows.
-
-    The required number of cores is the smallest divisor of k for which
-    k / divisor <= _TOPK_MAX_K_PER_CORE, capped at max_cores.  If no such
-    divisor exists, Unsupported is raised to trigger the fallback path.
+    Splits only k, across the smallest number of cores d with
+    k / d <= _TOPK_MAX_K_PER_CORE. Raises Unsupported if no such d exists
+    within max_cores.
     """
     input_tds, output_td = collect_tensor_deps(op, args)
 
     it_space = iteration_space_from_op(op)
-
-    # Identify the k symbol: the only non-stick output dimension.
     it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, input_tds + [output_td])
     output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
     if not output_dims:
         return
 
-    # For topk the only non-stick output dim is k (mb is the stick dim).
-    k_sym = output_dims[0]
+    k_sym = _find_topk_k_symbol(output_dims, input_tds)
+    if k_sym is None:
+        # k=1: inductor optimizes away the size-1 loop. Single-core is correct.
+        return
     k_val = concretize_expr(it_space[k_sym])
 
-    if k_val <= _TOPK_MAX_K_PER_CORE:
-        return
-
-    # Find the smallest divisor of k such that k/divisor <= _TOPK_MAX_K_PER_CORE,
-    # capped at max_cores.
-    required_cores = None
-    for d in sorted(divisors(k_val)):
-        if d > 1 and k_val // d <= _TOPK_MAX_K_PER_CORE and d <= max_cores:
-            required_cores = d
-            break
-
-    if required_cores is None:
+    valid_k_splits = _topk_valid_k_splits(k_val, max_cores)
+    if not valid_k_splits:
         raise Unsupported(
-            f"topk: k={k_val} cannot be split across at most {max_cores} cores "
-            f"such that k_per_core <= {_TOPK_MAX_K_PER_CORE}; "
-            f"no valid divisor exists in [2, {max_cores}]"
+            f"topk(k={k_val}): no divisor of k in [1, {max_cores}] gives "
+            f"k_per_core <= {_TOPK_MAX_K_PER_CORE}, so k cannot be split "
+            f"across at most {max_cores} cores"
         )
+    required_k_cores = valid_k_splits[0]
 
+    # Commit only the k-split, leaving all other dims at split=1.
     splits = {sym: 1 for sym in it_space}
-    splits[k_sym] = required_cores
+    splits[k_sym] = required_k_cores
     apply_splits(op, splits, output_td)
 
     logger.debug(
-        "_divide_topk_op %s: k=%d, cores=%d, k_per_core=%d",
+        "_divide_topk_op %s: k=%d, k_cores=%d, k_per_core=%d",
         op.get_name(),
         k_val,
-        required_cores,
-        k_val // required_cores,
+        required_k_cores,
+        k_val // required_k_cores,
     )
 
 
@@ -1573,11 +1607,7 @@ def divide_reduction_op(
     red: Reduction = op.data
 
     if red.reduction_type in TOPK_OPS:
-        # Topk requires at most _TOPK_MAX_K_PER_CORE output rows per core.
-        # For k <= _TOPK_MAX_K_PER_CORE a single core suffices; for larger k
-        # the k dimension must be split across cores.  Work distribution passes
-        # (span_reduction, work_distribution) are not applicable to topk so we
-        # handle the split here directly.
+        # span_reduction/work_distribution don't apply to topk; split directly.
         _divide_topk_op(op, args, max_cores)
         return
 

@@ -335,8 +335,6 @@ def spyre_topk(
     largest: bool = True,
     sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 4:
-        raise Unsupported("Topk is not supported for this config")
     if not largest:
         raise Unsupported("topk with largest=False")
     # sorted=False only relaxes the ordering guarantee (any order of the top-k
