@@ -17,7 +17,14 @@ import math
 import pytest
 import sympy
 
+import torch_spyre._inductor.codegen.superdsc as superdsc_module
+import torch_spyre._inductor.pass_utils as pass_utils_module
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor.codegen.superdsc import parse_op_spec
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
+    BATCH_MATMUL_OP,
+)
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
@@ -27,7 +34,7 @@ def _coordinates(splits, num_cores, **kwargs):
     mapping = core_to_slice_mapping(dims, splits, num_cores, **kwargs)
     core_id = sympy.Symbol("core_id")
     return [
-        tuple(int(mapping[str(dim)].subs(core_id, core)) for dim in dims)
+        tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
         for core in range(num_cores)
     ]
 
@@ -102,3 +109,61 @@ def _bmm_op_spec(op: str) -> OpSpec:
         args,
         {},
     )
+
+
+@pytest.mark.parametrize("op", [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP])
+@pytest.mark.parametrize("reduction_contiguous", [False, True])
+def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contiguous):
+    class FakeReduction:
+        def __init__(self, reduction_type):
+            self.reduction_type = reduction_type
+
+    class FakeComputedBuffer:
+        def __init__(self, reduction_type):
+            self.data = FakeReduction(reduction_type)
+
+    monkeypatch.setattr(pass_utils_module, "Reduction", FakeReduction)
+    monkeypatch.setattr(pass_utils_module, "ComputedBuffer", FakeComputedBuffer)
+    monkeypatch.setattr(
+        pass_utils_module.config,
+        "core_id_k_fast_emission",
+        reduction_contiguous,
+    )
+    monkeypatch.setattr(
+        superdsc_module._spyre_config,
+        "core_id_k_fast_emission",
+        reduction_contiguous,
+    )
+
+    op_spec = _bmm_op_spec(op)
+    dims = tuple(op_spec.iteration_space)
+    splits = dict(zip(dims, (2, 4, 4)))
+    monkeypatch.setattr(
+        pass_utils_module, "apply_splits_from_index_coeff", lambda *_: splits
+    )
+    prep = pass_utils_module._ViewPrep(
+        iter_space=op_spec.iteration_space,
+        write_index=dims[0],
+        read_index=dims[-1],
+        dep_coeff={dims[0]: 1, dims[1]: 2, dims[2]: 0},
+        device_size=[2, 4],
+        stride_map=[1, 2],
+        elems_per_stick=64,
+        device_stride_to_dim={1: 0, 2: 1},
+        stick_host_stride=None,
+        num_stick_dim=None,
+        num_stick=0,
+        num_stick_stride=0,
+        is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
+    )
+    planner_view, _, representable = pass_utils_module._per_core_view_from_prep(
+        prep, ({1: 2, 2: 4}, {3: 4})
+    )
+
+    sdsc_spec, renamed = parse_op_spec(op_spec)
+    sdsc_output_mapping = {
+        device_dim: sdsc_spec.core_id_to_work_slice[renamed[dim]]
+        for device_dim, dim in enumerate(dims[:2])
+    }
+    assert representable
+    assert dict(planner_view.core_to_slot) == sdsc_output_mapping
