@@ -97,6 +97,7 @@ def collect_work_division_constraints(
         qfp8wt_pinned_vars,
         qfp8wt_matmul_k_pinned,
         topk_pinned_search_space_vars,
+        topk_k_split_constraint,
         indirect_access_pinned_vars,
     ):
         result = constraint(ctx)
@@ -248,6 +249,50 @@ def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
         return ConstraintResult()
 
     return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
+
+
+def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Pin k to the smallest valid split for topk ops.
+
+    Each core can produce at most 4 top-k results per pass. The smallest valid
+    k-split is ceil(k / 4), chosen to minimize core usage while satisfying the
+    hardware constraint. This is pinned as a hard constraint to ensure the
+    work_distribution planner picks the minimal k-split rather than a
+    larger one that leaves more cores for other dims.
+    """
+    from .constants import TOPK_OPS
+    from sympy import divisors
+
+    if not isinstance(ctx.op.data, Reduction):
+        return ConstraintResult()
+    if ctx.op.data.reduction_type not in TOPK_OPS:
+        return ConstraintResult()
+
+    # Find k's symbol (output dim absent from every input's device coords).
+    coord_vars = {
+        s for td in ctx.input_tds for e in td.device_coords[:-1] for s in e.free_symbols
+    }
+    output_vars = {s for e in ctx.output_td.device_coords[:-1] for s in e.free_symbols}
+    k_sym_candidates = [s for s in output_vars if s not in coord_vars]
+    if len(k_sym_candidates) != 1:
+        # k=1 or malformed; no constraint needed.
+        return ConstraintResult()
+
+    k_sym = k_sym_candidates[0]
+    k_val = concretize_expr(ctx.it_space[k_sym])
+
+    # Find the smallest divisor d of k such that k / d <= 4.
+    _TOPK_MAX_K_PER_CORE = 4
+    min_k_split = None
+    for d in sorted(divisors(k_val)):
+        if k_val // d <= _TOPK_MAX_K_PER_CORE and d <= 32:  # 32 = max_cores default
+            min_k_split = d
+            break
+
+    if min_k_split and min_k_split > 1:
+        return ConstraintResult(pinned={k_sym: min_k_split})
+
+    return ConstraintResult()
 
 
 def indirect_access_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
