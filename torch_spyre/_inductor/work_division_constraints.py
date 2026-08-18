@@ -283,13 +283,21 @@ def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
     # Find the smallest divisor d of k such that k / d <= 4.
     _TOPK_MAX_K_PER_CORE = 4
+    max_cores = config.sencores
     min_k_split = None
     for d in sorted(divisors(k_val)):
-        if k_val // d <= _TOPK_MAX_K_PER_CORE and d <= 32:  # 32 = max_cores default
+        if k_val // d <= _TOPK_MAX_K_PER_CORE and d <= max_cores:
             min_k_split = d
             break
 
-    if min_k_split and min_k_split > 1:
+    if min_k_split is None:
+        raise Unsupported(
+            f"topk(k={k_val}): no divisor of k in [1, {max_cores}] gives "
+            f"k_per_core <= {_TOPK_MAX_K_PER_CORE}, so k cannot be split "
+            f"across at most {max_cores} cores"
+        )
+
+    if min_k_split > 1:
         return ConstraintResult(pinned={k_sym: min_k_split})
 
     return ConstraintResult()
