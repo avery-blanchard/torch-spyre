@@ -96,6 +96,7 @@ def collect_work_division_constraints(
         conv_spatial_blocked_vars,
         qfp8wt_pinned_vars,
         qfp8wt_matmul_k_pinned,
+        topk_pinned_search_space_vars,
         indirect_access_pinned_vars,
     ):
         result = constraint(ctx)
@@ -227,6 +228,23 @@ def qfp8wt_matmul_k_pinned(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
     all_tds = ctx.input_tds + [ctx.output_td]
     if not has_qfp8wt_tensor(all_tds):
+        return ConstraintResult()
+
+    return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
+
+
+def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Pin the search-space (reduction) dim to split=1 for topk ops.
+
+    The topk hardware op searches the full dimension on one core to compute
+    the top-k results. Splitting the search-space would require merging
+    partial top-k results across cores, which the hardware does not support.
+    """
+    from .constants import TOPK_OPS
+
+    if not isinstance(ctx.op.data, Reduction):
+        return ConstraintResult()
+    if ctx.op.data.reduction_type not in TOPK_OPS:
         return ConstraintResult()
 
     return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})

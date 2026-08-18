@@ -697,8 +697,8 @@ def enumerate_work_division_candidates(
     included when it is itself permissible.
 
     For ``TOPK`` reductions, k's factors are restricted to divisors ``d``
-    with ``k / d <= _TOPK_MAX_K_PER_CORE`` (mirrors ``_divide_topk_op``), and
-    the search-space dim is pinned to 1 -- topk splits k only.
+    with ``k / d <= _TOPK_MAX_K_PER_CORE``, and the search-space dim is
+    pinned to 1 via the ``topk_pinned_search_space_vars`` constraint.
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
@@ -743,9 +743,6 @@ def enumerate_work_division_candidates(
     )
     blocked = constraint_result.blocked
     pinned = constraint_result.pinned
-    if is_topk:
-        # Topk never splits the search space itself -- only k.
-        pinned = {**pinned, **{v: 1 for v in reduction_vars}}
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
@@ -1550,79 +1547,12 @@ def _topk_valid_k_splits(k_val: int, max_cores: int) -> list[int]:
     ]
 
 
-def _divide_topk_op(
-    op: ComputedBuffer,
-    args: list[SchedNodeArg],
-    max_cores: int,
-) -> None:
-    """Apply multi-core work division for topk ops.
-
-    k is split across the smallest number of cores d with
-    k / d <= _TOPK_MAX_K_PER_CORE. Raises Unsupported if no such d exists
-    within max_cores. The search-space (reduction) dimension is never split.
-    Any remaining core budget is then distributed across the other
-    batch/output dims, sharing the same max_cores budget with the k-split.
-    """
-    input_tds, output_td = collect_tensor_deps(op, args)
-
-    it_space = iteration_space_from_op(op)
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, input_tds + [output_td])
-    output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
-    if not output_dims:
-        return
-
-    k_sym = _find_topk_k_symbol(output_dims, input_tds)
-    if k_sym is None:
-        # k=1: inductor optimizes away the size-1 loop. Single-core is correct.
-        return
-    k_val = concretize_expr(it_space[k_sym])
-
-    valid_k_splits = _topk_valid_k_splits(k_val, max_cores)
-    if not valid_k_splits:
-        raise Unsupported(
-            f"topk(k={k_val}): no divisor of k in [1, {max_cores}] gives "
-            f"k_per_core <= {_TOPK_MAX_K_PER_CORE}, so k cannot be split "
-            f"across at most {max_cores} cores"
-        )
-    required_k_cores = valid_k_splits[0]
-
-    # Commit the k-split, then distribute any remaining core budget across
-    # the other output/batch dims. The search-space (reduction) dim is
-    # never a candidate -- pass reduction_dims=[] so multi_dim_iteration_
-    # space_split's reduction-dim pass never runs.
-    other_output_dims = [d for d in output_dims if d != k_sym]
-    splits = multi_dim_iteration_space_split(
-        it_space_adjusted,
-        max_cores,
-        other_output_dims,
-        [],
-        min_splits={k_sym: required_k_cores},
-    )
-    apply_splits(op, splits, output_td)
-
-    logger.debug(
-        "_divide_topk_op %s: k=%d, k_cores=%d, k_per_core=%d, splits=%s",
-        op.get_name(),
-        k_val,
-        required_k_cores,
-        k_val // required_k_cores,
-        splits,
-    )
-
-
 def divide_reduction_op(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    red: Reduction = op.data
-
-    if red.reduction_type in TOPK_OPS:
-        # span_reduction/work_distribution don't apply to topk; split directly.
-        _divide_topk_op(op, args, max_cores)
-        return
-
     pass_fn(op, args, max_cores)
 
 
