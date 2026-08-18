@@ -7849,7 +7849,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         expected = scatter_op(buffer.clone(), keys, indices)
 
-        compiled = torch.compile(scatter_op, backend="spyre")
+        compiled = torch.compile(scatter_op)
         buffer_spyre = buffer.clone().to(device_layout=kv_cache_layout)
         keys_spyre = keys.to(device="spyre")
         indices_spyre = indices.to(device="spyre")
@@ -7897,7 +7897,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             key_cache.clone(), value_cache.clone(), keys, values, slot_idxs
         )
 
-        compiled = torch.compile(paged_store, backend="spyre")
+        compiled = torch.compile(paged_store)
         key_cache_spyre = key_cache.clone().to(device_layout=kv_cache_layout)
         value_cache_spyre = value_cache.clone().to(device_layout=kv_cache_layout)
         keys_spyre = keys.to(device="spyre")
