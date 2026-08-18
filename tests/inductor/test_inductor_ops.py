@@ -1182,6 +1182,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
+                "2d_k6_dim0": (
+                    unique_randn_along_dim((64, 64), dim=0, dtype=torch.float32),
+                    6,
+                    0,
+                ),
                 "2d_k4_dim_minusone": (
                     unique_randn_along_dim((64, 256), dim=-1),
                     4,
