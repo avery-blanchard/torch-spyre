@@ -1057,10 +1057,9 @@ def commit_core_mapping(
     contiguous_dim = (
         len(dims) - 1 if is_matmul and config.core_id_k_fast_emission else None
     )
-    by_name = core_to_slice_mapping(
+    by_symbol = core_to_slice_mapping(
         dims, splits, num_cores, contiguous_dim=contiguous_dim
     )
-    by_symbol = {sym: by_name[str(sym)] for sym in dims}
     op.core_id_to_work_slice = slice_by_index_coeff(by_symbol, write_index, read_index)
 
 
