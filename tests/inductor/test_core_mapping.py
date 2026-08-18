@@ -160,6 +160,15 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
         prep, ({1: 2, 2: 4}, {3: 4})
     )
 
+    # Populate op_spec.core_id_to_work_slice before calling parse_op_spec
+    pass_utils_module.commit_core_mapping(
+        op_spec,
+        splits,
+        dims[0],
+        dims[-1],
+        is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
+    )
+
     sdsc_spec, renamed = parse_op_spec(op_spec)
     sdsc_output_mapping = {
         device_dim: sdsc_spec.core_id_to_work_slice[renamed[dim]]
