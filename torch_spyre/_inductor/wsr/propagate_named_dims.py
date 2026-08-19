@@ -186,6 +186,12 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
             sym = _lone_sym(coord)
             if sym is not None and is_indirect(sym.name):
                 continue
+            # If coord is a constant and we have indirect_sizes, it may be that
+            # the coordinate was simplified because the indirect symbol wasn't
+            # recognized (e.g., symbol name divergence after fusion).
+            # Assume this is indirect access and skip it.
+            if ind_sizes and not coord.free_symbols:
+                continue
             raise Unsupported(
                 f"{dep.name}: layout dim {i} (size {dim_size}) has no loop vars "
                 f"and no indirect index symbol in coord {coord!r} for names {names}"
