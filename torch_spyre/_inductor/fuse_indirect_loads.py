@@ -170,6 +170,31 @@ def _fuse_gather_into_consumer(
     )
 
 
+def _can_fuse_into_consumer(
+    gather_op: ComputedBuffer, consumer_op: ComputedBuffer
+) -> bool:
+    """Check if fusing gather into consumer violates backend constraints.
+
+    Backend constraint: an indirectly-accessed tensor can only have ONE indirect
+    symbol in its coordinates. If the consumer already uses indirect access on
+    its operands (e.g., x[i] @ w where x is already indirectly indexed),
+    fusing another gather would create multiple indirect symbols in one tensor's
+    access pattern, which is not supported.
+    """
+    # Check if consumer has any indirect reads already
+    for dep in consumer_op.get_read_writes().reads:
+        if isinstance(dep, MemoryDep) and dep.is_indirect():
+            # Consumer already has an indirect access; can't fuse another
+            logger.debug(
+                "fuse_indirect_loads: consumer %s already has indirect access, "
+                "cannot fuse gather %s (backend constraint: one indirect symbol per tensor)",
+                consumer_op.get_name(),
+                gather_op.get_name(),
+            )
+            return False
+    return True
+
+
 def fuse_indirect_loads(graph: GraphLowering) -> None:
     """Main entry point: fuse pure indirect-load ops into their sole consumer.
 
@@ -177,6 +202,9 @@ def fuse_indirect_loads(graph: GraphLowering) -> None:
     scheduler construction. Scans graph.operations for pure indirect-load
     Pointwise ComputedBuffers; for each with exactly one IR-level consumer,
     splices it into that consumer's inner_fn and removes it from operations.
+
+    Only fuses if the consumer doesn't already have indirect access (backend
+    constraint: one indirect symbol per tensor).
     """
     gathers_to_fuse = []
     for op in list(graph.operations):
@@ -211,4 +239,7 @@ def fuse_indirect_loads(graph: GraphLowering) -> None:
             continue
 
         consumer_op = consumers[0]
+        if not _can_fuse_into_consumer(gather_op, consumer_op):
+            continue
+
         _fuse_gather_into_consumer(gather_op, consumer_op, graph.operations)
