@@ -69,7 +69,11 @@ from indirect_access_common import (  # noqa: E402
 
 from torch_spyre._C import DataFormats  # noqa: E402
 from torch_spyre._inductor import config  # noqa: E402
-from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
+from torch_spyre._inductor.constants import (  # noqa: E402
+    BATCH_MATMUL_OP,
+    IDENTITY_OP,
+    RESTICKIFY_OP,
+)
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 
 
@@ -1083,6 +1087,110 @@ class _GatherScenarios(IndirectAccessTestCase):
             return x[i] + y[j]
 
         self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
+
+
+@config.patch({"sencores": 1})
+class TestGatherFusedIntoMatmul(IndirectAccessTestCase):
+    """Gather ops fused into their sole compute consumer's OpSpec.
+
+    When a gather (x[i]) has exactly one consumer that is a fusable reduction
+    (matmul/conv), fuse_indirect_loads.py splices the gather's inner_fn into
+    the consumer's inner_fn pre-scheduling, so they produce a single fused
+    OpSpec instead of separate gather + compute OpSpecs.
+    """
+
+    def test_gather_into_matmul(self):
+        """x[i] @ w: one fused BATCH_MATMUL_OP OpSpec, no standalone gather copy."""
+        M, K, N, P = 128, 64, 32, 16
+        x = plain_to_spyre(torch.rand(M, K, dtype=torch.float16))
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        w = plain_to_spyre(torch.rand(K, N, dtype=torch.float16))
+        self.name_dims(x, {"M": M, "K": K})
+        self.name_dims(idx, {"P": P})
+        self.name_dims(w, {"K2": K, "N": N})
+
+        with capture_op_specs() as captured:
+            torch.compile(lambda x, i, w: x[i] @ w)(x, idx, w)
+        op_specs = self.assert_reaches_op_spec(captured)
+
+        matmul_specs = [s for s in op_specs if s.op == BATCH_MATMUL_OP]
+        self.assertEqual(
+            len(matmul_specs),
+            1,
+            f"expected one matmul spec, got ops={[s.op for s in op_specs]}",
+        )
+        matmul_spec = matmul_specs[0]
+        self.assertTrue(
+            op_spec_has_indirect_input(matmul_spec),
+            "fused matmul OpSpec should carry IndirectAccess on its activand input",
+        )
+
+        copy_specs = [
+            s
+            for s in op_specs
+            if s.op in (IDENTITY_OP, RESTICKIFY_OP) and op_spec_has_indirect_input(s)
+        ]
+        self.assertFalse(
+            copy_specs,
+            f"gather should have fused into the matmul, not kept a standalone "
+            f"copy op: {[s.op for s in copy_specs]}",
+        )
+
+        targets = indirect_access_target_names(op_specs)
+        named = [a for a in matmul_spec.args if a.is_input and a.name is not None]
+        self.assertTrue(named, "no named index arg found on the fused matmul spec")
+        self.assertTrue(any(a.name in targets for a in named))
+        self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
+
+    def test_matmul_without_gather_unaffected(self):
+        """Plain x @ w (no indirect access): unchanged single matmul OpSpec."""
+        M, K, N = 128, 64, 32
+        x = plain_to_spyre(torch.rand(M, K, dtype=torch.float16))
+        w = plain_to_spyre(torch.rand(K, N, dtype=torch.float16))
+        self.name_dims(x, {"M": M, "K": K})
+        self.name_dims(w, {"K2": K, "N": N})
+
+        with capture_op_specs() as captured:
+            torch.compile(lambda x, w: x @ w)(x, w)
+        op_specs = self.assert_reaches_op_spec(captured)
+
+        matmul_specs = [s for s in op_specs if s.op == BATCH_MATMUL_OP]
+        self.assertEqual(len(matmul_specs), 1)
+        self.assertFalse(op_spec_has_indirect_access(matmul_specs[0]))
+        self.assertEqual(
+            len([a for a in matmul_specs[0].args if a.is_input]),
+            2,
+            "non-indirect matmul should keep exactly its x/y inputs",
+        )
+
+    def test_gather_consumed_by_two_ops_stays_standalone(self):
+        """x[i] feeding both a matmul and .exp(): two IR consumers means no fusion."""
+        M, K, N, P = 128, 64, 32, 16
+        x = plain_to_spyre(torch.rand(M, K, dtype=torch.float16))
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        w = plain_to_spyre(torch.rand(K, N, dtype=torch.float16))
+        self.name_dims(x, {"M": M, "K": K})
+        self.name_dims(idx, {"P": P})
+        self.name_dims(w, {"K2": K, "N": N})
+
+        def kernel(x, i, w):
+            gathered = x[i]
+            return gathered @ w, gathered.exp()
+
+        with capture_op_specs() as captured:
+            torch.compile(kernel)(x, idx, w)
+        op_specs = self.assert_reaches_op_spec(captured)
+
+        copy_specs = [
+            s
+            for s in op_specs
+            if s.op in (IDENTITY_OP, RESTICKIFY_OP) and op_spec_has_indirect_input(s)
+        ]
+        self.assertTrue(
+            copy_specs,
+            "two-consumer gather should keep its own standalone copy op, "
+            f"got ops={[s.op for s in op_specs]}",
+        )
 
 
 @config.patch({"sencores": 1})

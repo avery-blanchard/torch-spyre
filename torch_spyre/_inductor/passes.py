@@ -72,6 +72,7 @@ from .insert_restickify import (
     insert_restickify,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
+from .fuse_indirect_loads import fuse_indirect_loads
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
@@ -468,6 +469,7 @@ class CustomPreSchedulingPasses:
             finalize_layouts,
             insert_restickify,
             enforce_indirect_access_layout,
+            fuse_indirect_loads,
             insert_post_mutation_restickify,
             insert_bmm_padding,
             #
