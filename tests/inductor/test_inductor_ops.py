@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import pytest
 import unittest
@@ -353,6 +354,31 @@ def _dtype_name(dt):
     return str(dt).split(".")[-1]
 
 
+@functools.lru_cache(maxsize=None)
+def _cached_randint(shape, dtype):
+    gen = utils_inductor._make_generator(shape, dtype)
+    return torch.randint(0, 512, shape, dtype=dtype, generator=gen)
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_fp32_for_int32_cast(shape):
+    """Generate fp32 tensor from truncated int32 values for testing fp32->int32.
+
+    Avoids pathological cases where random fp32 all truncate to 0. Instead,
+    we generate int32 values (0-512), cast to fp32, ensuring the truncation
+    test covers meaningful value ranges.
+    """
+    torch.manual_seed(3)
+    src_int = torch.randint(0, 512, shape, dtype=torch.int32)
+    return src_int.to(torch.float32)
+
+
+def _cached_to_dtype_input(shape, src):
+    if src.is_floating_point:
+        return cached_randn(shape, dtype=src)
+    return _cached_randint(shape, src)
+
+
 TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
@@ -360,7 +386,9 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
 
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
-        cached_randn(shape, dtype=src),
+        _cached_fp32_for_int32_cast(shape)
+        if (src, dst) == (torch.float32, torch.int32)
+        else _cached_to_dtype_input(shape, src),
         dst,
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
@@ -377,7 +405,11 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES
     if (
         shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
-        or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+        or (
+            DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+            and (src, dst)
+            not in [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+        )
         or (src == torch.float32 and shape[-1] < 32)
     )
 ]

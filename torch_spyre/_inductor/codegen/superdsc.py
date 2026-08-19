@@ -29,8 +29,11 @@ from torch_spyre._inductor.constants import (
     CONV2D_LAYOUT_LABELS,
     CONV_DIM_LABELS,
     CONV_OPS,
+    DEPTHWISE_CONV2D_OP,
+    FP32TOINT32_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
+    INT32TOFP32_OP,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
@@ -39,7 +42,6 @@ from torch_spyre._inductor.constants import (
     POOL_DIM_LABELS,
     POOL_OPS,
     RESTICKIFY_OP,
-    DEPTHWISE_CONV2D_OP,
     TOPK_OPS,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
@@ -1035,21 +1037,31 @@ def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
 
 
 def _get_data_format(op, device_dtype):
-    """
+    """Re-label int32 tensor data formats to fp32 for SDSC compatibility.
+
     NOTE: This is NOT a data conversion.
     This is only a temporary re-labeling of the same 32 bit data.
     The underlying data remains unchanged.
 
     In the long term, SDSC should accept int32 as the data format.
     Such re-labeling will become unnecessary.
+    See backend issue deeptools#4307.
     """
-    data_format = {
-        (
-            IDENTITY_OP,
-            DataFormats.IEEE_INT32,
-        ): DataFormats.IEEE_FP32,  # Identity op: int32 -> fp32
-    }
-    return data_format.get((op, device_dtype), device_dtype)
+    if device_dtype == DataFormats.IEEE_INT32 and op == IDENTITY_OP:
+        return DataFormats.IEEE_FP32
+    return device_dtype
+
+
+def _get_sdsc_spec_data_format(op, arg_data_format):
+    """Re-label int32 ops' SDSC spec data_format to fp32 for backend compatibility.
+
+    For int32 dtype-conversion ops, the SDSC spec itself must report fp32 as the
+    data format, even though the arguments (tensors) are relabeled separately.
+    See backend issue deeptools#4307.
+    """
+    if op in (FP32TOINT32_OP, INT32TOFP32_OP):
+        return DataFormats.IEEE_FP32
+    return arg_data_format
 
 
 def _collect_index_tensor_layouts(
@@ -2134,9 +2146,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             execution_unit="pt"
             if (is_matmul or op_spec.op == CONV2D_FWD_OP)
             else "sfp",
-            data_format=args[
-                1 if indirect_access_indices else 0
-            ].data_format,  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
+            data_format=_get_sdsc_spec_data_format(
+                op_spec.op,
+                args[1 if indirect_access_indices else 0].data_format,
+            ),  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
             num_inputs=num_inputs,
             iteration_space=sdsc_iteration_space,
             num_cores=num_cores,
