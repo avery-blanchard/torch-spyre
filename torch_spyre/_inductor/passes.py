@@ -448,20 +448,7 @@ class CustomPreSchedulingPasses:
         self.passes = [
             deadcode_elimination,
             #
-            # Working Set Reduction (hint-driven, pre-stickification)
-            # These passes only need host-side FixedLayout (size/stride) and
-            # loop variable ranges.  Running before stickification means
-            # _divide_ranges does not call _resize_device_layout: stickification
-            # computes the correct SpyreTensorLayout from the already-divided
-            # ranges.  This also dissolves the insert_restickify→hint cross-phase
-            # contract (issue #3135).
-            propagate_named_dims,
-            validate_named_dims,
-            assign_dim_hints,
-            _maybe_reorder_unhinted_interlopers,
-            _maybe_coarse_tile_hints,
-            #
-            # Tensor Layout (Stickification)
+            # Tensor Layout (Stickification) - up to indirect access layout
             split_multi_ops,
             propagate_spyre_tensor_layouts,
             validate_ops,
@@ -474,12 +461,27 @@ class CustomPreSchedulingPasses:
             #
             dedup_and_promote_constants,
             #
-            # Fuse pure indirect-load ops into their sole consumer BEFORE work division.
-            # This must run after enforce_indirect_access_layout (which needs the
-            # separate gather op to exist) but BEFORE _distribute_work applies
-            # indirect_access_pinned_vars, so work division sees the fused op,
+            # Fuse pure indirect-load ops into their sole consumer BEFORE
+            # propagate_named_dims. This must run AFTER enforce_indirect_access_layout
+            # (which needs the separate gather op to exist and have correct layout)
+            # but BEFORE propagate_named_dims (which can now handle fused ops with
+            # correct indirect size tracking). Must also run BEFORE _distribute_work
+            # applies indirect_access_pinned_vars, so work division sees the fused op,
             # not the separate gather.
             fuse_indirect_loads,
+            #
+            # Working Set Reduction (hint-driven, pre-stickification)
+            # These passes only need host-side FixedLayout (size/stride) and
+            # loop variable ranges.  Running before stickification means
+            # _divide_ranges does not call _resize_device_layout: stickification
+            # computes the correct SpyreTensorLayout from the already-divided
+            # ranges.  This also dissolves the insert_restickify→hint cross-phase
+            # contract (issue #3135).
+            propagate_named_dims,
+            validate_named_dims,
+            assign_dim_hints,
+            _maybe_reorder_unhinted_interlopers,
+            _maybe_coarse_tile_hints,
             #
             # Working Set Reduction (device-layout-aware, post-stickification)
             # These passes require FixedTiledLayout.device_layout (device_size,

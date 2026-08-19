@@ -719,6 +719,31 @@ def host_coordinates(
     )
 
 
+def filter_fused_indirect_index_bufs(
+    inputs: list[MemoryDep],
+) -> list[MemoryDep]:
+    """Filter out index buffers that were added by gather fusion.
+
+    After gather fusion, a reduction operation may have index buffers in its
+    inputs that are used for indirect access (e.g., for x[i] @ w, the index
+    buffer i is included as a separate MemoryDep).
+
+    Index buffers can be identified by having empty ranges ({}) while actual
+    operand buffers have proper ranges dicts.
+
+    Returns a filtered list with actual operand buffers. If filtering results
+    in fewer than 2 inputs, returns the original list (fallback).
+    """
+    # Filter to keep only inputs with non-empty ranges
+    filtered = [inp for inp in inputs if inp.ranges]
+
+    # If we filtered too much, return original
+    if len(filtered) < max(2, len(inputs) - 1):
+        return inputs
+
+    return filtered
+
+
 def identify_matmul_inputs(
     inputs: list[MemoryDep],
     write_dep: MemoryDep,
@@ -739,8 +764,12 @@ def identify_matmul_inputs(
 
     Returns (None, None) if y cannot be identified.
     """
-    assert len(inputs) == 2
-    a, b = inputs[0], inputs[1]
+    # Filter out index buffers added by gather fusion
+    filtered_inputs = filter_fused_indirect_index_bufs(inputs)
+    if len(filtered_inputs) < 2:
+        return None, None
+
+    a, b = filtered_inputs[0], filtered_inputs[1]
     out_syms = write_dep.index.free_symbols
     syms_a = a.index.free_symbols
     syms_b = b.index.free_symbols
