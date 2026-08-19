@@ -181,8 +181,13 @@ def keep_by_index_cpu(
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
+    # indices has K at the masked dimension
+    # Build indexing tuple with slice(None) at dim position
+    idx_list = [slice(None) if i == dim else 0 for i in range(indices.dim())]
+    keep_vals = indices[tuple(idx_list)].to(torch.long)
+
     coords = torch.arange(values.shape[dim], device=values.device, dtype=torch.long)
-    mask = torch.isin(coords, indices.flatten().unique().to(torch.long))
+    mask = torch.isin(coords, keep_vals)
     shape = [1] * values.dim()
     shape[dim] = values.shape[dim]
     mask = mask.reshape(shape)

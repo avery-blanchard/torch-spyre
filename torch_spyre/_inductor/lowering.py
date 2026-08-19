@@ -1139,7 +1139,7 @@ def lower_keep_by_index(values, indices, dim, fill_value):
     indices_loader = indices.make_loader()
 
     ranges = list(x_size)
-    reduction_ranges = [indices_size[1]]
+    reduction_ranges = [indices_size[norm_dim]]
 
     def inner_fn(index, rindex):
         values_index = list(index)
