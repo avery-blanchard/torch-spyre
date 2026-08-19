@@ -680,6 +680,21 @@ def _pattern_resolve(variant, args):
     raise ValueError(f"unknown transpose suite variant {variant}")
 
 
+def _make_keep_by_index_test(shape, dim, k, fill_value):
+    """Generate keep_by_index test case."""
+    values = unique_randn_along_dim(shape, dim=dim)
+    # Create indices tensor with K values to keep
+    # Shape: [..., K, ...] with K inserted at dim+1
+    indices_shape = list(shape)
+    indices_shape.insert(dim + 1, k)
+    indices = (
+        torch.arange(k, dtype=torch.float16)
+        .reshape([1] * (dim + 1) + [k] + [1] * (len(shape) - dim - 1))
+        .expand(indices_shape)
+    )
+    return (values, indices, dim, fill_value)
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -1255,61 +1270,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
-                "2d_dim0": (
-                    unique_randn_along_dim((67, 256), dim=0),
-                    torch.tensor([[0.0, 1.0, 2.0]] * 256, dtype=torch.float16)
-                    .t()
-                    .reshape(3, 256),
-                    0,
-                    -1.0,
+                "2d_dim0": lambda: _make_keep_by_index_test(
+                    (67, 256), dim=0, k=3, fill_value=-1.0
                 ),
-                "3d_dim0": (
-                    unique_randn_along_dim((67, 71, 256), dim=0),
-                    torch.arange(2, dtype=torch.float16)
-                    .view(2, 1, 1)
-                    .expand(2, 71, 256),
-                    0,
-                    0.0,
+                "3d_dim0": lambda: _make_keep_by_index_test(
+                    (67, 71, 256), dim=0, k=2, fill_value=0.0
                 ),
-                "3d_dim1": (
-                    unique_randn_along_dim((67, 71, 256), dim=1),
-                    torch.arange(4, dtype=torch.float16)
-                    .view(4, 1, 1)
-                    .expand(4, 71, 256),
-                    1,
-                    -1.0,
+                "3d_dim1": lambda: _make_keep_by_index_test(
+                    (67, 71, 256), dim=1, k=4, fill_value=-1.0
                 ),
-                "4d_dim0": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
-                    torch.arange(2, dtype=torch.float16)
-                    .view(2, 1, 1, 1)
-                    .expand(2, 17, 7, 64),
-                    0,
-                    -1.0,
+                "4d_dim0": lambda: _make_keep_by_index_test(
+                    (6, 17, 7, 64), dim=0, k=2, fill_value=-1.0
                 ),
-                "4d_dim1": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=1),
-                    torch.arange(3, dtype=torch.float16)
-                    .view(3, 1, 1, 1)
-                    .expand(3, 17, 7, 64),
-                    1,
-                    0.0,
+                "4d_dim1": lambda: _make_keep_by_index_test(
+                    (6, 17, 7, 64), dim=1, k=3, fill_value=0.0
                 ),
-                "4d_dim2": (
-                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
-                    torch.arange(2, dtype=torch.float16)
-                    .view(2, 1, 1, 1)
-                    .expand(2, 17, 7, 64),
-                    2,
-                    -1.0,
+                "4d_dim2": lambda: _make_keep_by_index_test(
+                    (6, 17, 7, 64), dim=2, k=2, fill_value=-1.0
                 ),
-                "3d_dim0_fill_inf": (
-                    unique_randn_along_dim((67, 71, 256), dim=0),
-                    torch.arange(3, dtype=torch.float16)
-                    .view(3, 1, 1)
-                    .expand(3, 71, 256),
-                    0,
-                    float("-inf"),
+                "3d_dim0_fill_inf": lambda: _make_keep_by_index_test(
+                    (67, 71, 256), dim=0, k=3, fill_value=float("-inf")
                 ),
             },
         },
@@ -6108,25 +6088,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
-        def spyre_fn(x, indices):
+        def fn(x, indices):
             return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
 
-        def pytorch_fn(x, indices):
-            # Extract K indices from representative slice of indices tensor
-            keep_indices = indices[(slice(None),) + (0,) * (indices.dim() - 1)].to(
-                torch.long
-            )
-            # For each position, check if its coordinate along dim is in keep_indices
-            coords = torch.arange(x.shape[dim], device=x.device, dtype=torch.long)
-            # Reshape coords to broadcast along the masked dimension
-            shape = [1] * x.dim()
-            shape[dim] = x.shape[dim]
-            coords_expanded = coords.reshape(shape)
-            # Create mask: keep if coordinate is in keep_indices
-            mask = torch.isin(coords_expanded, keep_indices)
-            return torch.where(mask, x, torch.full_like(x, fill_value))
-
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, indices)
+        self.compare_with_cpu(fn, x, indices, run_eager=True)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)

@@ -1139,11 +1139,15 @@ def lower_keep_by_index(values, indices, dim, fill_value):
     indices_loader = indices.make_loader()
 
     ranges = list(x_size)
-    reduction_ranges = [indices_size[0]]
+    reduction_ranges = [indices_size[1]]
 
     def inner_fn(index, rindex):
         values_index = list(index)
-        indices_index = [rindex[0]] + list(index)[1:]
+        # indices shape: [masked_dim_size, K, ...dims_in_order_except_masked]
+        # Build indices_index preserving dimension order
+        indices_index = list(index)
+        indices_index[norm_dim] = index[norm_dim]
+        indices_index.insert(norm_dim + 1, rindex[0])
         return (values_loader(values_index), indices_loader(indices_index))
 
     op_info = {"constants": {"maskval": fill_value}}
