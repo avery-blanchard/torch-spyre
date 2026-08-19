@@ -43,6 +43,7 @@ from .constants import (
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
     DEPTHWISE_CONV2D_OP,
+    KEEP_BY_INDEX_OP,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
@@ -1210,7 +1211,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             BATCH_MATMUL_OP,
             BATCH_MATMUL_FP8_OP,
             CONV2D_FWD_OP,
-            "keep_by_index",
+            KEEP_BY_INDEX_OP,
         ]:
             # Two-input reductions: matmul (activation @ weight), conv2d
             # (activation * weight, reduced over in/ki/kj), and keep_by_index
