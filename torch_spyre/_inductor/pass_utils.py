@@ -526,14 +526,18 @@ class _IndirectIndexFinder:
 
 def _find_indirect_index_bufs(
     op: ComputedBuffer,
-) -> "tuple[dict[str, str], dict[str, int]]":
-    """Re-execute inner_fn and return ({data_buf: index_buf}, {data_buf: size}) mappings."""
+) -> "tuple[dict[str, str], dict[str, int], dict[str, sympy.Symbol]]":
+    """Re-execute inner_fn and return mappings: ({data_buf: index_buf}, {data_buf: size}, {data_buf: indirect_sym})."""
     from torch._inductor.virtualized import V as _V
 
     finder = _IndirectIndexFinder()
     with _V.set_ops_handler(finder):
         op.data.inner_fn(*op.data.inner_fn_args())
-    return finder.indirect_index_by_buf, finder.indirect_index_size_by_buf
+    return (
+        finder.indirect_index_by_buf,
+        finder.indirect_index_size_by_buf,
+        finder.indirect_syms_by_buf,
+    )
 
 
 def _build_indirect_load_subs(
@@ -555,15 +559,12 @@ def _build_indirect_load_subs(
     ]
     if not any(d.is_indirect() for d in reads):
         return {}, None
-    finder = _IndirectIndexFinder()
-    from torch._inductor.virtualized import V as _V
 
-    with _V.set_ops_handler(finder):
-        op.data.inner_fn(*op.data.inner_fn_args())
-
-    indirect_index_buf_map = finder.indirect_index_by_buf
-    indirect_index_size_map = finder.indirect_index_size_by_buf
-    indirect_syms_map = finder.indirect_syms_by_buf
+    # Use _find_indirect_index_bufs which internally calls _IndirectIndexFinder
+    # and caches its results. This avoids minting duplicate symbols.
+    indirect_index_buf_map, indirect_index_size_map, indirect_syms_map = (
+        _find_indirect_index_bufs(op)
+    )
 
     dep_by_name = {d.name: d for d in reads}
     subs = {}
