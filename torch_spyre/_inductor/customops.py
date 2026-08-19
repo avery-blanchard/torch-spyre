@@ -174,14 +174,13 @@ def _(
     return values.new_empty(values.size())
 
 
-@keep_by_index.register_decomposition
-def _(
+@torch.library.register_kernel("spyre::keep_by_index", ["cpu"])
+def keep_by_index_cpu(
     values: torch.Tensor,
     indices: torch.Tensor,
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
-    # CPU: keep positions where the coordinate is in the indices list
     coords = torch.arange(values.shape[dim], device=values.device, dtype=torch.long)
     mask = torch.isin(coords, indices.flatten().unique().to(torch.long))
     shape = [1] * values.dim()
