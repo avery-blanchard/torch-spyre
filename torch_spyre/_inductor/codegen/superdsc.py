@@ -41,6 +41,7 @@ from torch_spyre._inductor.constants import (
     RESTICKIFY_OP,
     DEPTHWISE_CONV2D_OP,
     TOPK_OPS,
+    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -1189,7 +1190,12 @@ def _create_sdsc_tensors(
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+        if (
+            use_op_dims
+            and dim_order != dims
+            and _is_topk(op_spec.op)
+            and op_spec.op != "keepbyindex"
+        ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
@@ -1452,6 +1458,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
+        and op != "keepbyindex"
     ):
         return op + "nonstick"
     return op
@@ -2017,7 +2024,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
-
+    if op_spec.op == KEEP_BY_INDEX_OP:
+        num_inputs = 2
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
         # The pool hardware accumulates the full kernel window on each core.

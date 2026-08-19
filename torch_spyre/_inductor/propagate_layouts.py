@@ -1342,6 +1342,11 @@ def compute_layouts(
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
+    if aten_op == spyreop.keep_by_index.default:
+        # keep_by_index: output matches values (arg 0) layout.
+        # indices (arg 1) is a multi-arg case, use the standard multi-arg handler.
+        return _multi_arg_pointwise_layouts(op, output, output_dep, args)
+
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
         # output must have matching size/stride, and x's stick must match
