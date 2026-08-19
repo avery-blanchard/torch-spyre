@@ -472,6 +472,8 @@ class _IndirectIndexFinder:
     Inductor bakes the index range into the inner_fn closure as the size argument to
     ops.indirect_indexing() — invisible in printed IR, only accessible by re-execution.
     This handler intercepts those calls to recover both the source buffer name and the size.
+    Also mints and returns actual indirect symbols (indirectN) so they appear in the
+    reconstructed index expressions.
     """
 
     def __init__(self):
@@ -480,8 +482,10 @@ class _IndirectIndexFinder:
         self._mock = MockHandler()
         self._pending_indirect_index_buf: str | None = None
         self._pending_indirect_index_size: int | None = None
+        self._indirect_counter = 0
         self.indirect_index_by_buf: dict[str, str] = {}
         self.indirect_index_size_by_buf: dict[str, int] = {}
+        self.indirect_syms_by_buf: dict[str, sympy.Symbol] = {}
 
     def load(self, name: str, index):
         if self._pending_indirect_index_buf is not None:
@@ -509,7 +513,12 @@ class _IndirectIndexFinder:
                 )
             self._pending_indirect_index_buf = index_var.name
             self._pending_indirect_index_size = int(size)
-        return sympy.S.Zero
+        # Mint and return an actual indirect symbol so it appears in reconstructed indices
+        sym = sympy.Symbol(f"indirect{self._indirect_counter}")
+        self._indirect_counter += 1
+        if isinstance(index_var, _LoadSentinel):
+            self.indirect_syms_by_buf[index_var.name] = sym
+        return sym
 
     def __getattr__(self, attr):
         return getattr(self._mock, attr)
@@ -546,7 +555,16 @@ def _build_indirect_load_subs(
     ]
     if not any(d.is_indirect() for d in reads):
         return {}, None
-    indirect_index_buf_map, indirect_index_size_map = _find_indirect_index_bufs(op)
+    finder = _IndirectIndexFinder()
+    from torch._inductor.virtualized import V as _V
+
+    with _V.set_ops_handler(finder):
+        op.data.inner_fn(*op.data.inner_fn_args())
+
+    indirect_index_buf_map = finder.indirect_index_by_buf
+    indirect_index_size_map = finder.indirect_index_size_by_buf
+    indirect_syms_map = finder.indirect_syms_by_buf
+
     dep_by_name = {d.name: d for d in reads}
     subs = {}
     sizes = {}
@@ -558,13 +576,14 @@ def _build_indirect_load_subs(
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
         size = indirect_index_size_map.get(d.name)
-        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
-        if len(indirect_syms) > 1:
-            raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
-        for sym in indirect_syms:
-            subs[sym] = IndexedBase(indirect_index_dep.name)[indirect_index_dep.index]
+        # Get the actual indirect symbol that was minted during re-execution
+        indirect_sym = indirect_syms_map.get(d.name)
+        if indirect_sym is not None:
+            subs[indirect_sym] = IndexedBase(indirect_index_dep.name)[
+                indirect_index_dep.index
+            ]
             if size is not None:
-                sizes[sym] = size
+                sizes[indirect_sym] = size
     return subs, sizes
 
 
