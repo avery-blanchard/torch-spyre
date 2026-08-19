@@ -6112,16 +6112,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
 
         def pytorch_fn(x, indices):
-            # Extract the K indices from dimension 0 of the indices tensor.
-            # All positions in non-masked dimensions have the same indices,
-            # so we extract from a representative slice.
-            idx_slice = indices[(slice(None),) + (0,) * (indices.dim() - 1)]
-            keep_indices = torch.unique(idx_slice)
-            mask = torch.zeros(x.shape[dim], dtype=torch.bool)
-            mask[keep_indices.to(torch.long)] = True
+            # Extract K indices from representative slice of indices tensor
+            keep_indices = indices[(slice(None),) + (0,) * (indices.dim() - 1)].to(
+                torch.long
+            )
+            # For each position, check if its coordinate along dim is in keep_indices
+            coords = torch.arange(x.shape[dim], device=x.device, dtype=torch.long)
+            # Reshape coords to broadcast along the masked dimension
             shape = [1] * x.dim()
             shape[dim] = x.shape[dim]
-            return torch.where(mask.reshape(shape), x, torch.full_like(x, fill_value))
+            coords_expanded = coords.reshape(shape)
+            # Create mask: keep if coordinate is in keep_indices
+            mask = torch.isin(coords_expanded, keep_indices)
+            return torch.where(mask, x, torch.full_like(x, fill_value))
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, indices)
 
