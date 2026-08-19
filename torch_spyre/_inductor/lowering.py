@@ -1146,15 +1146,12 @@ def lower_keep_by_index(values, indices, dim, fill_value):
         values_index = list(index)
         values_index[norm_dim] = rindex[0]
         indices_index = list(index)
-        return lowering.ops_wrapper(torch.ops.spyre.keep_by_index.__name__)(
-            values_loader(values_index),
-            indices_loader(indices_index),
-        )
+        return (values_loader(values_index), indices_loader(indices_index))
 
     op_info = {"constants": {"mask_val": fill_value}}
     result = SpyreReduction.create(
         reduction_type="keep_by_index",
-        input_node=values,
+        input_node=[values, indices],
         device=values.get_device(),
         dst_dtype=values.get_dtype(),
         src_dtype=values.get_dtype(),
