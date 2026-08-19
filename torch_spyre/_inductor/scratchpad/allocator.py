@@ -1126,6 +1126,8 @@ def _commit_op_core_mapping(op: Operation, coeff_splits: tuple[dict, dict]) -> N
     """
     from torch._inductor.dependencies import StarDep
 
+    if not isinstance(op, ComputedBuffer):
+        return
     rw = op_read_writes(op)
     write = next(iter(rw.writes), None)
     if write is None or isinstance(write, StarDep):
