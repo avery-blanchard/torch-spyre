@@ -1270,25 +1270,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_keep_by_index", "test_keep_by_index_cpu"): {
             "param_sets": {
-                "2d_dim0": lambda: _make_keep_by_index_test(
+                "2d_dim0": _make_keep_by_index_test(
                     (67, 256), dim=0, k=3, fill_value=-1.0
                 ),
-                "3d_dim0": lambda: _make_keep_by_index_test(
+                "3d_dim0": _make_keep_by_index_test(
                     (67, 71, 256), dim=0, k=2, fill_value=0.0
                 ),
-                "3d_dim1": lambda: _make_keep_by_index_test(
+                "3d_dim1": _make_keep_by_index_test(
                     (67, 71, 256), dim=1, k=4, fill_value=-1.0
                 ),
-                "4d_dim0": lambda: _make_keep_by_index_test(
+                "4d_dim0": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=0, k=2, fill_value=-1.0
                 ),
-                "4d_dim1": lambda: _make_keep_by_index_test(
+                "4d_dim1": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=1, k=3, fill_value=0.0
                 ),
-                "4d_dim2": lambda: _make_keep_by_index_test(
+                "4d_dim2": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=2, k=2, fill_value=-1.0
                 ),
-                "3d_dim0_fill_inf": lambda: _make_keep_by_index_test(
+                "3d_dim0_fill_inf": _make_keep_by_index_test(
                     (67, 71, 256), dim=0, k=3, fill_value=float("-inf")
                 ),
             },
