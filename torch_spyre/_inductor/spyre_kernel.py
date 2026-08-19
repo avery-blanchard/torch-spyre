@@ -286,7 +286,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def keep_by_index(x, indices):
-        return ReductionOp("keep_by_index", [x, indices])
+        return ReductionOp("keepbyindex", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):

@@ -1150,7 +1150,7 @@ def lower_keep_by_index(values, indices, dim, fill_value):
 
     op_info = {"constants": {"mask_val": fill_value}}
     result = SpyreReduction.create(
-        reduction_type="keep_by_index",
+        reduction_type="keepbyindex",
         input_node=[values, indices],
         device=values.get_device(),
         dst_dtype=values.get_dtype(),

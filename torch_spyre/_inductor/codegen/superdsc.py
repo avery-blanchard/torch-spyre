@@ -1201,7 +1201,12 @@ def _create_sdsc_tensors(
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+        if (
+            use_op_dims
+            and dim_order != dims
+            and _is_topk(op_spec.op)
+            and op_spec.op != "keepbyindex"
+        ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
@@ -1464,6 +1469,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
+        and op != "keepbyindex"
     ):
         return op + "nonstick"
     return op
