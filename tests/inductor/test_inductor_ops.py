@@ -1257,43 +1257,57 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_dim0": (
                     unique_randn_along_dim((67, 256), dim=0),
-                    (0, 3, 5),
+                    torch.tensor([[0.0, 1.0, 2.0]] * 256, dtype=torch.float16)
+                    .t()
+                    .reshape(3, 256),
                     0,
                     -1.0,
                 ),
                 "3d_dim0": (
                     unique_randn_along_dim((67, 71, 256), dim=0),
-                    (1, 2),
+                    torch.arange(2, dtype=torch.float16)
+                    .view(2, 1, 1)
+                    .expand(2, 71, 256),
                     0,
                     0.0,
                 ),
                 "3d_dim1": (
                     unique_randn_along_dim((67, 71, 256), dim=1),
-                    (0, 10, 20, 30),
+                    torch.arange(4, dtype=torch.float16)
+                    .view(4, 1, 1)
+                    .expand(4, 71, 256),
                     1,
                     -1.0,
                 ),
                 "4d_dim0": (
                     unique_randn_along_dim((6, 17, 7, 64), dim=0),
-                    (0, 5),
+                    torch.arange(2, dtype=torch.float16)
+                    .view(2, 1, 1, 1)
+                    .expand(2, 17, 7, 64),
                     0,
                     -1.0,
                 ),
                 "4d_dim1": (
                     unique_randn_along_dim((6, 17, 7, 64), dim=1),
-                    (2, 4, 6),
+                    torch.arange(3, dtype=torch.float16)
+                    .view(3, 1, 1, 1)
+                    .expand(3, 17, 7, 64),
                     1,
                     0.0,
                 ),
                 "4d_dim2": (
                     unique_randn_along_dim((6, 17, 7, 64), dim=2),
-                    (0, 1),
+                    torch.arange(2, dtype=torch.float16)
+                    .view(2, 1, 1, 1)
+                    .expand(2, 17, 7, 64),
                     2,
                     -1.0,
                 ),
                 "3d_dim0_fill_inf": (
                     unique_randn_along_dim((67, 71, 256), dim=0),
-                    (5, 10, 15),
+                    torch.arange(3, dtype=torch.float16)
+                    .view(3, 1, 1)
+                    .expand(3, 71, 256),
                     0,
                     float("-inf"),
                 ),
