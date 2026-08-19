@@ -589,23 +589,24 @@ def _build_indirect_load_subs(
     subs = {}
     sizes = {}
 
-    # For each indirect symbol that was discovered, find its value buffer
-    # and size and build a substitution.
-    for data_buf_name, indirect_sym in indirect_syms_map.items():
-        indirect_index_buf = indirect_index_buf_map.get(data_buf_name)
-        if indirect_index_buf is None:
+    # indirect_syms_by_buf maps INDEX buffer name to symbol, so iterate over
+    # the data_buf -> index_buf map to find the corresponding index buffer
+    # and then look up the symbol.
+    for data_buf_name, index_buf_name in indirect_index_buf_map.items():
+        indirect_sym = indirect_syms_map.get(index_buf_name)
+        if indirect_sym is None:
             logger.debug(
-                "  %s: no index buffer found for data_buf %s",
-                indirect_sym,
+                "  data_buf %s: no indirect symbol found for index_buf %s",
                 data_buf_name,
+                index_buf_name,
             )
             continue
-        indirect_index_dep = dep_by_name.get(indirect_index_buf)
+        indirect_index_dep = dep_by_name.get(index_buf_name)
         if indirect_index_dep is None:
             logger.debug(
                 "  %s: index buffer %s not in reads, reads=%s",
                 indirect_sym,
-                indirect_index_buf,
+                index_buf_name,
                 [d.name for d in reads],
             )
             continue
