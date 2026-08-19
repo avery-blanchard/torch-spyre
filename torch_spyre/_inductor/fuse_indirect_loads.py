@@ -182,16 +182,35 @@ def _can_fuse_into_consumer(
     access pattern, which is not supported.
     """
     # Check if consumer has any indirect reads already
-    for dep in consumer_op.get_read_writes().reads:
-        if isinstance(dep, MemoryDep) and dep.is_indirect():
-            # Consumer already has an indirect access; can't fuse another
+    consumer_rw = consumer_op.get_read_writes()
+    logger.debug(
+        "fuse_indirect_loads: checking if %s can fuse into %s",
+        gather_op.get_name(),
+        consumer_op.get_name(),
+    )
+    for dep in consumer_rw.reads:
+        if isinstance(dep, MemoryDep):
+            is_ind = dep.is_indirect()
             logger.debug(
-                "fuse_indirect_loads: consumer %s already has indirect access, "
-                "cannot fuse gather %s (backend constraint: one indirect symbol per tensor)",
-                consumer_op.get_name(),
-                gather_op.get_name(),
+                "  read %s: is_indirect=%s, index=%s",
+                dep.name,
+                is_ind,
+                dep.index,
             )
-            return False
+            if is_ind:
+                # Consumer already has an indirect access; can't fuse another
+                logger.debug(
+                    "fuse_indirect_loads: consumer %s already has indirect access, "
+                    "cannot fuse gather %s (backend constraint: one indirect symbol per tensor)",
+                    consumer_op.get_name(),
+                    gather_op.get_name(),
+                )
+                return False
+    logger.debug(
+        "fuse_indirect_loads: %s can fuse into %s (no existing indirect access)",
+        gather_op.get_name(),
+        consumer_op.get_name(),
+    )
     return True
 
 

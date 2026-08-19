@@ -548,8 +548,36 @@ def _build_indirect_load_subs(
     Pre-scheduler only: re-executes inner_fn via _IndirectIndexFinder to learn
     which buffer's load produced each indirect index and what size it carries.
     Returns ({sym: IndexedBase[...]}, {sym: size}).
+
+    Note: After fusion, an op's static MemoryDep may not reflect indirect reads
+    added by spliced inner_fn code. Always re-execute to discover actual indirect
+    access, rather than filtering by MemoryDep.is_indirect() first.
     """
     from sympy import IndexedBase
+    from .logging_utils import get_inductor_logger
+
+    logger = get_inductor_logger("pass_utils")
+
+    # Always re-execute the inner_fn to discover indirect symbols, because
+    # fusion may have added indirect access at the inner_fn level without
+    # changing the static MemoryDep index expressions.
+    indirect_index_buf_map, indirect_index_size_map, indirect_syms_map = (
+        _find_indirect_index_bufs(op)
+    )
+
+    logger.debug(
+        "_build_indirect_load_subs(%s): discovered indirect_syms_map=%s",
+        op.get_name(),
+        indirect_syms_map,
+    )
+
+    if not indirect_syms_map:
+        # No indirect symbols were minted during re-execution
+        logger.debug(
+            "_build_indirect_load_subs(%s): no indirect symbols, returning empty",
+            op.get_name(),
+        )
+        return {}, None
 
     rw = op.get_read_writes()
     reads = [
@@ -557,34 +585,49 @@ def _build_indirect_load_subs(
         for d in rw.reads
         if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
     ]
-    if not any(d.is_indirect() for d in reads):
-        return {}, None
-
-    # Use _find_indirect_index_bufs which internally calls _IndirectIndexFinder
-    # and caches its results. This avoids minting duplicate symbols.
-    indirect_index_buf_map, indirect_index_size_map, indirect_syms_map = (
-        _find_indirect_index_bufs(op)
-    )
-
     dep_by_name = {d.name: d for d in reads}
     subs = {}
     sizes = {}
-    for d in reads:
-        if not d.is_indirect():
-            continue
-        indirect_index_buf = indirect_index_buf_map.get(d.name)
+
+    # For each indirect symbol that was discovered, find its value buffer
+    # and size and build a substitution.
+    for data_buf_name, indirect_sym in indirect_syms_map.items():
+        indirect_index_buf = indirect_index_buf_map.get(data_buf_name)
         if indirect_index_buf is None:
+            logger.debug(
+                "  %s: no index buffer found for data_buf %s",
+                indirect_sym,
+                data_buf_name,
+            )
             continue
-        indirect_index_dep = dep_by_name[indirect_index_buf]
-        size = indirect_index_size_map.get(d.name)
-        # Get the actual indirect symbol that was minted during re-execution
-        indirect_sym = indirect_syms_map.get(d.name)
-        if indirect_sym is not None:
-            subs[indirect_sym] = IndexedBase(indirect_index_dep.name)[
-                indirect_index_dep.index
-            ]
-            if size is not None:
-                sizes[indirect_sym] = size
+        indirect_index_dep = dep_by_name.get(indirect_index_buf)
+        if indirect_index_dep is None:
+            logger.debug(
+                "  %s: index buffer %s not in reads, reads=%s",
+                indirect_sym,
+                indirect_index_buf,
+                [d.name for d in reads],
+            )
+            continue
+        size = indirect_index_size_map.get(data_buf_name)
+        subs[indirect_sym] = IndexedBase(indirect_index_dep.name)[
+            indirect_index_dep.index
+        ]
+        if size is not None:
+            sizes[indirect_sym] = size
+        logger.debug(
+            "  %s: mapped to IndexedBase(%s)[%s], size=%s",
+            indirect_sym,
+            indirect_index_dep.name,
+            indirect_index_dep.index,
+            size,
+        )
+    logger.debug(
+        "_build_indirect_load_subs(%s): returning subs=%s, sizes=%s",
+        op.get_name(),
+        list(subs.keys()),
+        sizes,
+    )
     return subs, sizes
 
 
