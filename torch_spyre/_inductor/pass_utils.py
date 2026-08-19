@@ -1228,6 +1228,9 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
+    # Skip index buffers added by gather fusion (they have empty ranges)
+    if not in_dep.ranges:
+        return False, None
     idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
     out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
     if idc is None or out_idc is None:
