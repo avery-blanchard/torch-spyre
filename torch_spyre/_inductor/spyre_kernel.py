@@ -659,6 +659,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         every level into one combined Expr -- preserving the single-Expr-
         per-arg contract compute_ops.py/superdsc.py/bundle.py depend on.
 
+        A read dim tiled down to extent 1 in dep's own iteration space has
+        no d{i} symbol at all (Inductor's SqueezeView.squeezer drops it
+        unconditionally -- see CoarseTileInfo.squeezed_advance_per_read's
+        docstring), so it cannot contribute via substitution into dep.index
+        like every other tiled dim here. Its (host_stride, extent) pairs
+        are added as independent terms (level_symbol * extent * host_stride,
+        already in host-element space) through the same
+        tiling_expr_to_device_expr projection instead.
+
         This is the sole tile-advance mechanism. Returns None for ops
         without loop_info/coarse tiling.
         """
@@ -668,6 +677,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             return None
 
         op_name = ir_node.get_operation_name()
+        squeezed_advance_per_level: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
 
         if is_input:
             read_deps = [
@@ -691,6 +701,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return None
             dep = read_deps[dep_idx]
             per_level_dims = loop_info.tiled_dims_per_read[dep_idx]
+            squeezed_advance_per_read = getattr(
+                loop_info, "squeezed_advance_per_read", None
+            )
+            if squeezed_advance_per_read and dep_idx < len(squeezed_advance_per_read):
+                squeezed_advance_per_level = squeezed_advance_per_read[dep_idx]
         else:
             write_deps = [
                 dep
@@ -701,31 +716,47 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return None
             dep = write_deps[0]
             per_level_dims = loop_info.output_tiled_dims
+            squeezed_advance_per_level = (
+                getattr(loop_info, "squeezed_advance_output", None) or []
+            )
 
-        if not per_level_dims:
+        if not per_level_dims and not any(squeezed_advance_per_level):
             return None
 
         device_size = tensor.layout.device_layout.device_size
         stride_map = tensor.layout.device_layout.stride_map
 
         total_device_expr: "sympy.Expr | None" = None
-        for level_idx, dim_extent_pairs in enumerate(per_level_dims):
-            if not dim_extent_pairs:
+        n_levels = max(len(per_level_dims), len(squeezed_advance_per_level))
+        for level_idx in range(n_levels):
+            dim_extent_pairs = (
+                per_level_dims[level_idx] if level_idx < len(per_level_dims) else []
+            )
+            squeezed_pairs = (
+                squeezed_advance_per_level[level_idx]
+                if level_idx < len(squeezed_advance_per_level)
+                else []
+            )
+            if not dim_extent_pairs and not squeezed_pairs:
                 continue
             level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
-            tiled_dim_extents = {
-                self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
-                for d, extent in dim_extent_pairs
-            }
-            subs = dict(tiled_dim_extents)
-            subs.update(
-                {
-                    sym: sympy.Integer(0)
-                    for sym in dep.index.free_symbols
-                    if sym not in subs
+            host_expr = sympy.S.Zero
+            if dim_extent_pairs:
+                tiled_dim_extents = {
+                    self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
+                    for d, extent in dim_extent_pairs
                 }
-            )
-            host_expr = dep.index.subs(subs)
+                subs = dict(tiled_dim_extents)
+                subs.update(
+                    {
+                        sym: sympy.Integer(0)
+                        for sym in dep.index.free_symbols
+                        if sym not in subs
+                    }
+                )
+                host_expr += dep.index.subs(subs)
+            for host_stride, extent in squeezed_pairs:
+                host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
             total_device_expr = (
                 device_expr
@@ -1293,40 +1324,18 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def _kernel_uses_hbm_pool(self) -> bool:
         """Return True if any op in this kernel references an HBM-pool-allocated tensor."""
-        from torch_spyre._inductor.op_spec import TensorArg
-
-        return any(
-            "hbm_pool" in arg.allocation
-            for op in _iter_op_specs(self.op_specs)
-            for arg in op.args
-            if isinstance(arg, TensorArg)
-        )
+        return uses_hbm_pool(self.op_specs)
 
     def call_kernel(self, name: str, node=None):
-        """Codegen a call to this kernel, allocating/freeing this kernel's
-        own pool tensor (if any) scoped tightly around the .run() call."""
+        """Codegen a call to this kernel. This kernel's own HBM pool tensor
+        (if any) is allocated by the generated MLIR itself, via
+        sdscbundle.device_mem_allocate -- there is no Python-side pool
+        tensor to allocate or free here."""
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        uses_pool = self._kernel_uses_hbm_pool()
-        # `name` is this kernel's own wrapper-module variable name (e.g.
-        # "sdsc_fused__buf12"), already guaranteed unique across kernels by
-        # Inductor's wrapper codegen -- two kernels sharing a Python
-        # identifier in the same generated module would already break
-        # `{name}.run(...)` codegen independent of pool allocation. Deriving
-        # the pool variable's name from it is therefore also collision-free.
-        pool_var_name = f"_pool_{name}"
-        if uses_pool:
-            wrapper.writeline(
-                f"{pool_var_name} = spyre_empty_with_layout("
-                f"({self.pool_size},), (1,), torch.uint8, "
-                f"SpyreTensorLayout(device_size=[{self.pool_size}], "
-                f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
-            )
-            call_args.append(pool_var_name)
-
-        # Add remaining kernel arguments, deduplicating tensors that appear as
-        # both input and output (e.g. in-place ops like x *= 2).  With symbolic
+        # Add kernel arguments, deduplicating tensors that appear as both
+        # input and output (e.g. in-place ops like x *= 2).  With symbolic
         # args the MLIR bundle emits one !sdscbundle.input_arg<index> per unique
         # arg_index; passing the same tensor twice would cause a runtime
         # "Number of inputs mismatches" error in processComputeOnHostCommand.
@@ -1338,8 +1347,6 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
-        if uses_pool:
-            wrapper.writeline(f"del {pool_var_name}")
 
     def emit_layout_restores(self, restores) -> None:
         """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
@@ -1401,6 +1408,21 @@ def _iter_op_specs(specs):
             yield from _iter_op_specs(item.body)
         elif isinstance(item, OpSpec):
             yield item
+
+
+def uses_hbm_pool(specs) -> bool:
+    """Return True if any op in ``specs`` references an HBM-pool-allocated tensor.
+
+    This decides whether ``call_kernel`` passes the pool ahead of the kernel
+    args, so anything reading a kernel's ``.run()`` arguments has to agree with
+    it -- hence a shared function rather than a copy per caller.
+    """
+    return any(
+        "hbm_pool" in arg.allocation
+        for op in _iter_op_specs(specs)
+        for arg in op.args
+        if isinstance(arg, TensorArg)
+    )
 
 
 def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
