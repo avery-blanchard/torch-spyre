@@ -157,7 +157,7 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
 @torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
 def keep_by_index(
     values: torch.Tensor,
-    indices: Sequence[int],
+    indices: torch.Tensor,
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
@@ -167,7 +167,7 @@ def keep_by_index(
 @keep_by_index.register_fake
 def _(
     values: torch.Tensor,
-    indices: Sequence[int],
+    indices: torch.Tensor,
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
