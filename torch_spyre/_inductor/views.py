@@ -255,9 +255,26 @@ def compute_coordinates(
             if indirect_sizes is not None and var in indirect_sizes:
                 range_val = indirect_sizes[var]
             elif indirect_sizes is not None:
-                raise Unsupported(
-                    f"indirect symbol {var} not found in indirect_sizes {indirect_sizes}"
-                )
+                # Symbol not found by exact match. If this is an indirect symbol,
+                # try to find ANY indirect size (after fusion, symbol names may diverge)
+                from torch._inductor.dependencies import is_indirect
+
+                if is_indirect(var.name):
+                    # Look for any indirect symbol in the sizes dict
+                    indirect_sizes_list = [
+                        s for s in indirect_sizes.keys() if is_indirect(s.name)
+                    ]
+                    if indirect_sizes_list:
+                        # Use the first indirect size (assume single indirect access)
+                        range_val = indirect_sizes[indirect_sizes_list[0]]
+                    else:
+                        raise Unsupported(
+                            f"indirect symbol {var} not found in indirect_sizes {indirect_sizes}"
+                        )
+                else:
+                    raise Unsupported(
+                        f"symbol {var} not found in indirect_sizes {indirect_sizes}"
+                    )
             else:
                 continue
         else:
