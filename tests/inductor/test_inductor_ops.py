@@ -686,9 +686,12 @@ def _make_keep_by_index_test(shape, dim, k, fill_value):
     # Create indices tensor with K at the masked dimension
     indices_shape = list(shape)
     indices_shape[dim] = k
+    # Reshape arange(k) to have shape 1 everywhere except dim where it's k
+    reshape_shape = [1] * len(shape)
+    reshape_shape[dim] = k
     indices = (
         torch.arange(k, dtype=torch.float16)
-        .reshape([k if i == dim else 1 for i in range(len(shape))])
+        .reshape(reshape_shape)
         .expand(indices_shape)
     )
     return (values, indices, dim, fill_value)
