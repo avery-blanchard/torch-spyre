@@ -1341,6 +1341,21 @@ def compute_layouts(
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
+    if aten_op == spyreop.keep_by_index.default:
+        # keep_by_index: output matches values (arg 0) layout.
+        # indices (arg 1) has different leading dim (K vs N) but matching trailing dims.
+        # Use values' layout for output, and let indices broadcast.
+        values_layout = args[0].layout
+        if values_layout.size != output.size or values_layout.stride != output.stride:
+            raise Unsupported(
+                f"views not supported for spyre.keep_by_index({values_layout.size})=>{output.size})"
+            )
+        # Propagate values' layout to output (single-arg logic)
+        result = _single_arg_op_layout(
+            op, output, output_dep, args[0].dep, values_layout, args[0].layouts[0]
+        )
+        return result
+
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
         # output must have matching size/stride, and x's stick must match

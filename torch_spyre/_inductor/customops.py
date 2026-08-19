@@ -154,6 +154,26 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     return x.new_empty(out_size, dtype=torch.int64)
 
 
+@torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
+def keep_by_index(
+    values: torch.Tensor,
+    indices: Sequence[int],
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    pass
+
+
+@keep_by_index.register_fake
+def _(
+    values: torch.Tensor,
+    indices: Sequence[int],
+    dim: int,
+    fill_value: torch.types.Number,
+) -> torch.Tensor:
+    return values.new_empty(values.size())
+
+
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
 def gelu(
     input: torch.Tensor,

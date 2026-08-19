@@ -1253,6 +1253,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
             },
         },
+        ("test_keep_by_index", "test_keep_by_index_cpu"): {
+            "param_sets": {
+                "2d_dim0": (
+                    unique_randn_along_dim((67, 256), dim=0),
+                    (0, 3, 5),
+                    0,
+                    -1.0,
+                ),
+                "3d_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    (1, 2),
+                    0,
+                    0.0,
+                ),
+                "3d_dim1": (
+                    unique_randn_along_dim((67, 71, 256), dim=1),
+                    (0, 10, 20, 30),
+                    1,
+                    -1.0,
+                ),
+                "4d_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    (0, 5),
+                    0,
+                    -1.0,
+                ),
+                "4d_dim1": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=1),
+                    (2, 4, 6),
+                    1,
+                    0.0,
+                ),
+                "4d_dim2": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
+                    (0, 1),
+                    2,
+                    -1.0,
+                ),
+                "3d_dim0_fill_inf": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    (5, 10, 15),
+                    0,
+                    float("-inf"),
+                ),
+            },
+        },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
@@ -6046,6 +6092,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [x],
                 "spyre",
             )
+
+    def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
+        def spyre_fn(x):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        def pytorch_fn(x):
+            mask = torch.zeros(x.shape[dim], dtype=torch.bool)
+            mask[list(indices)] = True
+            shape = [1] * x.dim()
+            shape[dim] = x.shape[dim]
+            return torch.where(mask.reshape(shape), x, torch.full_like(x, fill_value))
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)

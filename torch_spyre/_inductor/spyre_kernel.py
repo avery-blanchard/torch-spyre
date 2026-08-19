@@ -284,6 +284,15 @@ class SpyreOpFuncs:
         return PointwiseOp("greaterthan", [a, b])
 
     @staticmethod
+    def keep_by_index(x, indices, fill_value):
+        op_info = {
+            "constants": {
+                "mask_val": fill_value,
+            }
+        }
+        return PointwiseOp("keep_by_index", [x, indices], op_info)
+
+    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 
