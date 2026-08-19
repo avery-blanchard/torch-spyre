@@ -38,20 +38,41 @@ logger = get_inductor_logger("fuse_indirect_loads")
 def _is_pure_indirect_load(op: ComputedBuffer) -> bool:
     """Check if op is a bare indirect load (x[i]) with no other ops fused.
 
-    Returns True iff:
-    - op.data is a Pointwise (not a Reduction or other op type)
-    - get_read_writes().reads contains exactly one MemoryDep
-    - that MemoryDep is an indirect access (MemoryDep.is_indirect() == True)
+    A pure indirect load is a Pointwise with:
+    - Exactly one *indirect* MemoryDep (the value being gathered)
+    - Zero or one direct (non-indirect) MemoryDep (the index tensor, if materialized as its own buffer)
+    - No writes (output-only)
+    - No other operations beyond the index load and value load
+
+    The index may be a TensorAccess that loads a separate index buffer (appears as a direct read),
+    or it may be a symbolic expression (no separate buffer read).
     """
     if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
         return False
+
     reads = op.get_read_writes().reads
-    if len(reads) != 1:
+    if not reads:
         return False
-    dep = next(iter(reads))
-    if not isinstance(dep, MemoryDep):
+
+    # Count indirect vs direct reads
+    indirect_reads = []
+    direct_reads = []
+    for dep in reads:
+        if not isinstance(dep, MemoryDep):
+            continue
+        if dep.is_indirect():
+            indirect_reads.append(dep)
+        else:
+            direct_reads.append(dep)
+
+    # Pure indirect load has exactly one indirect read (the gathered value)
+    # and at most one direct read (the index tensor, if materialized as a buffer)
+    if len(indirect_reads) != 1:
         return False
-    return dep.is_indirect()
+    if len(direct_reads) > 1:
+        return False
+
+    return True
 
 
 def _find_ir_consumers(buf_name: str, operations: list) -> list[ComputedBuffer]:

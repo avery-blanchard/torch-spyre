@@ -469,11 +469,17 @@ class CustomPreSchedulingPasses:
             finalize_layouts,
             insert_restickify,
             enforce_indirect_access_layout,
-            fuse_indirect_loads,
             insert_post_mutation_restickify,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
+            #
+            # Fuse pure indirect-load ops into their sole consumer BEFORE work division.
+            # This must run after enforce_indirect_access_layout (which needs the
+            # separate gather op to exist) but BEFORE _distribute_work applies
+            # indirect_access_pinned_vars, so work division sees the fused op,
+            # not the separate gather.
+            fuse_indirect_loads,
             #
             # Working Set Reduction (device-layout-aware, post-stickification)
             # These passes require FixedTiledLayout.device_layout (device_size,
