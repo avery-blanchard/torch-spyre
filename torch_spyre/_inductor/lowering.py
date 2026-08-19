@@ -1143,11 +1143,9 @@ def lower_keep_by_index(values, indices, dim, fill_value):
 
     def inner_fn(index, rindex):
         values_index = list(index)
-        # indices shape: [masked_dim_size, K, ...dims_in_order_except_masked]
-        # Build indices_index preserving dimension order
+        # indices has K at norm_dim position
         indices_index = list(index)
-        indices_index[norm_dim] = index[norm_dim]
-        indices_index.insert(norm_dim + 1, rindex[0])
+        indices_index[norm_dim] = rindex[0]
         return (values_loader(values_index), indices_loader(indices_index))
 
     op_info = {"constants": {"maskval": fill_value}}

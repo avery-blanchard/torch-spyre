@@ -683,13 +683,12 @@ def _pattern_resolve(variant, args):
 def _make_keep_by_index_test(shape, dim, k, fill_value):
     """Generate keep_by_index test case."""
     values = unique_randn_along_dim(shape, dim=dim)
-    # Create indices tensor with K values to keep
-    # Shape: [..., K, ...] with K inserted at dim+1
+    # Create indices tensor with K at the masked dimension
     indices_shape = list(shape)
-    indices_shape.insert(dim + 1, k)
+    indices_shape[dim] = k
     indices = (
         torch.arange(k, dtype=torch.float16)
-        .reshape([1] * (dim + 1) + [k] + [1] * (len(shape) - dim - 1))
+        .reshape([k if i == dim else 1 for i in range(len(shape))])
         .expand(indices_shape)
     )
     return (values, indices, dim, fill_value)
