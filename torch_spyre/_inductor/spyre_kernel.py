@@ -284,13 +284,8 @@ class SpyreOpFuncs:
         return PointwiseOp("greaterthan", [a, b])
 
     @staticmethod
-    def keep_by_index(x, indices, fill_value):
-        op_info = {
-            "constants": {
-                "mask_val": fill_value,
-            }
-        }
-        return PointwiseOp("keep_by_index", [x, indices], op_info)
+    def keep_by_index(x, indices):
+        return ReductionOp("keep_by_index", [x, indices])
 
     @staticmethod
     def layernormnorm(*args):
@@ -1211,10 +1206,15 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
-            # Two-input reductions: matmul (activation @ weight) and conv2d
-            # (activation * weight, reduced over in/ki/kj). Both build
-            # [input, weight, output] tensor args.
+        if value.op in [
+            BATCH_MATMUL_OP,
+            BATCH_MATMUL_FP8_OP,
+            CONV2D_FWD_OP,
+            "keep_by_index",
+        ]:
+            # Two-input reductions: matmul (activation @ weight), conv2d
+            # (activation * weight, reduced over in/ki/kj), and keep_by_index
+            # (values @ indices, keeps selected indices).
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))

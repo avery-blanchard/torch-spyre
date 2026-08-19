@@ -1149,7 +1149,6 @@ def lower_keep_by_index(values, indices, dim, fill_value):
         return lowering.ops_wrapper(torch.ops.spyre.keep_by_index.__name__)(
             values_loader(values_index),
             indices_loader(indices_index),
-            fill_value,
         )
 
     result = Reduction.create(
@@ -1161,6 +1160,7 @@ def lower_keep_by_index(values, indices, dim, fill_value):
         inner_fn=inner_fn,
         ranges=ranges,
         reduction_ranges=reduction_ranges,
+        op_info={"constants": {"mask_val": fill_value}},
     )
     result.realize()
     return result
