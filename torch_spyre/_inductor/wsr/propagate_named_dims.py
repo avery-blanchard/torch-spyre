@@ -299,11 +299,19 @@ def _compute_named_dims(op, inputs):
     if isinstance(op.data, Reduction):
         reduction_sym = find_reduction_var(inputs[0], output_dep)
         if reduction_sym not in loop_var_dims:
-            size = int(inputs[0].ranges[reduction_sym])
-            loop_var_dims[reduction_sym] = [
-                _untracked_name(op.get_name(), reduction_sym, size)
-            ]
-        reduction_named_dims = loop_var_dims[reduction_sym]
+            # After fusion, inputs[0] might be an index buffer with empty ranges
+            if reduction_sym in inputs[0].ranges:
+                size = int(inputs[0].ranges[reduction_sym])
+                loop_var_dims[reduction_sym] = [
+                    _untracked_name(op.get_name(), reduction_sym, size)
+                ]
+            # Otherwise, fall back to using output_dep's ranges if available
+            elif reduction_sym in output_dep.ranges:
+                size = int(output_dep.ranges[reduction_sym])
+                loop_var_dims[reduction_sym] = [
+                    _untracked_name(op.get_name(), reduction_sym, size)
+                ]
+        reduction_named_dims = loop_var_dims.get(reduction_sym, [])
     op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
         named_dims=named_dims,
         loop_var_dims=loop_var_dims,
