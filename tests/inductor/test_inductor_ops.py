@@ -6108,7 +6108,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
-        def ref_fn(x, indices):
+        def spyre_fn(x, indices):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        def pytorch_fn(x, indices):
             # Extract the unique indices from the K dimension of indices tensor
             keep_indices = torch.unique(indices[:, 0] if indices.dim() > 1 else indices)
             mask = torch.zeros(x.shape[dim], dtype=torch.bool)
@@ -6117,14 +6120,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             shape[dim] = x.shape[dim]
             return torch.where(mask.reshape(shape), x, torch.full_like(x, fill_value))
 
-        self.compare_with_cpu(
-            lambda x, indices: torch.ops.spyre.keep_by_index(
-                x, indices, dim, fill_value
-            ),
-            x,
-            indices,
-            run_eager=False,
-        )
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, indices)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
