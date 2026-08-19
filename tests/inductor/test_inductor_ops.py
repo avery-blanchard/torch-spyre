@@ -6112,8 +6112,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
 
         def pytorch_fn(x, indices):
-            # Extract the unique indices from the K dimension of indices tensor
-            keep_indices = torch.unique(indices[:, 0] if indices.dim() > 1 else indices)
+            # Extract the K indices from dimension 0 of the indices tensor.
+            # All positions in non-masked dimensions have the same indices,
+            # so we extract from a representative slice.
+            idx_slice = indices[(slice(None),) + (0,) * (indices.dim() - 1)]
+            keep_indices = torch.unique(idx_slice)
             mask = torch.zeros(x.shape[dim], dtype=torch.bool)
             mask[keep_indices.to(torch.long)] = True
             shape = [1] * x.dim()

@@ -43,6 +43,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
+    KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
@@ -2035,7 +2036,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
-
+    if op_spec.op == KEEP_BY_INDEX_OP:
+        num_inputs = 2
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
         # The pool hardware accumulates the full kernel window on each core.

@@ -1139,16 +1139,14 @@ def lower_keep_by_index(values, indices, dim, fill_value):
     indices_loader = indices.make_loader()
 
     ranges = list(x_size)
-    ranges[norm_dim] = indices_size[0]
-    reduction_ranges = [x_size[norm_dim]]
+    reduction_ranges = [indices_size[0]]
 
     def inner_fn(index, rindex):
         values_index = list(index)
-        values_index[norm_dim] = rindex[0]
-        indices_index = list(index)
+        indices_index = [rindex[0]] + list(index)[1:]
         return (values_loader(values_index), indices_loader(indices_index))
 
-    op_info = {"constants": {"mask_val": fill_value}}
+    op_info = {"constants": {"maskval": fill_value}}
     result = SpyreReduction.create(
         reduction_type="keepbyindex",
         input_node=[values, indices],
