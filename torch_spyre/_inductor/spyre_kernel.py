@@ -72,6 +72,7 @@ from .op_spec import (
     format_op_spec_list,
     is_lx_relayout_identity,
 )
+from .op_spec_validation import validate_op_specs
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
@@ -1274,6 +1275,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             else None
         )
 
+        if _spyre_config.validate_op_specs:
+            validate_op_specs(self.op_specs, stage="after_creation_loop_wrapping")
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "OP SPECS AFTER CREATION/LOOP-WRAPPING\n%s",
@@ -1283,6 +1286,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         for op_spec in _iter_op_specs(self.op_specs):
             simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
 
+        if _spyre_config.validate_op_specs:
+            validate_op_specs(self.op_specs, stage="after_simplification")
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "OP SPECS AFTER SIMPLIFICATION\n%s",
