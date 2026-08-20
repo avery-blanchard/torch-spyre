@@ -41,7 +41,12 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .core_mapping import core_to_slice_mapping
-from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS, TOPK_OPS
+from .constants import (
+    ELIDED_COPY_BACK_ATTR,
+    KEEP_BY_INDEX_OP,
+    MATMUL_REDUCTION_OPS,
+    TOPK_OPS,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -1602,6 +1607,15 @@ def is_topk(op: Operation) -> bool:
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
         and op.data.reduction_type in TOPK_OPS
+    )
+
+
+def is_keep_by_index(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing a keep_by_index reduction."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == KEEP_BY_INDEX_OP
     )
 
 
