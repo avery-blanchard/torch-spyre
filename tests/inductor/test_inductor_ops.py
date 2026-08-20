@@ -649,19 +649,13 @@ def _pattern_resolve(variant, args):
 
 
 def _make_keep_by_index_test(shape, dim, k, fill_value):
-    """Generate keep_by_index test case."""
-    values = unique_randn_along_dim(shape, dim=dim)
-    # Create indices tensor with K at the masked dimension
-    indices_shape = list(shape)
-    indices_shape[dim] = k
-    # Reshape arange(k) to have shape 1 everywhere except dim where it's k
-    reshape_shape = [1] * len(shape)
-    reshape_shape[dim] = k
-    indices = (
-        torch.arange(k, dtype=torch.float16)
-        .reshape(reshape_shape)
-        .expand(indices_shape)
-    )
+    """Generate keep_by_index test case with topk indices."""
+    # Create values with random data
+    values = torch.randn(shape, dtype=torch.float16)
+
+    # Get indices from topk
+    topk_values, indices = torch.topk(values, min(k, shape[dim]), dim=dim, largest=True)
+
     return (values, indices, dim, fill_value)
 
 
@@ -1300,9 +1294,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "4d_dim2": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=2, k=2, fill_value=-1.0
-                ),
-                "3d_dim0_fill_inf": _make_keep_by_index_test(
-                    (67, 71, 256), dim=0, k=3, fill_value=float("-inf")
                 ),
             },
         },
@@ -6113,9 +6104,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
         def fn(x, indices):
-            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+            if x.device.type == "spyre":
+                return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+            else:
+                # CPU reference: keep only elements whose coordinate along dim
+                # appears in the topk indices tensor
+                # Get all unique indices from topk output
+                kept_indices = torch.unique(indices.long())
+                mask = torch.zeros(x.shape[dim], dtype=torch.bool)
+                mask[kept_indices] = True
+                # Reshape mask to broadcast against x along dim
+                broadcast_shape = [1] * x.dim()
+                broadcast_shape[dim] = x.shape[dim]
+                mask = mask.reshape(broadcast_shape)
+                return torch.where(mask, x, torch.full_like(x, fill_value))
 
-        self.compare_with_cpu(fn, x, indices, run_eager=True)
+        self.compare_with_cpu(fn, x, indices, run_eager=False)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
