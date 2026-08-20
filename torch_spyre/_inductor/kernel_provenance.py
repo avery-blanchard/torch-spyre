@@ -60,6 +60,7 @@ _EXPECTED_OP_SPEC_SCHEMA = {
     "args": "Sequence[TensorArg]",
     "op_info": "dict[str, Any]",
     "tiled_symbols": "list[list[Symbol]]",
+    "core_id_to_work_slice": "dict[Symbol, Expr]",
     "tiled_symbol_trip_counts": "dict[Symbol, int]",
     "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
     "node_output_ranges": "tuple[Expr, ...] | None",
