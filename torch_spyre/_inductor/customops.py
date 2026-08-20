@@ -181,17 +181,29 @@ def keep_by_index_cpu(
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
-    # indices has K at the masked dimension
-    # Build indexing tuple with slice(None) at dim position
-    idx_list = [slice(None) if i == dim else 0 for i in range(indices.dim())]
-    keep_vals = indices[tuple(idx_list)].to(torch.long)
+    # Match lowering behavior: for each position, check if coord matches any indices[k, ...]
+    # This iterates through indices[0], indices[1], ... indices[K-1] and ORs the masks
+    indices_long = indices.to(torch.long)
+    output = torch.full_like(values, fill_value)
 
-    coords = torch.arange(values.shape[dim], device=values.device, dtype=torch.long)
-    mask = torch.isin(coords, keep_vals)
-    shape = [1] * values.dim()
-    shape[dim] = values.shape[dim]
-    mask = mask.reshape(shape)
-    return torch.where(mask, values, torch.full_like(values, fill_value))
+    # For each k in K dimension, load indices[k, ...] and mark positions that match
+    k_dim = indices.shape[dim]
+    for k in range(k_dim):
+        # Extract indices[k, ...]
+        idx_slice: list = [slice(None)] * values.ndim()  # type: ignore[assignment]
+        idx_slice[dim] = k
+        keep_indices = indices_long[tuple(idx_slice)]  # shape: same as values minus dim
+
+        # For each position in values, check if its coordinate along dim is in keep_indices[...]
+        for pos_coord in range(values.shape[dim]):
+            pos_idx: list = [slice(None)] * values.ndim()  # type: ignore[assignment]
+            pos_idx[dim] = pos_coord
+            # Check if pos_coord appears in keep_indices at corresponding position
+            if (keep_indices == pos_coord).any():
+                # This position should be kept
+                output[tuple(pos_idx)] = values[tuple(pos_idx)]
+
+    return output
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
