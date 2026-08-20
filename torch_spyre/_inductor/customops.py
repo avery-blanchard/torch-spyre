@@ -181,29 +181,29 @@ def keep_by_index_cpu(
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
-    # Match lowering behavior: for each position, check if coord matches any indices[k, ...]
-    # This iterates through indices[0], indices[1], ... indices[K-1] and ORs the masks
+    # For each position, keep if its coordinate along dim is in indices at that position
     indices_long = indices.to(torch.long)
-    output = torch.full_like(values, fill_value)
 
-    # For each k in K dimension, load indices[k, ...] and mark positions that match
-    k_dim = indices.shape[dim]
-    for k in range(k_dim):
-        # Extract indices[k, ...]
-        idx_slice: list = [slice(None)] * values.ndim()  # type: ignore[assignment]
-        idx_slice[dim] = k
-        keep_indices = indices_long[tuple(idx_slice)]  # shape: same as values minus dim
+    # Create coordinate tensor for the masked dimension
+    coords = torch.arange(values.shape[dim], device=values.device, dtype=torch.long)
 
-        # For each position in values, check if its coordinate along dim is in keep_indices[...]
-        for pos_coord in range(values.shape[dim]):
-            pos_idx: list = [slice(None)] * values.ndim()  # type: ignore[assignment]
-            pos_idx[dim] = pos_coord
-            # Check if pos_coord appears in keep_indices at corresponding position
-            if (keep_indices == pos_coord).any():
-                # This position should be kept
-                output[tuple(pos_idx)] = values[tuple(pos_idx)]
+    # Reshape indices to [K, ...] and coords to [N, 1, 1, ...] for broadcasting
+    mask = torch.zeros_like(values, dtype=torch.bool)
 
-    return output
+    # For each k, check if any coordinate matches indices[k, ...]
+    for k in range(indices.shape[dim]):
+        idx_k = indices_long.select(dim, k)  # shape: values.shape with dim removed
+        idx_k = idx_k.unsqueeze(dim)  # add back dim
+
+        # Expand coords for broadcasting
+        coords_expanded = coords.view(
+            [values.shape[dim] if i == dim else 1 for i in range(values.ndim)]
+        )
+
+        # Mark where coord == indices[k]
+        mask = mask | (coords_expanded == idx_k)
+
+    return torch.where(mask, values, torch.full_like(values, fill_value))
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
