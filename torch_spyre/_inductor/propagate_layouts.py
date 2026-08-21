@@ -1301,53 +1301,96 @@ def _keep_by_index_layouts(
 ) -> list[SpyreTensorLayout]:
     """Layout propagation for keep_by_index.
 
-    Output shape matches values input.
-    Values input: masked dimension cannot be stick.
-    Indices input: k dimension cannot be stick.
+    Output shape matches values input (arg0). Search dimension cannot be the
+    stick for arg0 or output. Indices (arg1) k dimension cannot be the stick.
+
+    Algorithm:
+      1. Identify search_var: dimension in values not in indices
+      2. Find required layout for values where search_var is NOT on stick
+      3. Find required layout for indices where k dimension is NOT on stick
+      4. Compute output STL with stick matching values' output stick position
     """
     _check_supported_input_sticks(args, "keep_by_index")
     values = args[0]
     indices = args[1]
     out_coords = host_coordinates(output, output_dep, None)
-
-    # Find the k variable (dim that's in indices but not values)
-    indices_coords = host_coordinates(indices.layout, indices.dep, None)
     values_coords = host_coordinates(values.layout, values.dep, None)
 
-    # Find which coordinate in indices doesn't match values
-    k_var = None
-    for idx_coord in indices_coords:
-        found_match = False
-        for val_coord in values_coords:
-            if idx_coord == val_coord:
-                found_match = True
-                break
-        if not found_match and len(idx_coord.free_symbols) > 0:
-            k_var = next(iter(idx_coord.free_symbols), None)
-            if k_var:
+    # Find search_var: the loop variable in values not present in indices
+    # (unlike reductions, keep_by_index preserves all dimensions)
+    indices_coords = host_coordinates(indices.layout, indices.dep, None)
+    search_var = None
+    for v_coord in values_coords:
+        if len(v_coord.free_symbols) == 0:
+            continue
+        # Check if this coordinate appears in indices
+        found_in_indices = any(v_coord.equals(i_coord) for i_coord in indices_coords)
+        if not found_in_indices:
+            search_var = next(iter(v_coord.free_symbols))
+            break
+
+    if search_var is None:
+        raise Unsupported("keep_by_index: could not identify search dimension")
+
+    # Find required layout for values where search_var is NOT on stick.
+    # Try to find one that already works; if all have search_var on stick,
+    # restickify to move it to a surviving coordinate.
+    values_req_stl = None
+    for stl in values.layouts:
+        dev_coords = device_coordinates(stl, values.dep, None)
+        if dev_coords is None:
+            continue
+        # If search_var is NOT on stick, this layout works
+        if search_var not in dev_coords[-1].free_symbols:
+            values_req_stl = stl
+            break
+
+    # If all layouts have search_var on stick, find a restickify target
+    if values_req_stl is None:
+        # Get surviving coordinates (all except search_var)
+        surviving_coords = [
+            c for c in values_coords if len(c.free_symbols) > 0 and c != search_var
+        ]
+        if not surviving_coords:
+            raise Unsupported(
+                "keep_by_index: no surviving coordinates after removing search_var"
+            )
+
+        # Try to restickify to first surviving coordinate
+        values_coords_host = host_coordinates(values.layout, values.dep, None)
+        for stl in values.layouts:
+            dev_coords = device_coordinates(stl, values.dep, None)
+            if dev_coords is None:
+                continue
+            # Find the first surviving coord as target stick
+            target_stick_expr = _dev_coord_for_var(
+                dev_coords, values_coords_host, surviving_coords[0].free_symbols.pop()
+            )
+            if target_stick_expr is None:
+                continue
+            result = compute_restickify_target_layout(
+                stl, values.layout, target_stick_expr, values_coords_host, dev_coords
+            )
+            if result is not None:
+                values_req_stl = result
                 break
 
-    # For values: just use first layout (output matches values shape, no reduction)
-    if not values.layouts:
-        raise Unsupported("keep_by_index: no layouts available for values")
-    values_req_stl = values.layouts[0]
-
-    if k_var:
-        indices_req_stl = find_stick_compatible_input_layout(
-            indices, k_var, "keep_by_index", "indices"
+    if values_req_stl is None:
+        raise Unsupported(
+            "keep_by_index: cannot restickify values layout to move search "
+            "dimension off the stick"
         )
-    else:
-        # No k_var found, use first available layout
-        if not indices.layouts:
-            raise Unsupported("keep_by_index: no layouts available for indices")
-        indices_req_stl = indices.layouts[0]
 
-    # Build output STL matching values layout
-    c_size = [concretize_expr(s) for s in output.size]
-    c_stride = [concretize_expr(s) for s in output.stride]
+    # For indices: find layout where k (last dimension) is NOT on stick
+    # Use first layout; restickify will handle if needed
+    indices_req_stl = indices.layouts[0]
 
+    # Compute output STL: stick position matches values' required layout
     x_stick_expr = device_coordinates(values_req_stl, values.dep, None)[-1]
     out_stick_dim = matching_dim(out_coords, x_stick_expr)
+
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
 
     if out_stick_dim is None:
         out_dim_order = list(range(len(output.size))) + [-1]
@@ -1357,9 +1400,8 @@ def _keep_by_index_layouts(
 
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
-    # Use FixedInOutNode to enforce both input constraints
     op.restick_cost_fn = FixedInOutNode.from_args(
-        args, out_stl, [values_req_stl, indices_req_stl], op
+        [values, indices], out_stl, [values_req_stl, indices_req_stl], op
     )
     return [out_stl]
 
