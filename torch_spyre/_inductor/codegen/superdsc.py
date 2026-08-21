@@ -2100,8 +2100,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
+
     if op_spec.op == KEEP_BY_INDEX_OP:
-        num_inputs = 2
+        num_inputs = 2  # keep_by_index has exactly 2 input tensors (values, indices)
+
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
         # The pool hardware accumulates the full kernel window on each core.

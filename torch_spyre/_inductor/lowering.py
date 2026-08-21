@@ -1129,7 +1129,6 @@ def lower_keep_by_index(values, indices, dim, fill_value):
 
     x_size = values.get_size()
     ndim = len(x_size)
-    norm_dim = dim % ndim
 
     # Concretize dim if symbolic
     if isinstance(dim, sympy.Basic):

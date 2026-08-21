@@ -183,27 +183,27 @@ def keep_by_index_cpu(
     dim: int,
     fill_value: torch.types.Number,
 ) -> torch.Tensor:
-    # For each position, keep if its coordinate along dim is in indices at that position
+    # Normalize dim to handle negative indices
+    dim = dim % values.ndim
     indices_long = indices.to(torch.long)
 
-    # Create coordinate tensor for the masked dimension
-    coords = torch.arange(values.shape[dim], device=values.device, dtype=torch.long)
-
-    # Reshape indices to [K, ...] and coords to [N, 1, 1, ...] for broadcasting
+    # Create mask: for each position in output, check if value[dim] matches any index
     mask = torch.zeros_like(values, dtype=torch.bool)
 
-    # For each k, check if any coordinate matches indices[k, ...]
+    # For each k in the indices dimension, check which values match
     for k in range(indices.shape[dim]):
-        idx_k = indices_long.select(dim, k)  # shape: values.shape with dim removed
-        idx_k = idx_k.unsqueeze(dim)  # add back dim
+        idx_k = indices_long.select(dim, k)  # values.shape with dim removed
+        idx_k = idx_k.unsqueeze(dim)  # add back dimension
 
-        # Expand coords for broadcasting
-        coords_expanded = coords.view(
-            [values.shape[dim] if i == dim else 1 for i in range(values.ndim)]
-        )
+        # Create coordinate tensor reshaped for broadcasting
+        shape = [1] * values.ndim
+        shape[dim] = values.shape[dim]
+        coords = torch.arange(
+            values.shape[dim], device=values.device, dtype=torch.long
+        ).view(shape)
 
-        # Mark where coord == indices[k]
-        mask = mask | (coords_expanded == idx_k)
+        # Mark where values[dim] == indices[k, ...]
+        mask = mask | (coords == idx_k)
 
     return torch.where(mask, values, torch.full_like(values, fill_value))
 

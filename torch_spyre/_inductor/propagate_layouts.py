@@ -790,6 +790,57 @@ def _dev_coord_for_var(dev_coords, arg_host_coords, var):
     return None
 
 
+def _find_layout_avoiding_var_on_stick(
+    arg: PropArg,
+    avoid_var: sympy.Symbol,
+    label: str,
+) -> SpyreTensorLayout:
+    """Find required STL for ``arg`` whose stick does not carry ``avoid_var``.
+
+    1. Return the first layout whose stick already excludes avoid_var (zero cost).
+    2. Else return the first layout that can be restickified to move avoid_var
+       off the stick, onto a surviving coordinate.
+    3. Else raise Unsupported.
+    """
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        if avoid_var not in dev_coords[-1].free_symbols:
+            return stl
+
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
+    if not surviving_vars:
+        raise Unsupported(
+            f"{label}: no surviving coordinates after removing {avoid_var}"
+        )
+    surviving_var = next(iter(surviving_vars))
+
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        target_stick_expr = _dev_coord_for_var(
+            dev_coords, arg_host_coords, surviving_var
+        )
+        if target_stick_expr is None:
+            continue
+        result = compute_restickify_target_layout(
+            stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
+        )
+        if result is not None:
+            return result
+
+    raise Unsupported(
+        f"{label}: cannot restickify layout to move {avoid_var} off the stick"
+    )
+
+
 def find_stick_compatible_input_layout(
     arg: PropArg,
     reduction_var: sympy.Symbol,
@@ -1365,58 +1416,26 @@ def _keep_by_index_layouts(
     if search_var is None:
         raise Unsupported("keep_by_index: could not identify search dimension")
 
-    # Find required layout for values where search_var is NOT on stick.
-    # Try to find one that already works; if all have search_var on stick,
-    # restickify to move it to a surviving coordinate.
-    values_req_stl = None
-    for stl in values.layouts:
-        dev_coords = device_coordinates(stl, values.dep, None)
-        if dev_coords is None:
+    values_req_stl = _find_layout_avoiding_var_on_stick(
+        values, search_var, "keep_by_index"
+    )
+
+    # Find reduction_var: loop variable in indices not in values (the k dimension)
+    reduction_var = None
+    for i_coord in indices_coords:
+        if len(i_coord.free_symbols) == 0:
             continue
-        # If search_var is NOT on stick, this layout works
-        if search_var not in dev_coords[-1].free_symbols:
-            values_req_stl = stl
+        found_in_values = any(i_coord.equals(v_coord) for v_coord in values_coords)
+        if not found_in_values:
+            reduction_var = next(iter(i_coord.free_symbols))
             break
 
-    # If all layouts have search_var on stick, find a restickify target
-    if values_req_stl is None:
-        # Get surviving coordinates (all except search_var)
-        surviving_coords = [
-            c for c in values_coords if len(c.free_symbols) > 0 and c != search_var
-        ]
-        if not surviving_coords:
-            raise Unsupported(
-                "keep_by_index: no surviving coordinates after removing search_var"
-            )
+    if reduction_var is None:
+        raise Unsupported("keep_by_index: could not identify k dimension")
 
-        # Try to restickify to first surviving coordinate
-        values_coords_host = host_coordinates(values.layout, values.dep, None)
-        for stl in values.layouts:
-            dev_coords = device_coordinates(stl, values.dep, None)
-            if dev_coords is None:
-                continue
-            # Find the first surviving coord as target stick
-            target_stick_expr = _dev_coord_for_var(
-                dev_coords, values_coords_host, surviving_coords[0].free_symbols.pop()
-            )
-            if target_stick_expr is None:
-                continue
-            result = compute_restickify_target_layout(
-                stl, values.layout, target_stick_expr, values_coords_host, dev_coords
-            )
-            if result is not None:
-                values_req_stl = result
-                break
-
-    if values_req_stl is None:
-        raise Unsupported(
-            "keep_by_index: cannot restickify values layout to move search "
-            "dimension off the stick"
-        )
-
-    # For indices: find layout where k (last dimension) is NOT on stick
-    # Use first layout; restickify will handle if needed
-    indices_req_stl = indices.layouts[0]
+    indices_req_stl = _find_layout_avoiding_var_on_stick(
+        indices, reduction_var, "keep_by_index"
+    )
 
     # Compute output STL: stick position matches values' required layout
     x_stick_expr = device_coordinates(values_req_stl, values.dep, None)[-1]

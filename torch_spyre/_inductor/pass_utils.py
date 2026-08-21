@@ -2012,6 +2012,32 @@ def is_keep_by_index(op: Operation) -> bool:
     )
 
 
+def read_with_max_reduction_overlap(
+    reads: Any,
+    reduction_vars: set[sympy.Symbol],
+) -> Optional[sympy.Expr]:
+    """Return the non-indirect read index with the most reduction-var coefficients.
+
+    For keep_by_index, the indices tensor carries the k (reduction) dimension
+    while the values tensor doesn't, so the read that should drive
+    ``splits_by_index_coeff`` / ``apply_splits_from_index_coeff`` isn't
+    necessarily the first non-indirect read. Instead, pick whichever
+    non-indirect read's index has nonzero coefficients on the most
+    ``reduction_vars`` symbols. Returns None if no read has any overlap.
+    """
+    best_read = None
+    best_count = 0
+    for d in reads:
+        if isinstance(d, MemoryDep) and not d.is_indirect():
+            red_count = sum(
+                1 for red_var in reduction_vars if d.index.coeff(red_var) != 0
+            )
+            if red_count > best_count:
+                best_count = red_count
+                best_read = d.index
+    return best_read
+
+
 # TODO: Select and store the core mapping before LX planning, then pass the
 # winning mapping to codegen.
 class _ViewPrep(NamedTuple):
