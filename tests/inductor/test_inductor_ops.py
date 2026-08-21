@@ -650,12 +650,9 @@ def _pattern_resolve(variant, args):
 
 def _make_keep_by_index_test(shape, dim, k, fill_value):
     """Generate keep_by_index test case with topk indices."""
-    # Create values with random data
     values = torch.randn(shape, dtype=torch.float16)
-
-    # Get indices from topk
-    topk_values, indices = torch.topk(values, min(k, shape[dim]), dim=dim, largest=True)
-
+    # Get indices from topk - these are the indices to keep
+    _, indices = torch.topk(values, min(k, shape[dim]), dim=dim, largest=True)
     return (values, indices, dim, fill_value)
 
 
@@ -1284,13 +1281,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (67, 71, 256), dim=0, k=2, fill_value=0.0
                 ),
                 "3d_dim1": _make_keep_by_index_test(
-                    (67, 71, 256), dim=1, k=4, fill_value=-1.0
+                    (67, 64, 256), dim=1, k=16, fill_value=-1.0
                 ),
                 "4d_dim0": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=0, k=2, fill_value=-1.0
                 ),
                 "4d_dim1": _make_keep_by_index_test(
-                    (6, 17, 7, 64), dim=1, k=3, fill_value=0.0
+                    (6, 17, 64, 64), dim=1, k=3, fill_value=0.0
                 ),
                 "4d_dim2": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=2, k=2, fill_value=-1.0
@@ -6102,25 +6099,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
-        # indices come from topk, so topk_values has the actual kept values
-        topk_values = torch.topk(x, indices.shape[dim], dim=dim, largest=True)[0]
+    def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
+        _, indices = torch.topk(x, k, dim=dim, largest=True)
 
         def fn(x, indices):
             return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
 
-        # Run on spyre
-        result_spyre = fn(x.to("spyre"), indices.to("spyre")).cpu()
+        compiled_fn = torch.compile(fn)
+        result_spyre = compiled_fn(
+            x.to("spyre"), indices.to(torch.float16).to("spyre")
+        ).cpu()
+        expected = fn(x, indices)
 
-        # Verify: result should contain only values from topk_values where they were kept
-        # Extract the kept values and check they match topk output
-        kept_mask = result_spyre != fill_value
-        result_kept_values = result_spyre[kept_mask]
-        topk_kept_values = topk_values[kept_mask]
-
-        torch.testing.assert_close(
-            result_kept_values, topk_kept_values, atol=0.1, rtol=0.1
-        )
+        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)

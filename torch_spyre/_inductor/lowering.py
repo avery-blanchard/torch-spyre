@@ -1125,15 +1125,17 @@ def lower_clamp(x, min=None, max=None):
 
 @register_spyre_lowering(torch.ops.spyre.keep_by_index)
 def lower_keep_by_index(values, indices, dim, fill_value):
+    from .pass_utils import concretize_expr
+
     x_size = values.get_size()
     ndim = len(x_size)
     norm_dim = dim % ndim
-    if norm_dim == ndim - 1:
-        raise Unsupported(
-            "keep_by_index cannot mask the last (stick) dimension: Spyre "
-            "pointwise ops address whole sticks, not individual lanes within "
-            "a stick."
-        )
+
+    # Concretize dim if symbolic
+    if isinstance(dim, sympy.Basic):
+        norm_dim = int(concretize_expr(dim)) % ndim
+    else:
+        norm_dim = dim % ndim
 
     indices_size = indices.get_size()
     values_loader = values.make_loader()
