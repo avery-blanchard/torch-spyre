@@ -455,6 +455,10 @@ def _is_depthwise_conv(op: str) -> bool:
     return op == DEPTHWISE_CONV2D_OP
 
 
+def _is_keep_by_index(op: str) -> bool:
+    return op == KEEP_BY_INDEX_OP
+
+
 # Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
 # these label strings; survival of each role is read from the node's live output
 # ranges (see _align_pool_dim_labels), so no size info leaks above codegen.
@@ -1193,8 +1197,8 @@ def _create_sdsc_tensors(
         if (
             use_op_dims
             and dim_order != dims
-            and _is_topk(op_spec.op)
-            and op_spec.op != "keepbyindex"
+            and not _is_topk(op_spec.op)
+            and not _is_keep_by_index(op_spec.op)
         ):
             if not (has_indirect_access and i in index_tensor_indices):
                 reduced_dims = [
