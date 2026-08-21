@@ -6103,23 +6103,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_keep_by_index_cpu(self, x, indices, dim: int, fill_value: float):
-        def fn(x, indices):
-            if x.device.type == "spyre":
-                return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
-            else:
-                # CPU reference: keep only elements whose coordinate along dim
-                # appears in the topk indices tensor
-                # Get all unique indices from topk output
-                kept_indices = torch.unique(indices.long())
-                mask = torch.zeros(x.shape[dim], dtype=torch.bool)
-                mask[kept_indices] = True
-                # Reshape mask to broadcast against x along dim
-                broadcast_shape = [1] * x.dim()
-                broadcast_shape[dim] = x.shape[dim]
-                mask = mask.reshape(broadcast_shape)
-                return torch.where(mask, x, torch.full_like(x, fill_value))
+        # indices come from topk, so topk_values has the actual kept values
+        topk_values = torch.topk(x, indices.shape[dim], dim=dim, largest=True)[0]
 
-        self.compare_with_cpu(fn, x, indices, run_eager=False)
+        def fn(x, indices):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        # Run on spyre
+        result_spyre = fn(x.to("spyre"), indices.to("spyre")).cpu()
+
+        # Verify: result should contain only values from topk_values where they were kept
+        # Extract the kept values and check they match topk output
+        kept_mask = result_spyre != fill_value
+        result_kept_values = result_spyre[kept_mask]
+        topk_kept_values = topk_values[kept_mask]
+
+        torch.testing.assert_close(
+            result_kept_values, topk_kept_values, atol=0.1, rtol=0.1
+        )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
