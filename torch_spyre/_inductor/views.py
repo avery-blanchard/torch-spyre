@@ -766,11 +766,18 @@ def align_tensors(
 
     # Redistribute core_id_to_work_slice across whatever new symbols each old
     # var was factored into (remap), so the mapping stays keyed correctly
-    # against the iteration space this function returns. Vars with no entry
-    # in remap passed through unchanged (the `else` branch above) and keep
-    # their existing slice, if any. IMPORTANT: only redistribute if the old
-    # slice was actually split (not Integer(0)); reduction-only dims with
-    # unsplit old_slice should stay unsplit across all segments.
+    # against the iteration space this function returns. align_tensors can
+    # reorder dims relative to each other even when a var passes through
+    # unsplit (the `else` branch above, no `remap` entry): new_op_it_space_splits
+    # is built from splits.items(), whose order reflects all_vars's
+    # dict-insertion order across all tensors' index terms, not the original
+    # dim_splits order the var's old_slice stride was computed against. So
+    # every var -- split or not -- is routed through redistribute_core_slice
+    # against all_dims_list (the final order) to recompute a stride consistent
+    # with its new position; a pass-through var is just a trivial one-segment
+    # "remap". IMPORTANT: redistribute_core_slice itself only redistributes if
+    # the old slice was actually split (not Integer(0)); reduction-only dims
+    # with unsplit old_slice stay unsplit.
     # Recompute core_id_to_work_slice based on the final iteration space order.
     new_core_id_to_work_slice: dict[sympy.Symbol, sympy.Expr] = {}
     if core_id_to_work_slice is not None:
@@ -779,19 +786,17 @@ def align_tensors(
         # Get the full dimension list in iteration order for correct stride computation.
         all_dims_list: list[sympy.Symbol] = list(new_op_it_space_splits.keys())
         for var, old_slice in core_id_to_work_slice.items():
-            segments = remap.get(var)
-            if segments is None:
-                new_core_id_to_work_slice[var] = old_slice
-            else:
-                # Redistribute across all segments. redistribute_core_slice handles
-                # unsplit slices (Integer(0)) correctly by returning all zeros.
-                # Pass all_dims so it can compute correct stride accounting for
-                # dimensions that come before these segments in the iteration order.
-                new_core_id_to_work_slice.update(
-                    redistribute_core_slice(
-                        old_slice, segments, new_op_it_space_splits, all_dims_list
-                    )
+            segments = remap.get(var, [var])
+            # Redistribute across all segments. redistribute_core_slice handles
+            # unsplit slices (Integer(0)) correctly by returning all zeros.
+            # Pass all_dims so it can compute correct stride accounting for
+            # dimensions that come before these segments in the iteration order,
+            # even for a pass-through var whose position may have moved.
+            new_core_id_to_work_slice.update(
+                redistribute_core_slice(
+                    old_slice, segments, new_op_it_space_splits, all_dims_list
                 )
+            )
 
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
