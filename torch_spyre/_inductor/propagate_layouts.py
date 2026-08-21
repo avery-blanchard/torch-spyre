@@ -1301,54 +1301,73 @@ def _keep_by_index_layouts(
 ) -> list[SpyreTensorLayout]:
     """Layout propagation for keep_by_index.
 
-    Output shape matches values input. Propagate stick dimensions from values input.
-    The k dimension of indices (where it differs from values) cannot be the stick dim.
+    Output shape matches values input.
+    Values input: search space dim cannot be stick.
+    Indices input: k dimension cannot be stick.
     """
     _check_supported_input_sticks(args, "keep_by_index")
     values = args[0]
     indices = args[1]
     out_coords = host_coordinates(output, output_dep, None)
 
-    # Find which dimension is k (differs between values and indices shapes)
-    values_size = values.layout.size
-    indices_size = indices.layout.size
-    k_dim = None
-    for i in range(len(values_size)):
-        if i < len(indices_size) and indices_size[i] != values_size[i]:
-            k_dim = i
-            break
+    # Find the search space variable (dim that's masked) - it's in values but not output
+    values_dep = values.dep
+    search_space_var = find_reduction_var(values_dep, output_dep)
 
-    # Check that indices k dimension is not in stick position for any layout
-    for stl_indices in indices.layouts:
-        indices_stick_expr = device_coordinates(stl_indices, indices.dep, None)[-1]
-        # Verify k_dim is not the stick dimension
-        if k_dim is not None:
-            # Get the coordinate expression for k_dim
-            indices_coords = host_coordinates(indices.layout, indices.dep, None)
-            if k_dim < len(indices_coords):
-                k_coord = indices_coords[k_dim]
-                if k_coord == indices_stick_expr:
-                    raise Unsupported(
-                        "keep_by_index: indices k dimension cannot be the stick dimension"
-                    )
+    # Find the k variable (dim that's in indices but not values)
+    # This requires looking at the shape difference
+    indices_coords = host_coordinates(indices.layout, indices.dep, None)
+    values_coords = host_coordinates(values.layout, values.dep, None)
 
+    # Find which coordinate in indices doesn't match values
+    k_var = None
+    for idx_coord in indices_coords:
+        found_match = False
+        for val_coord in values_coords:
+            if idx_coord == val_coord:
+                found_match = True
+                break
+        if not found_match and len(idx_coord.free_symbols) > 0:
+            k_var = next(iter(idx_coord.free_symbols), None)
+            if k_var:
+                break
+
+    # Find required layouts where search_space_var is NOT in stick for values
+    # and k_var is NOT in stick for indices
+    values_req_stl = find_stick_compatible_input_layout(
+        values, search_space_var, "keep_by_index", "values"
+    )
+
+    if k_var:
+        indices_req_stl = find_stick_compatible_input_layout(
+            indices, k_var, "keep_by_index", "indices"
+        )
+    else:
+        # No k_var found, use first available layout
+        if not indices.layouts:
+            raise Unsupported("keep_by_index: no layouts available for indices")
+        indices_req_stl = indices.layouts[0]
+
+    # Build output STL matching values layout
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    results: list[SpyreTensorLayout] = []
 
-    for stl in values.layouts:
-        x_stick_expr = device_coordinates(stl, values.dep, None)[-1]
-        out_stick_dim = matching_dim(out_coords, x_stick_expr)
+    x_stick_expr = device_coordinates(values_req_stl, values.dep, None)[-1]
+    out_stick_dim = matching_dim(out_coords, x_stick_expr)
 
-        if out_stick_dim is None:
-            out_dim_order = list(range(len(output.size))) + [-1]
-        else:
-            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
-            out_dim_order += [out_stick_dim]
-        results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
+    if out_stick_dim is None:
+        out_dim_order = list(range(len(output.size))) + [-1]
+    else:
+        out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+        out_dim_order += [out_stick_dim]
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
-    return results
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+
+    # Use FixedInOutNode to enforce both input constraints
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [values_req_stl, indices_req_stl], op
+    )
+    return [out_stl]
 
 
 def compute_layouts(

@@ -651,9 +651,7 @@ def _pattern_resolve(variant, args):
 def _make_keep_by_index_test(shape, dim, k, fill_value):
     """Generate keep_by_index test case with topk indices."""
     values = torch.randn(shape, dtype=torch.float16)
-    # Get indices from topk - these are the indices to keep
-    _, indices = torch.topk(values, min(k, shape[dim]), dim=dim, largest=True)
-    return (values, indices, dim, fill_value)
+    return (values, k, dim, fill_value)
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -1277,11 +1275,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_dim0": _make_keep_by_index_test(
                     (67, 256), dim=0, k=3, fill_value=-1.0
                 ),
+                "2d_dim1": _make_keep_by_index_test(
+                    (256, 64), dim=1, k=12, fill_value=-1.0
+                ),
                 "3d_dim0": _make_keep_by_index_test(
                     (67, 71, 256), dim=0, k=2, fill_value=0.0
-                ),
-                "3d_dim1": _make_keep_by_index_test(
-                    (67, 64, 256), dim=1, k=16, fill_value=-1.0
                 ),
                 "4d_dim0": _make_keep_by_index_test(
                     (6, 17, 7, 64), dim=0, k=2, fill_value=-1.0
@@ -1289,8 +1287,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim1": _make_keep_by_index_test(
                     (6, 17, 64, 64), dim=1, k=3, fill_value=0.0
                 ),
-                "4d_dim2": _make_keep_by_index_test(
-                    (6, 17, 7, 64), dim=2, k=2, fill_value=-1.0
+                "4d_dim3": _make_keep_by_index_test(
+                    (64, 17, 4, 128), dim=3, k=16, fill_value=-1.0
                 ),
             },
         },
