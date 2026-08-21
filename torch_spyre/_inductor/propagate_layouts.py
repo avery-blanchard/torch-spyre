@@ -1302,7 +1302,7 @@ def _keep_by_index_layouts(
     """Layout propagation for keep_by_index.
 
     Output shape matches values input.
-    Values input: search space dim cannot be stick.
+    Values input: masked dimension cannot be stick.
     Indices input: k dimension cannot be stick.
     """
     _check_supported_input_sticks(args, "keep_by_index")
@@ -1310,12 +1310,7 @@ def _keep_by_index_layouts(
     indices = args[1]
     out_coords = host_coordinates(output, output_dep, None)
 
-    # Find the search space variable (dim that's masked) - it's in values but not output
-    values_dep = values.dep
-    search_space_var = find_reduction_var(values_dep, output_dep)
-
     # Find the k variable (dim that's in indices but not values)
-    # This requires looking at the shape difference
     indices_coords = host_coordinates(indices.layout, indices.dep, None)
     values_coords = host_coordinates(values.layout, values.dep, None)
 
@@ -1332,11 +1327,10 @@ def _keep_by_index_layouts(
             if k_var:
                 break
 
-    # Find required layouts where search_space_var is NOT in stick for values
-    # and k_var is NOT in stick for indices
-    values_req_stl = find_stick_compatible_input_layout(
-        values, search_space_var, "keep_by_index", "values"
-    )
+    # For values: just use first layout (output matches values shape, no reduction)
+    if not values.layouts:
+        raise Unsupported("keep_by_index: no layouts available for values")
+    values_req_stl = values.layouts[0]
 
     if k_var:
         indices_req_stl = find_stick_compatible_input_layout(
