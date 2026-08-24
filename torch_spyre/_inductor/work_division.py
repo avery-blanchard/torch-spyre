@@ -721,12 +721,14 @@ def _first_non_indirect_read_index(rw, default):
     Indirect reads carry data-dependent symbols whose coefficients are not a
     stable identity key, so they must not be used as the reduction-split
     reference index in splits_by_index_coeff / apply_splits_from_index_coeff.
+    When all reads are indirect (gather/scatter where both index and value
+    tables are shared), fall back to default (write_index) rather than picking
+    an indirect read by mistake.
     """
     for d in rw.reads:
         if isinstance(d, MemoryDep) and not d.is_indirect():
             return d.index
-    first = next(iter(rw.reads), None)
-    return first.index if first is not None else default
+    return default
 
 
 def apply_splits(
@@ -747,6 +749,7 @@ def apply_splits(
 
     # Always commit core_id_to_work_slice for all ops, even single-core ones.
     # Single-core ops get all-unsplit (Integer(0)) mappings.
+    # Must use original write_index to correctly classify which symbols are outputs.
     commit_core_mapping(
         op, splits, write_index, read_index, is_matmul=_is_matmul_op(op)
     )
@@ -1033,7 +1036,15 @@ def span_reduction_pass(
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
         it_space, all_tds, symbol_meta
     )
-    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    # For scatter/indirect ops, skip coordinates with IndirectAccess markers
+    # (runtime-chosen row dims) when determining output vs reduction variables,
+    # since they don't represent true iteration dimensions.
+    coord_vars = {
+        v
+        for e in output_td.device_coords[:-1]
+        if not (hasattr(e, "has") and e.has(IndirectAccess))
+        for v in e.free_symbols
+    }
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
 
     # The two constraint kinds are needed at different points, so collect twice.
@@ -1220,6 +1231,16 @@ def work_distribution_pass(
         rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = _first_non_indirect_read_index(rw, write_index)
+
+        # For scatter/indirect ops, the write's actual index uses IndirectAccess
+        # markers. Use read_index for decoding to match the encoding in apply_splits.
+        has_indirect_output = any(
+            hasattr(c, "has") and c.has(IndirectAccess)
+            for c in output_td.device_coords[:-1]
+        )
+        if has_indirect_output:
+            write_index = read_index
+
         min_splits = apply_splits_from_index_coeff(
             op.op_it_space_splits, write_index, read_index, it_space
         )

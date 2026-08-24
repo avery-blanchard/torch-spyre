@@ -1402,12 +1402,25 @@ def splits_by_index_coeff(
     happen to share the same stride value in different tensors.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
+
+    For indirect ops (scatter/gather with IndirectAccess markers in write_index),
+    use read_index for output/reduction classification since IndirectAccess breaks
+    coefficient extraction.
     """
+    from .op_spec import IndirectAccess
+
     skip = lambda v: v <= 1  # noqa: E731
+
+    # Check if write_index contains IndirectAccess markers (scatter/gather ops).
+    # IndirectAccess breaks coefficient extraction, so use read_index instead.
+    coeff_index = write_index
+    if hasattr(write_index, "has") and write_index.has(IndirectAccess):
+        coeff_index = read_index
+
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
-    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    # Reduction splits: symbols with coeff==0 in coeff_index but coeff!=0 in read_index
     reduction_only = {
-        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+        sym: val for sym, val in splits.items() if coeff_index.coeff(sym) == 0
     }
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
@@ -1466,10 +1479,22 @@ def slice_by_index_coeff(
 
     Same output/reduction namespace split as splits_by_index_coeff, but for
     core_id_to_work_slice's Expr values instead of split ints.
+
+    For indirect ops (scatter/gather with IndirectAccess markers in write_index),
+    use read_index for output/reduction classification since IndirectAccess breaks
+    coefficient extraction.
     """
+    from .op_spec import IndirectAccess
+
+    # Check if write_index contains IndirectAccess markers (scatter/gather ops).
+    # IndirectAccess breaks coefficient extraction, so use read_index instead.
+    coeff_index = write_index
+    if hasattr(write_index, "has") and write_index.has(IndirectAccess):
+        coeff_index = read_index
+
     output_slice = _coeff_splits_from_index(slice_by_symbol, write_index)
     reduction_only = {
-        sym: val for sym, val in slice_by_symbol.items() if write_index.coeff(sym) == 0
+        sym: val for sym, val in slice_by_symbol.items() if coeff_index.coeff(sym) == 0
     }
     reduction_slice = _coeff_splits_from_index(reduction_only, read_index)
     return output_slice, reduction_slice
