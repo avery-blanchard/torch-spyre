@@ -1094,7 +1094,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
-            indirect_syms = _indirect_syms_used(value, self.indirect_vars)
+            # dst_index catches a fused producer (e.g. an add feeding a
+            # scatter) writing to an indirect destination whose index tensor
+            # differs from any index tensor among value's own arguments.
+            indirect_syms = _indirect_syms_used(
+                value, self.indirect_vars, dst_index=dst.index
+            )
+            index_tensor_names = {self.indirect_vars[sym].name for sym in indirect_syms}
+            if len(index_tensor_names) > 1:
+                raise Unsupported(
+                    f"{sorted(index_tensor_names)}: op has "
+                    f"{len(index_tensor_names)} distinct index tensors; fusing "
+                    "multiple indirect loads with different index tensors into "
+                    "one op is not supported"
+                )
             if indirect_syms:
                 args += [
                     self.create_tensor_arg(

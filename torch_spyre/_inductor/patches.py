@@ -94,11 +94,34 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
     }
 
+    from torch._inductor.dependencies import MemoryDep, is_indirect
     from torch._inductor.ir import Loops
 
-    # Force all operations to be realized when LoopLevel IR is initially constructed
     old_loop = Loops.has_large_inner_fn
-    Loops.has_large_inner_fn = lambda self, threshold=None: True
+    # Indirect symbol names already let through as "safe to inline" during
+    # this compile. Inductor mints a fresh, never-reused indirect symbol name
+    # per indirect_indexing() call site, so seeing a different name here means
+    # a second, distinct index tensor is in play. has_large_inner_fn runs
+    # per-producer-node, before its consumer is known, so it can't tell
+    # whether that second gather will land in the same op as the first (e.g.
+    # x[i] + x[j]) -- once one indirect symbol has been allowed through, any
+    # different one falls back to today's always-safe force-realize rather
+    # than risk that collision. SpyreKernel.store() (spyre_kernel.py) raises
+    # Unsupported as a backstop for collisions this can't see.
+    _seen_indirect_names: set[str] = set()
+
+    def _spyre_has_large_inner_fn(self, threshold=None):
+        for dep in self.get_reads():
+            if not (isinstance(dep, MemoryDep) and dep.is_indirect()):
+                continue
+            names = {str(s) for s in dep.index.free_symbols if is_indirect(str(s))}
+            if _seen_indirect_names and not names & _seen_indirect_names:
+                return True
+            _seen_indirect_names.update(names)
+            return False
+        return True
+
+    Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
     from torch._inductor.fx_passes import joint_graph
 

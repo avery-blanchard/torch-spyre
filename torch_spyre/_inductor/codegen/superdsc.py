@@ -46,6 +46,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -1713,6 +1714,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     index_tensor_indices = {
         i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
     }
+    if len(index_tensor_indices) > 1:
+        raise Unsupported(
+            f"op {op_spec.op!r} has {len(index_tensor_indices)} distinct index "
+            "tensors in one op spec; this is not supported"
+        )
     has_indirect_access = bool(index_tensor_indices)
 
     symbol_mapping = None
