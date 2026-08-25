@@ -1475,7 +1475,7 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
         and not _is_topk(op)
         and not _is_conv(op)
         and -2 not in output_scales.values()
-        and op != "keepbyindex"
+        and not _is_keep_by_index(op)
     ):
         return op + "nonstick"
     return op
@@ -2101,7 +2101,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
-    if op_spec.op == KEEP_BY_INDEX_OP:
+    if _is_keep_by_index(op_spec.op):
         num_inputs = 2  # keep_by_index has exactly 2 input tensors (values, indices)
 
     if is_pool:
