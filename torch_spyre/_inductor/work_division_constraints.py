@@ -331,8 +331,9 @@ def indirect_access_constraints(ctx: WorkDivConstraintContext) -> ConstraintResu
     base address on every core, its row chosen at runtime by IndirectAccess.
     Splitting a data (non-row) dimension would give each core a different base
     into that shared table and miscompile, so those dims must NEVER be split — a
-    hard constraint : span reduction must not split them either. Also covers the
-    partial-last-stick index-entry dim.
+    hard constraint : span reduction must not split them either. The index
+    tensor's entry dim is not covered here — it may split at any granularity,
+    including counts that are not a multiple of the index elems_per_stick.
 
     ``force_output`` — a scatter's destination row is runtime-chosen, so its
     index-entry dim never appears in the output coordinates and would otherwise

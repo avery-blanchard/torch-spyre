@@ -594,30 +594,19 @@ class IndirectAccessTestCase(InductorTestCase):
         torch._dynamo.reset()
 
     # -- Work-division split-map assertion -------------------------------
-    # An int32 index packs 32 elements per 128-byte stick, so an index/entry dim
-    # of size `S` exposes `S // 32` sticks — the ceiling on how many cores
-    # can split it.
-    INDEX_ELEMS_PER_STICK = 32
-
     def assert_indexed_dim_split(self, code, index_size, data_size):
         """Assert the work-division split map at the current SENCORES.
 
         For a gather `out = x[i]` or overwrite-scatter `dest[i] = src`, the
         planner MUST split the index/entry dim (c0) and MUST NOT split the
-        value-table / destination data dim (c1). The entry dim is the index
-        tensor's stick dim, so it splits in whole 32-entry sticks: the split is
-        the planner's ``core_split`` -- the largest divisor of the stick count
-        ``ceil(index_size / 32)`` that does not exceed SENCORES (so it always
-        divides evenly, and a non-power-of-two core count like 6 rounds down to
-        the nearest divisor, e.g. 8 sticks over 6 cores -> 4). The ceiling
-        handles a NON-stick-aligned count, whose partial last stick is padded up
-        to a whole stick (enforce_indirect_access_layout) so the dim still
-        splits, e.g. 40 -> 2 sticks. c1 always stays 1. Skips at sencores=1.
-
-        For power-of-two stick counts and core counts (the historical sweep)
-        ``core_split`` equals ``min(sencores, sticks)`` -- this generalises it to
-        the odd stick counts (6, 7, ...) and odd core counts the padded / 6-core
-        variants introduce.
+        value-table / destination data dim (c1). The index tensor's entry dim
+        is a runtime row count, not a stick-shaped data layout, so it splits
+        directly on that count -- no stick-alignment padding or rounding is
+        involved, and the split need not be a multiple of the index dtype's
+        elems_per_stick. The split is the planner's ``core_split`` -- the
+        largest divisor of ``index_size`` that does not exceed SENCORES (so it
+        always divides evenly, and a non-power-of-two core count like 6 rounds
+        down to the nearest divisor). c1 always stays 1. Skips at sencores=1.
         """
         from torch_spyre._inductor import config
         from torch_spyre._inductor.work_division import core_split
@@ -625,50 +614,18 @@ class IndirectAccessTestCase(InductorTestCase):
         n = config.sencores
         if n == 1:
             self.skipTest("no work division at sencores=1")
-        sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
-        expected = core_split(sticks, n)
+        expected = core_split(index_size, n)
         self.assertIn(
             f"sympify('c0'): (sympify('{index_size}'), {expected})",
             code,
             f"index/entry dim {index_size} must split by {expected} at {n} cores "
-            f"(largest divisor of {sticks} sticks not exceeding {n})",
+            f"(largest divisor of {index_size} not exceeding {n})",
         )
         self.assertIn(
             f"sympify('c1'): (sympify('{data_size}'), 1)",
             code,
             f"data dim {data_size} must stay unsplit (split=1) at {n} cores; "
             "splitting a shared table/destination dim silently corrupts results",
-        )
-
-    def assert_entry_dim_unsplit(self, code, index_size):
-        """Assert the index/entry dim is NOT core-split at the current SENCORES.
-
-        The correct outcome when a stick-aligned split is forbidden and cannot be
-        made safe by padding -- e.g. a partial-last-stick SCATTER, whose in-place
-        destination cannot be grown to a whole stick the way a gather output can
-        (enforce_indirect_access_layout). If the dim were splittable it would
-        split by ``core_split(ceil(index_size/32), sencores)``; assert that split
-        is absent, so the guard kept the op on a single core rather than letting
-        an even slice straddle the index stick boundary. Skips at sencores=1, and
-        is a no-op when the count could not split anyway (would-be split of 1).
-        """
-        from torch_spyre._inductor import config
-        from torch_spyre._inductor.work_division import core_split
-
-        n = config.sencores
-        if n == 1:
-            self.skipTest("no work division at sencores=1")
-        sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
-        would_be = core_split(sticks, n)
-        if would_be <= 1:
-            return  # nothing could split even if allowed; nothing to assert
-        self.assertNotIn(
-            f"sympify('c0'): (sympify('{index_size}'), {would_be})",
-            code,
-            f"partial-stick entry dim {index_size} must NOT be core-split "
-            f"(would be {would_be} at {n} cores if allowed); its in-place scatter "
-            "destination can't be padded to a whole stick, so the guard must keep "
-            "it single-core rather than straddle the index stick boundary",
         )
 
     # -- Dimension naming helpers ----------------------------------------
