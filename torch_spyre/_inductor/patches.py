@@ -94,32 +94,41 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
     }
 
-    from torch._inductor.dependencies import MemoryDep, is_indirect
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import Loops
+    from torch._inductor.virtualized import V as _V
+    from torch_spyre._inductor.pass_utils import _IndirectIndexFinder
 
     old_loop = Loops.has_large_inner_fn
-    # Indirect symbol names already let through as "safe to inline" during
-    # this compile. Inductor mints a fresh, never-reused indirect symbol name
-    # per indirect_indexing() call site, so seeing a different name here means
-    # a second, distinct index tensor is in play. has_large_inner_fn runs
-    # per-producer-node, before its consumer is known, so it can't tell
-    # whether that second gather will land in the same op as the first (e.g.
-    # x[i] + x[j]) -- once one indirect symbol has been allowed through, any
-    # different one falls back to today's always-safe force-realize rather
-    # than risk that collision. SpyreKernel.store() (spyre_kernel.py) raises
-    # Unsupported as a backstop for collisions this can't see.
-    _seen_indirect_names: set[str] = set()
+    # For ops with indirect reads: track which index buffer names have been let
+    # through for inlining. Allow gathers from already-allowed buffers (e.g., y[i]
+    # after x[i]); force-realize gathers from new buffers (e.g., x[j] after x[i]).
+    # This prevents two distinct index tensors from landing in one op spec.
+    # For ops with inherited indirect reads (reading from unrealized gathers):
+    # always force-realize to create materialization boundaries and prevent
+    # duplication in composed inner_fns. SpyreKernel.store() provides a backstop.
+    _allowed_index_buf_names: set[str] = set()
 
     def _spyre_has_large_inner_fn(self, threshold=None):
+        has_indirect = False
         for dep in self.get_reads():
             if not (isinstance(dep, MemoryDep) and dep.is_indirect()):
                 continue
-            names = {str(s) for s in dep.index.free_symbols if is_indirect(str(s))}
-            if _seen_indirect_names and not names & _seen_indirect_names:
+            has_indirect = True
+            break
+        if not has_indirect:
+            return old_loop(self, threshold)
+        finder = _IndirectIndexFinder()
+        with _V.set_ops_handler(finder):
+            self.inner_fn(*self.inner_fn_args())
+        current_index_bufs = set(finder.indirect_index_by_buf.values())
+        if not current_index_bufs:
+            return True
+        if _allowed_index_buf_names:
+            if not current_index_bufs <= _allowed_index_buf_names:
                 return True
-            _seen_indirect_names.update(names)
-            return False
-        return True
+        _allowed_index_buf_names.update(current_index_bufs)
+        return False
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
