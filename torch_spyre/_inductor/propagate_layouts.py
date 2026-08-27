@@ -216,26 +216,35 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 def _indirect_entry_dim(args, access_subs, out_coords):
     """Find (elems_per_stick, pos) for the output's index-entry dim, or None.
 
-    The entry dim is the non-stick output coordinate whose free symbol is
-    one of access_subs's keys (the plain loop symbol that indirect_info_from_op
-    marks as index-driven, for gather reads and scatter writes alike).
-    indirect_sizes substitution to IndirectAccess happens later
-    (simplify_op_spec, after align_tensors), so at this point the symbol is
-    still bare in out_coords.
+    The entry dim is the output host coordinate (non-stick) that has exactly
+    one free symbol, and that symbol is one of the indirect symbols in
+    access_subs. This symbol represents iteration over the index tensor's rows,
+    which become the entry dimension in the output.
     """
-    sym_to_name = {sym: e.args[0].name for sym, e in access_subs.items() if e.args}
-    if not sym_to_name:
+    if not access_subs:
         return None
-    for pos, coord in enumerate(out_coords[:-1]):
-        if len(coord.free_symbols) != 1:
+
+    indirect_syms = set(access_subs.keys())
+    index_names = {e.args[0].name for e in access_subs.values() if e.args}
+    if not index_names:
+        return None
+
+    for arg in args:
+        if arg.dep.name not in index_names:
             continue
-        sym = next(iter(coord.free_symbols))
-        if sym not in sym_to_name:
+        if not arg.layouts:
             continue
-        index_buf_name = sym_to_name[sym]
-        for arg in args:
-            if arg.dep.name == index_buf_name and arg.layouts:
-                return arg.layouts[0].elems_per_stick(), pos
+
+        index_stl = arg.layouts[0]
+        eps = index_stl.elems_per_stick()
+
+        for pos, coord in enumerate(out_coords[:-1]):
+            free_syms = coord.free_symbols
+            if len(free_syms) == 1:
+                sym = next(iter(free_syms))
+                if sym in indirect_syms:
+                    return eps, pos
+
     return None
 
 
