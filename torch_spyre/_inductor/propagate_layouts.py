@@ -213,37 +213,33 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
     return -1 if maybe is None else maybe
 
 
-def _indirect_entry_dim(args, access_subs, out_coords):
+def _indirect_entry_dim(args, access_subs, output):
     """Find (elems_per_stick, pos) for the output's index-entry dim, or None.
 
-    The entry dim is the output host coordinate (non-stick) that has exactly
-    one free symbol, and that symbol is one of the indirect symbols in
-    access_subs. This symbol represents iteration over the index tensor's rows,
-    which become the entry dimension in the output.
+    The entry dim is the output dimension whose extent matches the index
+    tensor's row count (first dimension). This is the dimension that iterates
+    over the rows selected by the index (gather) or written to (scatter).
     """
     if not access_subs:
         return None
 
-    indirect_syms = set(access_subs.keys())
     index_names = {e.args[0].name for e in access_subs.values() if e.args}
     if not index_names:
         return None
 
+    output_size = [concretize_expr(s) for s in output.size]
+
     for arg in args:
-        if arg.dep.name not in index_names:
-            continue
-        if not arg.layouts:
+        if arg.dep.name not in index_names or not arg.layouts:
             continue
 
         index_stl = arg.layouts[0]
+        index_row_size = concretize_expr(index_stl.size[0])
         eps = index_stl.elems_per_stick()
 
-        for pos, coord in enumerate(out_coords[:-1]):
-            free_syms = coord.free_symbols
-            if len(free_syms) == 1:
-                sym = next(iter(free_syms))
-                if sym in indirect_syms:
-                    return eps, pos
+        for pos, out_extent in enumerate(output_size):
+            if out_extent == index_row_size:
+                return eps, pos
 
     return None
 
@@ -1161,7 +1157,7 @@ def _multi_arg_pointwise_layouts(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
 
-    entry = _indirect_entry_dim(args, access_subs, out_coords)
+    entry = _indirect_entry_dim(args, access_subs, output)
     if entry is not None:
         eps, pos = entry
         if c_size[pos] % eps != 0:
