@@ -24,6 +24,15 @@ from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 
+def _assert_stick_multiple(size, elems_per_stick):
+    """Raise Unsupported if size is not a multiple of elems_per_stick."""
+    if size % elems_per_stick != 0:
+        raise Unsupported(
+            f"Stick size {size} not a multiple of elems_per_stick {elems_per_stick}"
+        )
+    return True
+
+
 @dataclasses.dataclass(frozen=True)
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
@@ -413,7 +422,10 @@ def gen_coord_info_value(
                     {
                         "factor_": 1
                         if is_stick_reduction
-                        else (size // elems_per_stick),
+                        else (
+                            _assert_stick_multiple(size, elems_per_stick)
+                            or (size // elems_per_stick)
+                        ),
                         "label_": "elem_arr_1",
                     },
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},
