@@ -20,11 +20,19 @@ from torch._inductor.scheduler import (
     FusedSchedulerNode,
     NopKernelSchedulerNode,
 )
-from torch._inductor.ir import FallbackKernel
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import ComputedBuffer, FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import MAX_POOL_SIZE_BYTES, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
+from .pass_utils import (
+    apply_splits_from_index_coeff,
+    indirect_sizes_from_op,
+    iteration_space_from_op,
+    op_read_writes,
+    try_device_coordinates,
+)
 from .scheduler import CountedLoopSchedulerNode
 from . import config
 
@@ -363,10 +371,80 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         writer = buffer_writer_bundle.get(name)
         return bool(readers - {writer})
 
+    # Per-buffer name -> every (op, dep) accessing it, so
+    # _has_split_spanning_multiple_dims can look up a candidate's accessors
+    # without rescanning all_flat_nodes per candidate.
+    accessors_by_buf: dict[str, list[tuple[ComputedBuffer, MemoryDep]]] = {}
+    for node in all_flat_nodes:
+        if isinstance(node, _kernel_arg_types) or not isinstance(
+            node.node, ComputedBuffer
+        ):
+            continue
+        op = node.node
+        for dep in (*op_read_writes(op).reads, *op_read_writes(op).writes):
+            if isinstance(dep, MemoryDep):
+                accessors_by_buf.setdefault(dep.name, []).append((op, dep))
+
+    def _has_split_spanning_multiple_dims(name: str) -> bool:
+        """True if some accessor splits a symbol whose device-coordinate
+        contribution into `name` spans more than one device dimension.
+
+        `core_idx_to_slice_offset` (compute_ops.py) computes each core's HBM
+        pool address using exactly one stride per split symbol
+        (`_get_device_dim_order` keeps only the first device dim it sees a
+        symbol in). A symbol can legitimately decompose onto two device dims
+        at once via `compute_coordinates`'s primary-dim/next-stride overflow
+        logic (e.g. a size-4 gather dim sharing a stride value with an
+        unrelated stick-split boundary -- see issue #4033); when that
+        happens, one dim's contribution to the per-core address is silently
+        dropped, which can alias a neighboring pool buffer. Excluding such
+        buffers keeps them on standalone HBM, where there is no neighbor for
+        a wrong address to corrupt.
+        """
+        buf = V.graph.get_buffer(name)
+        layout = buf.maybe_get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            return False
+        stl = layout.device_layout
+        for op, dep in accessors_by_buf.get(name, []):
+            coeff_splits = getattr(op, "op_it_space_splits", None)
+            if coeff_splits is None:
+                continue
+            rw = op_read_writes(op)
+            write_index = next(iter(rw.writes)).index
+            read_index = next((d.index for d in rw.reads), write_index)
+            it_space = iteration_space_from_op(op)
+            splits = apply_splits_from_index_coeff(
+                coeff_splits, write_index, read_index, it_space
+            )
+            split_syms = {sym for sym, factor in splits.items() if factor > 1}
+            if not split_syms:
+                continue
+            indirect_sizes = indirect_sizes_from_op(op)
+            coords = try_device_coordinates(stl, dep, indirect_sizes)
+            if coords is None:
+                continue
+            for sym in split_syms:
+                spanned = sum(1 for coord in coords if coord.coeff(sym) != 0)
+                if spanned > 1:
+                    logger.debug(
+                        "hbm_pool_planning: %s split symbol %s spans %d "
+                        "device dims via %s -- excluding from pool "
+                        "eligibility",
+                        name,
+                        sym,
+                        spanned,
+                        op.get_name(),
+                    )
+                    return True
+        return False
+
     all_candidates = {
         name
         for name in (written & read) - io_names - fallback_read
-        if _is_intermediate(name) and not _is_cross_bundle(name)
+        if _is_intermediate(name)
+        and not _is_cross_bundle(name)
+        and not _has_split_spanning_multiple_dims(name)
     }
 
     V.graph.hbm_pool_sizes = {}
