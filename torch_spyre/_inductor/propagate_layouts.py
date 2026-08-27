@@ -82,6 +82,7 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
+    indirect_sizes_from_op,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -1816,6 +1817,8 @@ def propagate_spyre_tensor_layouts(
             if layout is None or layout.device.type != DEVICE_NAME:
                 continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                from torch._inductor.ir import Scatter
+
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
                     target = target.data
@@ -1824,6 +1827,35 @@ def propagate_spyre_tensor_layouts(
                 # wrappers that coarse_tile.py places around SpyreEmptyFallback).
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
                 target_stl = _target_device_layout(target, target_name)
+
+                if isinstance(op.data, Scatter):
+                    real = op.layout.real_layout()
+                    if isinstance(real, FixedTiledLayout):
+                        rw = op.get_read_writes()
+                        output_dep = next(iter(rw.writes))
+                        args = _get_prop_args(rw.reads)
+                        output = op.get_layout()
+                        ind_sizes = indirect_sizes_from_op(op)
+                        out_coords = host_coordinates(output, output_dep, ind_sizes)
+                        entry = _indirect_entry_dim(
+                            args, dict(indirect_info_from_op(op)[1]), out_coords
+                        )
+
+                        if entry is not None:
+                            eps, pos = entry
+                            dev_layout = real.device_layout
+                            device_size = list(dev_layout.device_size)
+                            if device_size[pos] % eps != 0:
+                                device_size[pos] = (
+                                    (device_size[pos] + eps - 1) // eps
+                                ) * eps
+                                new_dev_layout = SpyreTensorLayout(
+                                    device_size,
+                                    dev_layout.stride_map,
+                                    dev_layout.device_dtype,
+                                    dev_layout.element_arrangement,
+                                )
+                                real.device_layout = new_dev_layout
                 if target_stl is None:
                     target_buf_layouts = getattr(target_buf, "layouts", None)
                     if not isinstance(target_buf, SpyreEmptyFallback) and (
