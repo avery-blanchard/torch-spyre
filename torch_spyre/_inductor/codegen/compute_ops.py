@@ -413,7 +413,11 @@ def gen_coord_info_value(
                     {
                         "factor_": 1
                         if is_stick_reduction
-                        else (size // elems_per_stick),
+                        else (
+                            size // elems_per_stick
+                            if size % elems_per_stick == 0
+                            else size // elems_per_stick + 1
+                        ),
                         "label_": "elem_arr_1",
                     },
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},
