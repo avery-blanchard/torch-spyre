@@ -1845,21 +1845,23 @@ def propagate_spyre_tensor_layouts(
                             eps, pos = entry
                             dev_layout = real.device_layout
                             device_size = list(dev_layout.device_size)
-                            min_size = device_size[pos]
 
-                            # For scatter, the output's indexed dimension must be at
-                            # least as large as the value tensor's indexed dimension,
-                            # since the indirect index can write to any row of the
-                            # value tensor. rw.reads[0] is index, rw.reads[1] is value.
-                            if len(args) >= 2:
-                                value_arg = args[1]
-                                if isinstance(value_arg.layout, FixedTiledLayout):
-                                    value_dev_layout = value_arg.layout.device_layout
-                                    value_dev_size = value_dev_layout.device_size
-                                    if pos < len(value_dev_size):
-                                        min_size = max(min_size, value_dev_size[pos])
+                            # For scatter, the output's indexed dimension must be
+                            # rounded up to the index tensor's stick size. The index
+                            # tensor is rw.reads[0]; its stick elems_per_stick is eps.
+                            index_arg = args[0] if args else None
+                            if index_arg and isinstance(
+                                index_arg.layout, FixedTiledLayout
+                            ):
+                                index_eps = (
+                                    index_arg.layout.device_layout.elems_per_stick()
+                                )
+                            else:
+                                index_eps = eps
 
-                            device_size[pos] = ((min_size + eps - 1) // eps) * eps
+                            device_size[pos] = (
+                                (device_size[pos] + index_eps - 1) // index_eps
+                            ) * index_eps
                             if device_size[pos] != dev_layout.device_size[pos]:
                                 new_dev_layout = SpyreTensorLayout(
                                     device_size,
