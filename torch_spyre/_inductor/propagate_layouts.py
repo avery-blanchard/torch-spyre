@@ -1847,17 +1847,22 @@ def propagate_spyre_tensor_layouts(
                             device_size = list(dev_layout.device_size)
 
                             # For scatter, the output's indexed dimension must be
-                            # rounded up to the index tensor's stick size. The index
-                            # tensor is rw.reads[0]; its stick elems_per_stick is eps.
-                            index_arg = args[0] if args else None
-                            if index_arg and isinstance(
-                                index_arg.layout, FixedTiledLayout
-                            ):
-                                index_eps = (
-                                    index_arg.layout.device_layout.elems_per_stick()
-                                )
-                            else:
-                                index_eps = eps
+                            # rounded up to the index tensor's stick size. Find the
+                            # index tensor in the read dependencies via its buffer name.
+                            index_eps = eps  # fallback
+                            indirect_names, _, _ = indirect_info_from_op(op)
+                            for buf_name in rw.reads:
+                                if buf_name.name in indirect_names:
+                                    buf = V.graph.get_buffer(buf_name.name)
+                                    if buf:
+                                        buf_layout = buf.maybe_get_layout()
+                                        if isinstance(buf_layout, FixedTiledLayout):
+                                            buf_dev_size = (
+                                                buf_layout.device_layout.device_size
+                                            )
+                                            if buf_dev_size:
+                                                index_eps = buf_dev_size[-1]
+                                                break
 
                             device_size[pos] = (
                                 (device_size[pos] + index_eps - 1) // index_eps
@@ -1879,6 +1884,9 @@ def propagate_spyre_tensor_layouts(
                                 op.layout = MutationLayoutSHOULDREMOVE(
                                     op.layout.target, new_layout
                                 )
+                                # Also update the mutation target buffer's layout
+                                if target_buf is not None:
+                                    target_buf.layout = new_layout
                 if target_stl is None:
                     target_buf_layouts = getattr(target_buf, "layouts", None)
                     if not isinstance(target_buf, SpyreEmptyFallback) and (
