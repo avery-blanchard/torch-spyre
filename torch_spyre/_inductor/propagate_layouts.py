@@ -1845,10 +1845,22 @@ def propagate_spyre_tensor_layouts(
                             eps, pos = entry
                             dev_layout = real.device_layout
                             device_size = list(dev_layout.device_size)
-                            if device_size[pos] % eps != 0:
-                                device_size[pos] = (
-                                    (device_size[pos] + eps - 1) // eps
-                                ) * eps
+                            min_size = device_size[pos]
+
+                            # For scatter, the output's indexed dimension must be at
+                            # least as large as the value tensor's indexed dimension,
+                            # since the indirect index can write to any row of the
+                            # value tensor. rw.reads[0] is index, rw.reads[1] is value.
+                            if len(args) >= 2:
+                                value_arg = args[1]
+                                if isinstance(value_arg.layout, FixedTiledLayout):
+                                    value_dev_layout = value_arg.layout.device_layout
+                                    value_dev_size = value_dev_layout.device_size
+                                    if pos < len(value_dev_size):
+                                        min_size = max(min_size, value_dev_size[pos])
+
+                            device_size[pos] = ((min_size + eps - 1) // eps) * eps
+                            if device_size[pos] != dev_layout.device_size[pos]:
                                 new_dev_layout = SpyreTensorLayout(
                                     device_size,
                                     dev_layout.stride_map,
