@@ -213,12 +213,13 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
     return -1 if maybe is None else maybe
 
 
-def _indirect_entry_dim(args, access_subs, output, output_dep, ind_sizes):
+def _indirect_entry_dim(args, access_subs, out_coords):
     """Find (elems_per_stick, pos) for the output's index-entry dim, or None.
 
-    The entry dim is the output device dimension whose free symbols match
-    the index tensor's stick coordinate's free symbols. This identifies which
-    output device dimension is driven by the index tensor's stick loop.
+    The entry dim is the output coordinate that contains the free symbol from
+    the index tensor's stick dimension. For multi-dimensional indices, this
+    identifies which output dimension is driven by the index tensor's stick
+    (the outermost padded dimension).
     """
     if not access_subs:
         return None
@@ -235,33 +236,18 @@ def _indirect_entry_dim(args, access_subs, output, output_dep, ind_sizes):
         eps = index_stl.elems_per_stick()
 
         try:
-            index_coords = device_coordinates(index_stl, arg.dep, ind_sizes)
+            index_coords = device_coordinates(index_stl, arg.dep, None)
+            if not index_coords:
+                continue
+            index_stick_coord = index_coords[-1]
+            index_stick_syms = index_stick_coord.free_symbols
+            if not index_stick_syms:
+                continue
         except (Unsupported, RuntimeError, KeyError, ValueError):
             continue
 
-        if not index_coords:
-            continue
-
-        index_stick_coord = index_coords[-1]
-        index_stick_syms = index_stick_coord.free_symbols
-
-        output_size = [concretize_expr(s) for s in output.size]
-        output_stride = [concretize_expr(s) for s in output.stride]
-
-        try:
-            out_stl = SpyreTensorLayout(
-                output_size,
-                output_stride,
-                None,
-                list(range(len(output_size))),
-                ElementArrangement.STANDARD,
-            )
-            out_coords = device_coordinates(out_stl, output_dep, ind_sizes)
-        except (Unsupported, RuntimeError, KeyError, ValueError):
-            continue
-
-        for pos, out_coord in enumerate(out_coords[:-1]):
-            if out_coord.free_symbols == index_stick_syms:
+        for pos, coord in enumerate(out_coords[:-1]):
+            if index_stick_syms & coord.free_symbols:
                 return eps, pos
 
     return None
@@ -1180,7 +1166,7 @@ def _multi_arg_pointwise_layouts(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
 
-    entry = _indirect_entry_dim(args, access_subs, output, output_dep, ind_sizes)
+    entry = _indirect_entry_dim(args, access_subs, out_coords)
     if entry is not None:
         eps, pos = entry
         if c_size[pos] % eps != 0:
