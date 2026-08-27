@@ -1855,7 +1855,16 @@ def propagate_spyre_tensor_layouts(
                                     dev_layout.device_dtype,
                                     dev_layout.element_arrangement,
                                 )
-                                real.device_layout = new_dev_layout
+                                new_layout = FixedTiledLayout(
+                                    real.device,
+                                    real.dtype,
+                                    real.size,
+                                    real.stride,
+                                    new_dev_layout,
+                                )
+                                op.layout = MutationLayoutSHOULDREMOVE(
+                                    op.layout.target, new_layout
+                                )
                 if target_stl is None:
                     target_buf_layouts = getattr(target_buf, "layouts", None)
                     if not isinstance(target_buf, SpyreEmptyFallback) and (
