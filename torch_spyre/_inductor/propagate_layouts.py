@@ -213,6 +213,32 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
     return -1 if maybe is None else maybe
 
 
+def _indirect_entry_dim(args, access_subs, out_coords):
+    """Find (elems_per_stick, pos) for the output's index-entry dim, or None.
+
+    The entry dim is the non-stick output coordinate whose free symbol is
+    one of access_subs's keys (the plain loop symbol that indirect_info_from_op
+    marks as index-driven, for gather reads and scatter writes alike).
+    indirect_sizes substitution to IndirectAccess happens later
+    (simplify_op_spec, after align_tensors), so at this point the symbol is
+    still bare in out_coords.
+    """
+    sym_to_name = {sym: e.args[0].name for sym, e in access_subs.items() if e.args}
+    if not sym_to_name:
+        return None
+    for pos, coord in enumerate(out_coords[:-1]):
+        if len(coord.free_symbols) != 1:
+            continue
+        sym = next(iter(coord.free_symbols))
+        if sym not in sym_to_name:
+            continue
+        index_buf_name = sym_to_name[sym]
+        for arg in args:
+            if arg.dep.name == index_buf_name and arg.layouts:
+                return arg.layouts[0].elems_per_stick(), pos
+    return None
+
+
 def _output_stl_from_stick_expr(
     stick_expr, output, output_dep, c_size, c_stride, dtype=None
 ) -> SpyreTensorLayout | None:
@@ -1084,7 +1110,7 @@ def _multi_arg_pointwise_layouts(
         # All STANDARD or other EAs - use STANDARD
         output_ea = ElementArrangement.STANDARD
 
-    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    ind_names, access_subs, ind_sizes = indirect_info_from_op(op)
     stick_exprs = {
         dc[-1]
         for arg in args
@@ -1125,6 +1151,13 @@ def _multi_arg_pointwise_layouts(
     stick_size = get_elem_in_stick(out_dtype_for_layout)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+
+    entry = _indirect_entry_dim(args, access_subs, out_coords)
+    if entry is not None:
+        eps, pos = entry
+        if c_size[pos] % eps != 0:
+            c_size[pos] = ((c_size[pos] + eps - 1) // eps) * eps
+        can_use_same_layout = False
 
     def _is_supported_layout(dim_order):
         for arg in args:

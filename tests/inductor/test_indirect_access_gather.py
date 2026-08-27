@@ -1299,7 +1299,7 @@ class _EmbeddingAllIndexBucketsScenario:
     sticks ways, i.e. the stick count is also the core count.
     For each count s:
       N = s*32 - offset  (offset ∈ [1,31] seeded from s)
-      → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
+      → N is non-stick-aligned, but propagate_layouts rounds it up to a stick multiple
       → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
       → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
     """
