@@ -603,18 +603,21 @@ class IndirectAccessTestCase(InductorTestCase):
         is a runtime row count, not a stick-shaped data layout, so it splits
         directly on that count -- no stick-alignment padding or rounding is
         involved, and the split need not be a multiple of the index dtype's
-        elems_per_stick. The split is the planner's ``core_split`` -- the
-        largest divisor of ``index_size`` that does not exceed SENCORES (so it
-        always divides evenly, and a non-power-of-two core count like 6 rounds
-        down to the nearest divisor). c1 always stays 1. Skips at sencores=1.
+        elems_per_stick. The split is the largest divisor of ``index_size``
+        that does not exceed SENCORES (so it always divides evenly, and a
+        non-power-of-two core count like 6 rounds down to the nearest divisor).
+        c1 always stays 1. Skips at sencores=1.
         """
+        from sympy import divisors
+
         from torch_spyre._inductor import config
-        from torch_spyre._inductor.work_division import core_split
 
         n = config.sencores
         if n == 1:
             self.skipTest("no work division at sencores=1")
-        expected = core_split(index_size, n)
+        # Find the largest divisor of index_size not exceeding n cores
+        legal = [d for d in divisors(index_size) if d <= n]
+        expected = max(legal) if legal else 1
         self.assertIn(
             f"sympify('c0'): (sympify('{index_size}'), {expected})",
             code,

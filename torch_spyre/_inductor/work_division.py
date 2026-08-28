@@ -930,7 +930,7 @@ def work_division_splits_are_legal(
     )
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, input_tds + [output_td], symbol_meta
+        it_space, _non_index_tensor_deps(op, input_tds + [output_td]), symbol_meta
     )
     coord_vars = {
         v
@@ -1279,7 +1279,7 @@ def work_distribution_pass(
     symbol_meta = _collect_symbol_metadata(it_space)
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
     )
 
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -1871,7 +1871,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         )
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, all_tds, symbol_meta
+        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
     )
 
     ownership = getattr(op, "iteration_space_ownership", None)
