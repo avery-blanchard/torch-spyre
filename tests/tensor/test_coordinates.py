@@ -13,14 +13,19 @@
 # limitations under the License.
 
 import sympy
+from types import SimpleNamespace
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import FixedLayout
+from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.optimize_restickify import FixedInOutNode
 from torch_spyre._inductor.pass_utils import (
+    compute_restickify_needed,
     device_coordinates,
     try_device_coordinates,
 )
@@ -28,6 +33,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
     _find_alt_target_stl,
+    _matmul_layouts,
 )
 from torch_spyre._inductor.views import (
     _decompose_constant_offset,
@@ -595,6 +601,159 @@ class TestNormalizeCoordinatesFusion(TestCase):
             ],
         )
         self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+
+
+class TestUnitNMatmulLayouts(TestCase):
+    """A size-one BMM N axis is semantic even after its symbol disappears."""
+
+    def _scenario(self):
+        batch, reduction = sympy.symbols(
+            "batch reduction", integer=True, nonnegative=True
+        )
+        ranges = (batch, reduction)
+        sizes = (32, 128)
+
+        # Use reverse-lexical buffer names to ensure semantic read order, not a
+        # name/set ordering heuristic, determines x and y.  When N == 1, both
+        # reads can have identical affine expressions.
+        x_dep = MemoryDep("z_x", 128 * batch + reduction, ranges, sizes)
+        y_dep = MemoryDep("a_y", 128 * batch + reduction, ranges, sizes)
+        out_dep = MemoryDep("out", batch, (batch,), (32,))
+
+        host = FixedLayout(
+            torch.device("cpu"), torch.float16, [32, 1, 128], [128, 128, 1]
+        )
+        source = SpyreTensorLayout(
+            [32, 1, 128], [128, 128, 1], torch.float16, [0, 1, 2]
+        )
+        args = [
+            PropArg(x_dep, host, [source]),
+            PropArg(y_dep, host, [source]),
+        ]
+        output = FixedLayout(torch.device("cpu"), torch.float16, [32, 1, 1], [1, 1, 1])
+        op = SimpleNamespace(
+            data=SimpleNamespace(
+                reduction_type=BATCH_MATMUL_OP,
+                ranges=[32, 1, 1],
+                reduction_ranges=[128],
+            )
+        )
+        layouts = {"z_x": host, "a_y": host}
+        graph = SimpleNamespace(
+            get_buffer=lambda name: SimpleNamespace(get_layout=lambda: layouts[name])
+        )
+        return op, output, out_dep, args, source, graph
+
+    def test_identical_deps_use_ordered_roles_and_sparse_y(self):
+        op, output, out_dep, args, source, graph = self._scenario()
+
+        with V.set_graph_handler(graph):
+            (out_stl,) = _matmul_layouts(op, output, out_dep, args)
+
+            self.assertEqual(
+                [edge.dep.name for edge in op.restick_cost_fn.edge_costs],
+                ["z_x", "a_y"],
+            )
+            x_req, y_req = op.restick_cost_fn.required_in_stls
+            self.assertEqual(x_req, source)
+            self.assertEqual(
+                device_coordinates(y_req, args[1].dep, None),
+                [0, args[1].dep.var_names[1], 0, args[1].dep.var_names[0], 0],
+            )
+            self.assertEqual(
+                device_coordinates(out_stl, out_dep, None),
+                [0, 0, out_dep.var_names[0], 0],
+            )
+
+    def test_same_buffer_name_keeps_distinct_operand_positions(self):
+        """Self-matmul roles are positional even when both deps share a name."""
+        op, output, out_dep, args, source, graph = self._scenario()
+        args[1] = PropArg(
+            MemoryDep(
+                args[0].dep.name,
+                args[1].dep.index,
+                args[1].dep.var_names,
+                args[1].dep.size,
+            ),
+            args[1].layout,
+            args[1].layouts,
+        )
+
+        with V.set_graph_handler(graph):
+            _matmul_layouts(op, output, out_dep, args)
+
+        self.assertEqual(
+            [edge.dep.name for edge in op.restick_cost_fn.edge_costs],
+            ["z_x", "z_x"],
+        )
+        self.assertEqual(op.restick_cost_fn.required_in_stls[0], source)
+        self.assertEqual(
+            device_coordinates(
+                op.restick_cost_fn.required_in_stls[1], args[1].dep, None
+            ),
+            [0, args[1].dep.var_names[1], 0, args[1].dep.var_names[0], 0],
+        )
+
+    def test_exact_self_alias_read_restores_two_semantic_edges(self):
+        """An OrderedSet-deduplicated read still supplies lhs and rhs roles."""
+        op, output, out_dep, args, source, graph = self._scenario()
+
+        with V.set_graph_handler(graph):
+            _matmul_layouts(op, output, out_dep, args[:1])
+
+        edges = op.restick_cost_fn.edge_costs
+        self.assertEqual(len(edges), 2)
+        self.assertIs(edges[0].dep, edges[1].dep)
+        self.assertEqual(op.restick_cost_fn.required_in_stls[0], source)
+        self.assertEqual(
+            device_coordinates(
+                op.restick_cost_fn.required_in_stls[1], edges[1].dep, None
+            ),
+            [0, args[0].dep.var_names[1], 0, args[0].dep.var_names[0], 0],
+        )
+
+    def test_fixed_input_can_materialize_exact_zero_stick_target(self):
+        _, _, _, args, source, graph = self._scenario()
+        y = args[1]
+        target = SpyreTensorLayout(
+            [32, 1, 128],
+            [128, 128, 1],
+            torch.float16,
+            [0, 1, 2, -1],
+        )
+
+        with V.set_graph_handler(graph):
+            # Dependency object identity is not an exact-target contract.
+            self.assertEqual(
+                compute_restickify_needed(source, y.layout, y.dep, target, y.dep, None),
+                (True, None),
+            )
+
+            # FixedInOut declares the exceptional sparse target explicitly,
+            # and equivalent reconstructed dependencies behave identically.
+            equivalent_dep = MemoryDep(
+                y.dep.name, y.dep.index, y.dep.var_names, y.dep.size
+            )
+            self.assertEqual(
+                compute_restickify_needed(
+                    source,
+                    y.layout,
+                    y.dep,
+                    target,
+                    equivalent_dep,
+                    None,
+                    exact_target=True,
+                ),
+                (True, target),
+            )
+            node = FixedInOutNode.from_args(
+                [y],
+                target,
+                [target],
+                None,
+                exact_target_layouts=[True],
+            )
+            self.assertEqual(node.edge_costs[0].layout(source, target), target)
 
 
 if __name__ == "__main__":

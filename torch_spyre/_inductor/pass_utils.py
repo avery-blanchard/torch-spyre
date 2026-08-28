@@ -878,36 +878,38 @@ def host_coordinates(
 def identify_matmul_inputs(
     inputs: list[MemoryDep],
     write_dep: MemoryDep,
-) -> tuple[MemoryDep, MemoryDep] | tuple[None, None]:
+) -> tuple[MemoryDep, MemoryDep]:
     """Identify Input1 (x) and Input2 (y) of a BatchMatmul op.
 
-    Uses the BatchMatmul semantic dimension definitions:
-      reduction_dim: in Input1, Input2,  NOT Output
-      generated_dim: in Input2, Output,  NOT Input1
-      preserved_dim: in Input1, Output,  NOT Input2
-      noreuse_dim:   in Input1, Input2,  Output
+    Uses positional order: lower_bmm always emits x before y, so inputs[0] is
+    x and inputs[1] is y.  This is valid even when N=1 (the N symbol is
+    constant-folded out of index expressions) or when both deps are identical
+    (ReadWrites deduplicated a self-alias read).
 
-    Identifies y by its generated_dim (N): present in y and the output, absent
-    from x.  This is more robust than identifying x by its preserved_dim (M):
-    when M=1, M is constant-folded out of both x's and the output's index
-    simultaneously, making the preserved_dim test blind.  N is immune — even
-    N=1 ranges stay in the output's index expression.
+    For a 1-element input list, the single dep is treated as both x and y
+    (self-matmul where ReadWrites collapsed two identical MemoryDeps to one).
 
-    Returns (None, None) if y cannot be identified.
+    Raises ValueError for 0 or 3+ inputs.
     """
-    assert len(inputs) == 2
-    a, b = inputs[0], inputs[1]
-    out_syms = write_dep.index.free_symbols
-    syms_a = a.index.free_symbols
-    syms_b = b.index.free_symbols
+    if len(inputs) == 0 or len(inputs) > 2:
+        raise ValueError(
+            f"identify_matmul_inputs: expected 1 or 2 inputs, got {len(inputs)}"
+        )
+    if len(inputs) == 1:
+        return inputs[0], inputs[0]
 
-    # b has generated_dim → b is y, a is x
-    if (syms_b & out_syms) - syms_a:
-        return a, b
-    # a has generated_dim → a is y, b is x
-    if (syms_a & out_syms) - syms_b:
-        return b, a
-    return None, None
+    a, b = inputs[0], inputs[1]
+    return a, b
+
+
+def get_matmul_n_size(op: "Operation") -> int:
+    """Return the concrete N (output columns) extent of a matmul op.
+
+    Reads from op.data.ranges[-1] rather than inferring from index expressions,
+    so it is correct even when N=1 and the N symbol has been constant-folded
+    out of every MemoryDep.
+    """
+    return concretize_expr(op.data.ranges[-1])
 
 
 def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
