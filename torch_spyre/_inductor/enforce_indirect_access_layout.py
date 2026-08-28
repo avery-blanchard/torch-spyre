@@ -41,6 +41,7 @@ from torch._inductor.ir import (
 from torch_spyre._C import SpyreTensorLayout
 
 from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
 from .insert_restickify import (
     _create_restickify_node,
     _fixed_tiled,
@@ -88,7 +89,7 @@ def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
 
 
 def _scatter_access_subs_and_sizes(
-    scatter_op: ComputedBuffer, output_layout, write_dep: MemoryDep
+    scatter_op: ComputedBuffer, coord_layout, write_dep: MemoryDep
 ) -> tuple[dict, dict]:
     """Build access substitutions and sizes for scatter op index symbols.
 
@@ -98,8 +99,15 @@ def _scatter_access_subs_and_sizes(
     write_dep.index (symbols that appear in the write but NOT in write_dep's
     loop ranges) and build IndirectAccess mappings for each one.
 
+    ``coord_layout`` must be the layout that write_dep's coordinates will
+    actually be computed against (the scatter's output when checking the
+    op's own device layout; the mutation target's layout when checking
+    destination compliance against a possibly-different target layout) --
+    sizing against a different buffer's strides can silently mismatch or
+    misresolve a symbol's size.
+
     For each scatter symbol, compute its device dimension via device_coordinates
-    to find the corresponding size in output_layout.device_size.
+    to find the corresponding size in coord_layout.device_size.
     Returns ({sym: IndirectAccess(...)}, {sym: size}).
     """
 
@@ -118,20 +126,20 @@ def _scatter_access_subs_and_sizes(
     }
 
     # Compute device coordinates to find the actual device dimension for each
-    # scatter symbol, then look up its size from output_layout.device_size.
+    # scatter symbol, then look up its size from coord_layout.device_size.
     sizes: dict[sympy.Symbol, int] = {}
-    if output_layout.size and output_layout.stride:
+    if coord_layout.size and coord_layout.stride:
         # For each scatter symbol, find which host dimension it multiplies
-        # (by matching the stride of that dimension in output_layout.stride).
+        # (by matching the stride of that dimension in coord_layout.stride).
         for sym in access_subs:
             # Extract the coefficient of this symbol in write_dep.index
             coeff = write_dep.index.coeff(sym)
             if coeff is not None:
                 # Find which host dimension has this stride
-                for dim_idx, stride in enumerate(output_layout.stride):
+                for dim_idx, stride in enumerate(coord_layout.stride):
                     if stride == coeff:
-                        if 0 <= dim_idx < len(output_layout.size):
-                            sizes[sym] = output_layout.size[dim_idx]
+                        if 0 <= dim_idx < len(coord_layout.size):
+                            sizes[sym] = coord_layout.size[dim_idx]
                         break
 
     return access_subs, sizes
@@ -544,8 +552,10 @@ def _enforce_scatter_destination_layout(
     # device layout, which is where the scatter actually writes.
     target_layout = target_buf.get_layout()
     target_stl = None
+    target_fixed_tiled_layout = None
     if isinstance(target_layout, FixedTiledLayout):
         target_stl = target_layout.device_layout
+        target_fixed_tiled_layout = target_layout
     else:
         # For non-tiled layouts (e.g., FixedLayout on graph inputs), try to get
         # the SpyreTensorLayout from the TensorBox's .layouts attribute.
@@ -577,8 +587,34 @@ def _enforce_scatter_destination_layout(
         return
 
     # Compute write coordinates against the target's layout and find positions
-    # of IndirectAccess markers.
-    write_coords = device_coordinates(target_stl, write_dep, None)
+    # of IndirectAccess markers. The sizes must be the scatter's real
+    # indirect_sizes -- device_coordinates drops indirect symbols outright when
+    # passed None, so the marker search below could never match -- and they
+    # must be resolved against the *target's* layout/strides, since that is
+    # the layout write_coords is computed against (the target and output
+    # layouts can differ; that's exactly why this branch is reached).
+    if target_fixed_tiled_layout is not None:
+        subs_from_op, scatter_sizes = _scatter_access_subs_and_sizes(
+            scatter_op, target_fixed_tiled_layout, write_dep
+        )
+        if subs_from_op:
+            scatter_access_subs = subs_from_op
+    else:
+        scatter_sizes = {}
+    try:
+        write_coords = device_coordinates(target_stl, write_dep, scatter_sizes)
+    except Unsupported:
+        # A scatter symbol's size could not be resolved against the target's
+        # layout, so compliance cannot be determined here. Skip enforcement
+        # rather than falling back to an unconditional (possibly unnecessary)
+        # copy -- mirrors the other "cannot enforce" branches above.
+        logger.debug(
+            "scatter_destination_check: skipping %s: could not resolve indirect "
+            "sizes against target %r layout",
+            scatter_op.get_name(),
+            target_name,
+        )
+        return
     indirect_stride_idxs = []
     for idx, coord in enumerate(reversed(write_coords)):
         substituted = coord.xreplace(scatter_access_subs)
