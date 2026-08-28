@@ -1132,12 +1132,6 @@ def _create_sdsc_tensors(
     # label. Reduced-dim appending (below) is a single-input-reduction concern.
     is_matmul = _is_matmul(op_spec.op)
     use_op_dims = not (is_matmul or _is_conv(op_spec.op))
-    # x (args[0]) is broadcast over a batch dim when torch.matmul's own
-    # broadcasting never indexes that dim in x's access pattern at all (e.g.
-    # torch.matmul(x.unsqueeze(0), w) for x:[T, H], w:[E, H, F]) -- see
-    # _matmul_reuse_dims. Computed once, up front, since it needs x's own
-    # natural dim_order (i==0's Step 1 result below) together with y's/the
-    # output's -- not tied to the per-arg loop index.
     matmul_x_reuse_dims: list[Symbol] = []
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -1230,11 +1224,6 @@ def _create_sdsc_tensors(
                 ]
                 dim_order = dim_order + reduced_dims
 
-        # x's reuse dims (matmul only, see _matmul_reuse_dims): dims x is
-        # broadcast over. use_op_dims is False for matmul, so these are never
-        # covered by Step 2 above -- append them the same way, with the same
-        # scale=-1 treatment, since they are absent from x's own layout for
-        # exactly the same reason an ordinary reduced dim is.
         if is_matmul and i == 0 and matmul_x_reuse_dims:
             reduced_dims = reduced_dims + matmul_x_reuse_dims
             dim_order = dim_order + matmul_x_reuse_dims
@@ -1634,33 +1623,18 @@ def _matmul_reuse_dims(
     symbol_mapping: dict,
     x_dim_order: list[Symbol],
 ) -> list[Symbol]:
-    """Return dims x is broadcast over: present in y and the output, absent
-    from x, and not the generated (N) dim.
+    """Dims x is broadcast over (in y/output, not in x, excluding N).
 
-    ``torch.matmul(x, w)`` broadcasts x over a batch dim w/the output carry
-    (e.g. x:[T, H], w:[E, H, F] -> [E, T, F]) by simply never indexing that
-    dim in x's access pattern -- x's device_coordinates carry no symbol for
-    it at all (see issue #3888/#3927). Such a dim is "in y and the output,
-    not in x", which is also exactly the set-membership signature of the
-    matmul's own generated dim N (identify_matmul_inputs's generated_dim,
-    pass_utils.py) -- N and a genuine broadcast-batch dim cannot be told
-    apart by that test alone.
-
-    Disambiguate using the layout policy instead of set arithmetic: y and
-    the output always stick on N (find_stick_compatible_input_layout in
-    propagate_layouts.py enforces "Input2 (y): stick on generated_var" /
-    "Output: stick on generated_var"), while a broadcast-batch dim never is
-    -- it has no data-dependent axis in x to justify sticking on. So N is
-    identifiable as y's (and the output's) stick dim, and everything else
-    in the "y and output, not x" candidate set is a genuine reuse dim.
+    matmul broadcasts x over batch dims it doesn't index (issue #3888/#3927).
+    These are indistinguishable from the true generated dim N by set membership
+    alone. Use layout policy to disambiguate: y and output always stick on N,
+    broadcast-batch dims never do. N = y's stick dim; others are reuse dims.
     """
     y_arg = op_spec.args[1]
     out_arg = op_spec.args[-1]
     y_dim_order, y_stick = _get_device_dim_order(y_arg, symbol_mapping)
     out_dim_order, out_stick = _get_device_dim_order(out_arg, symbol_mapping)
     if y_stick is None:
-        # Degenerate: y has no stick dim to identify N by. Rather than guess
-        # which candidate is N, skip reuse-dim injection for this arg.
         return []
     y_syms = set(y_dim_order) | {y_stick}
     out_syms = set(out_dim_order) | ({out_stick} if out_stick is not None else set())
