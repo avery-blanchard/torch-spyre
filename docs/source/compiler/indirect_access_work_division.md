@@ -123,33 +123,21 @@ left for a single core.
 
 ## The proposed fix
 
-Four changes, in order of importance.
+Three changes, in order of importance.
 
 ### Where the rules live: the work-division constraint framework
 
 The split rules are expressed as a single op constraint in the centralized
 work-division constraint framework
 ([work_division_constraints.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division_constraints.py)).
-`indirect_access_constraints(ctx)` returns a `ConstraintResult` with two sets:
+`indirect_access_split_domains(ctx)` maps every symbol returned by
+`indirect_forbidden_split_syms(op)` to `allowed_splits={symbol: {1}}`.
 
-* **`forbidden`** — the shared-table data dims that must never be split (fix #1).
-  This is a **hard** constraint: unlike the framework's soft `blocked` (which span
-  reduction may override to meet the memory-span limit), a `forbidden` dim is
-  removed from the span-reduction candidate set too, so it is never split under
-  any circumstance. The index-entry dim is never in this set: it is a runtime row
-  count, not a stick-shaped data layout, so it may split at any granularity —
-  including counts that are not a multiple of the index elems_per_stick.
-* **`force_output`** — a scatter's index-entry dim, promoted to output-split
-  priority (fix #2).
-
-`collect_work_division_constraints` merges this with the other op constraints
-(coordinate-mask, conv-spatial, QFP8WT), and the split passes consume the merged
-result: `span_reduction_pass` feeds `forbidden` into `must_split_vars`' candidate
-filter, and `work_distribution_pass` passes `forbidden` / `force_output` into
-`_default_split`. The computation itself lives in
-[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
-(`indirect_forbidden_split_syms`, `indirect_store_entry_syms`), so it is reusable
-and has no dependency on `work_division.py`.
+`allowed_splits` is the common hard-legality mechanism: it is intersected with
+other constraints and consumed by span reduction, default and cost-model
+planning, user hints, candidate enumeration, and split validation. A span-limit
+commitment outside the domain raises `Unsupported`; planner never splits a shared
+table dimension to satisfy span.
 
 ### 1. Forbid splitting the shared table's data dims — the correctness fix
 
@@ -164,13 +152,11 @@ indirect tensor of an op:
   coordinate symbols.
 
 `shared_indirect_data_syms` then takes the non-`IndirectAccess` coordinate
-symbols of those coordinates — the same extraction for both directions. The split
-passes consult it through `indirect_forbidden_split_syms`, which surfaces the
-result directly as the `forbidden` set of `indirect_access_constraints`.
-`span_reduction_pass` excludes those symbols from `must_split_vars`' candidate set
-and `_default_split` removes them from the output and reduction priority lists, so
-the core budget is distributed only over the index-entry dims — **divide by the
-index, not the table.**
+symbols of those coordinates — the same extraction for both directions.
+`indirect_forbidden_split_syms` combines them with the partial-last-stick rule,
+and `indirect_access_split_domains` restricts each to `{1}`. Every planner then
+considers only the remaining legal dimensions — **divide by the index, not the
+table.**
 
 When the index dim cannot absorb all the cores, the op falls back to fewer cores
 rather than splitting a data dim. **Correct-but-serial is the intended
@@ -182,57 +168,61 @@ A gather's index-entry dim is already an output coordinate, so it is a split axi
 by default. A scatter's index-entry dim is **absent** from the destination's
 direct coordinates (the row is data-dependent), so `prioritize_dimensions`
 classifies it as a *reduction* dim, which a non-reduction op never splits.
-`indirect_store_entry_syms` returns those entry dims (the iteration symbols left
-after removing the data dims); they become the `force_output` set of
-`indirect_access_constraints`, and `_default_split`'s `force_output_syms`
-promotes them to output priority so the distributor splits them.
+`indirect_store_entry_syms` returns those entry dims for overwrite scatters.
+`prioritize_indirect_scatter_dimensions` promotes them to output priority. This
+is heuristic policy, not constraint state.
 
-The split round-trips through the existing coefficient encoding without new
-machinery: a scatter's entry dim has coefficient 0 in the (indirect) write index,
-so `splits_by_index_coeff` encodes it via the first **non-indirect** read — the
-direct `src` load selected by `_first_non_indirect_read_index` — and
-`apply_splits_from_index_coeff` decodes it the same way at codegen.
+A scatter entry dim has coefficient 0 in the indirect write index, so
+`splits_by_index_coeff` encodes it via the first direct read. Split recovery,
+split validation, and codegen use the same transport-index selection for that
+reference.
 
 This is gated on the [uniqueness condition](#the-scatter-only-correctness-condition-index-uniqueness):
 `indirect_store_entry_syms` returns dims only for overwrite scatters.
 
-### 3. Shared-table span guard
+### 3. Stick-align the index-entry split (partial last stick)
 
-The shared table's coordinates carry `IndirectAccess`, so it is visible to the
-per-core span check with `get_per_core_span` treating an `IndirectAccess`
-coordinate as contributing its full device extent (any core may touch any row)
-and never splitting it. A gather's value table is pulled in as an extra TensorDep
-(it is not in `args`), via `collect_indirect_value_tds`; a scatter's destination
-is the output TensorDep, already covered.
+Enabling the index-entry split (fixes #1–2) exposes a second hazard when the
+entry count is **not a whole multiple of the index stick** (32 int32 entries per
+128-byte stick). Work division splits the entry dim in whole sticks, so an
+*even* per-core slice of a partial last stick — e.g. `Q = 40` = one full stick +
+8 — hands the second core a slice that **straddles the index stick boundary**.
+The backend cannot step a sticked dimension across a stick boundary *within* a core,
+so the entries past the boundary are read from the wrong device addresses.
 
-### 4. Deterministic split round-trip
+The fix pads the **gather output**'s entry-dim `device_size` up to the next stick
+multiple (e.g. `40 → 64`), leaving the logical size unchanged.
+`pass_utils.padded_entry_output_stl` owns this — the single coordinate search
+(`_find_entry_output_dim`) plus the size math — and returns the grown device
+layout (or `None` when there is nothing to pad); the pre-scheduling pass
+`enforce_indirect_access_layout._pad_output_for_stick_aligned_split` just applies
+it. The physical allocation grows, so the per-core base becomes stick-aligned —
+matching the index tensor, whose device layout is already stick-padded — and the
+D2H copy extracts the logical rows from the larger allocation (its
+`physical_exceeds_logical` path). To keep the per-core base stride consistent,
+`superdsc` grows the SDSC iteration to the padded size **before**
+`_create_sdsc_tensors` computes strides; otherwise the base lands element-aligned
+(mid-stick) and the split still miscompiles.
 
-The split plan is encoded with the coefficients of the read/write index
-expressions. An indirect read carries data-dependent symbols whose coefficients
-are not a stable identity key, so the encode side (`apply_splits`) and both
-decode sites (`work_distribution_pass`, `create_op_spec`) prefer the first
-**non-indirect** read as the reduction-split reference index, via
-`_first_non_indirect_read_index`. This same reference also carries a scatter's
-entry-dim split (fix #2).
-
-### Why no fifth fix is needed: the index-entry dim splits at any granularity
-
-The index-entry dim is a runtime row **count**, not a stick-shaped data layout.
-Unlike a shared table's data dims, there is no shared base address to keep
-aligned across cores: each core's index sub-tensor (and, for a gather, its
-output slice) is independently addressed, so a per-core slice may fall anywhere
-in the entry count — including a slice that would straddle an index-stick
-boundary. There is nothing to pad and no alignment restriction to enforce.
-
-`work_division._non_index_tensor_deps` excludes the index tensor from
-`adjust_it_space_for_sticks`, so the entry dim's iteration-space size is always
-its raw element count, never a stick-count approximation. `core_split` then
-operates directly on that count: `cores = core_split(Q, SENCORES)` for a 1-D
-index, whether or not `Q` is a multiple of the index elems_per_stick.
 `indirect_forbidden_split_syms`
 ([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
-only ever forbids the shared-table data dims (fix #1); the index-entry dim is
-never in that set, for either gather or scatter.
+enforces the invariant, **forbid unless provably padded**, as a single predicate:
+it forbids a partial-last-stick entry dim — reading the index's *unpadded*
+logical count (`d.ranges`), which the output padding never changes — **unless**
+`is_output_stick_aligned_for_entry(op)` confirms the output extent is already a
+whole multiple of the index `eps` (either naturally, or because the padding pass
+grew it).
+
+So a padded gather splits stick-aligned, while anything unpadded falls back to a
+single core rather than miscompiling. A **scatter cannot be padded**: its
+destination is written in place (a mutation layout) and its entry row is
+data-dependent (an `IndirectAccess` coord), so `_find_entry_output_dim` finds no
+paddable entry, `is_output_stick_aligned_for_entry` returns `False`, the
+forbiddance is never lifted, and a partial-stick scatter stays on a single core —
+correct-but-serial rather than miscompiling.
+
+Stick-aligned counts (a multiple of 32) are unaffected: no padding, the
+forbiddance never fires, and they split exactly as before.
 
 ## Detection: load side vs. store side
 
@@ -256,12 +246,13 @@ substitutes into the shared table's coordinates.
 
 `out = x[i]` with `x : [128, 64, 512]`, `i : [256]`, `SENCORES=32`. Iteration
 space `{d0 = Q = 256, d1 = K = 64, d2 = N = 512}`; the value's gather axis
-`M = 128` is addressed by `IndirectAccess`.
+`M = 128` is addressed by `IndirectAccess`. The index stickifies to `256 / 32 =
+8` sticks on `d0`.
 
 | | Without the fix | With the fix |
 |---|---|---|
-| Largest dim | `K = 64` | (forbidden) |
-| Split | `K`, 32 cores | `d0` (index), 32 cores |
+| Largest dim | `K = 64` | legal domain `{1}` |
+| Split | `K`, 32 cores | `d0` (index), 8 cores |
 | Value tensor | per-core column base diverges | shared at base 0 |
 | Result | wrong (every core reads column 0) | correct |
 
@@ -269,21 +260,22 @@ space `{d0 = Q = 256, d1 = K = 64, d2 = N = 512}`; the value's gather axis
 
 `out[i] = src` with `out, src : [5, 64, 512]`, `i : [5]` (a permutation),
 `SENCORES=32`. Iteration space `{d0 = Q = 5, d1 = K = 64, d2 = N = 512}`; the
-destination's scatter axis `M = 5` is addressed by `IndirectAccess`.
+destination's scatter axis `M = 5` is addressed by `IndirectAccess`. The index
+stickifies `d0` to `ceil(5 / 32) = 1` stick.
 
 | | Without the fix | With the fix |
 |---|---|---|
-| Largest dim | `K = 64` | (forbidden) |
-| Split | `K`, 32 cores | `d0` (index), 5 cores |
+| Largest dim | `K = 64` | legal domain `{1}` |
+| Split | `K`, 32 cores | `d0` (index), 1 core (Q stickifies to 1) |
 | Destination | per-core column base pinned, all cores write columns `[0,2)` | shared at base 0, row from `IndirectAccess` |
-| Result | wrong / backend abort | correct |
+| Result | wrong / backend abort | correct (serial — index too small to split) |
 
-In both cases parallelism is set directly by the index element count:
-`cores = core_split(Q, SENCORES)` for a 1-D index — the largest divisor of `Q`
-that fits the core budget (`Q = 256 → 32`, `Q = 5 → 5`, a non-stick-aligned
-count like `Q = 40 → core_split(40, SENCORES)` with no padding or rounding
-involved, and a non-power-of-two `SENCORES = 6` rounds down to the nearest
-divisor). A spatial (non-stick) index dimension splits directly.
+In both cases parallelism is set by the index size in sticks: for a 1-D index,
+planner selects largest legal divisor of `ceil(Q / 32)` within `SENCORES`
+(`Q = 256 → 8` sticks → 8 cores; a partial `Q = 40` gather pads to 2 sticks →
+2 cores; `SENCORES = 6` rounds 8 sticks down to 4). A spatial non-stick index
+dimension splits directly. A small index (the scatter `Q = 5` here) runs
+correct-but-serial.
 
 ## Limitations and future work
 
@@ -307,9 +299,11 @@ divisor). A spatial (non-stick) index dimension splits directly.
 
 | File | Change |
 |---|---|
-| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`; the split-rule computation: `_shared_indirect_coords` (gather reads + scatter destination), `shared_indirect_data_syms`, `_non_indirect_coord_syms`, `indirect_forbidden_split_syms` (shared-table dims only — the index-entry dim is never forbidden), `indirect_store_entry_syms` |
-| `_inductor/work_division_constraints.py` | `indirect_access_constraints` — registers the split rules as one op constraint; `ConstraintResult.forbidden` (hard, never-split) / `.force_output` fields, merged by `collect_work_division_constraints` and consumed by every split pass |
-| `_inductor/work_division.py` | consumes `constraint_result.forbidden` / `.force_output` (feeds `forbidden` into `must_split_vars`; `forbidden_split_syms` + `force_output_syms` in `_default_split`); `collect_indirect_value_tds` + `IndirectAccess` span guard; `_resolve_layout`; `_non_index_tensor_deps` excludes the index tensor from `adjust_it_space_for_sticks` so its entry dim keeps its raw element count |
+| `_inductor/pass_utils.py` | indirect load/store discovery; partial-stick helpers; shared-table and partial-stick detection (`indirect_forbidden_split_syms`); overwrite-scatter entry detection (`indirect_store_entry_syms`); `first_non_indirect_read_index` |
+| `_inductor/work_division_constraints.py` | `indirect_access_split_domains` maps hard indirect restrictions to `allowed_splits={symbol: {1}}` |
+| `_inductor/work_division.py` | consumes generic legal split domains; `prioritize_indirect_scatter_dimensions` promotes overwrite-scatter entry dims; split encoding and recovery use direct-read reference |
+| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — applies the grown output layout from `pass_utils.padded_entry_output_stl` to a partial-stick gather output (fix #5) |
+| `_inductor/codegen/superdsc.py` | grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #5) |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
 
 ## See also
