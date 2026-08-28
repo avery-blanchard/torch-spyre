@@ -680,7 +680,9 @@ def align_tensors(
         return var
 
     all_terms = []  # terms for each tensor
-    stick_dim = []  # stick var for each tensor
+    stick_dim: list[
+        Optional[sympy.Symbol]
+    ] = []  # stick var for each tensor (None for index tensors)
     stick_size = []  # stick size for each tensor
 
     for tensor in tensors:
@@ -692,8 +694,20 @@ def align_tensors(
             synthetic_var,
             indirect_sizes,
         )
-        stick_dim.append(terms[-1].var)
-        stick_size.append(terms[-1].dim_size)
+        # Check if this is an index tensor: it has an indirect symbol in coordinates.
+        # Index tensors' entry dimensions are runtime row counts, not stick-shaped layouts,
+        # so they don't follow the stick-alignment invariant (split must be multiple of
+        # stick_size). Mark such tensors with stick_dim=None so they're excluded from
+        # the stick-based split clamping logic.
+        is_index_tensor = indirect_sizes is not None and any(
+            sym in indirect_sizes for sym in tensor["coordinates"][-1].free_symbols
+        )
+        if is_index_tensor:
+            stick_dim.append(None)
+            stick_size.append(1)
+        else:
+            stick_dim.append(terms[-1].var)
+            stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
 
     _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
@@ -716,11 +730,13 @@ def align_tensors(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                if den != stick_size[i] or var != stick_dim[i]:
+                # Skip stick-size exclusion for index tensors (stick_dim[i] is None)
+                if stick_dim[i] is None or den != stick_size[i] or var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
                     splits[var].add(den)
                 if (
-                    mod != stick_size[i]
+                    stick_dim[i] is None
+                    or mod != stick_size[i]
                     or var != stick_dim[i]
                     or var in repeat_info.keys()
                 ):
