@@ -71,6 +71,7 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -633,10 +634,12 @@ def _make_tiled_op_spec() -> OpSpec:
         allocation={"hbm": 0x2000},
         device_tile_advance_expr=tile_advance_expr,
     )
+    iteration_space = {c0: (Integer(128), 1)}
     return OpSpec(
         op="abs",
         is_reduction=False,
-        iteration_space={c0: (Integer(128), 1)},
+        iteration_space=iteration_space,
+        core_id_to_work_slice=derive_operation_mapping(iteration_space),
         args=[tensor_in, tensor_out],
         op_info={},
         tiled_symbols=[[c0]],
@@ -3082,14 +3085,16 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             allocation={"hbm": 0x2000},
             device_tile_advance_expr=tile_advance_expr,
         )
+        iteration_space = {
+            c0: (Integer(2), 1),
+            c1: (Integer(4), 1),
+            c2: (Integer(64), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c0: (Integer(2), 1),
-                c1: (Integer(4), 1),
-                c2: (Integer(64), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[tensor_in, tensor_out],
             op_info={},
             tiled_symbols=[[c0, c1]],
@@ -3576,6 +3581,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
                 op="batchmatmul",
                 is_reduction=True,
                 iteration_space=iteration_space,
+                core_id_to_work_slice=derive_operation_mapping(iteration_space),
                 args=args,
                 op_info=op_info,
             )
@@ -4045,10 +4051,12 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             allocation={"hbm": 0x3000},
             device_tile_advance_expr=64 * out,
         )
+        iteration_space = {c0: (Integer(128), 1)}
         op = OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={c0: (Integer(128), 1)},
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[tensor_in0, tensor_in1, tensor_out],
             op_info={},
             tiled_symbols=[[c0]],
@@ -6276,6 +6284,25 @@ class TestValidatePlannedReductionTiling(unittest.TestCase):
         tiled_dims = [[0], []]
         tiled_rdims = [[], [0]]
         # Must not raise: outer output-dim + inner reduction-dim is now supported.
+        _validate_planned_reduction_tiling(op, tiled_dims, tiled_rdims)
+
+    def test_multiple_output_levels_outer_to_reduction_allowed(self):
+        """Every output level may remain outer to the inner reduction tile."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
+
+        data = MagicMock(spec=Reduction)
+        data.ranges = [Integer(4), Integer(128), Integer(32)]
+        data.reduction_ranges = [Integer(512)]
+        data.reduction_type = "sum"
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "combined_bmm"
+
+        tiled_dims = [[0], [1], []]
+        tiled_rdims = [[], [], [0]]
         _validate_planned_reduction_tiling(op, tiled_dims, tiled_rdims)
 
     def test_multiple_reduction_dims_same_level_raises(self):

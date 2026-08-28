@@ -593,44 +593,6 @@ class IndirectAccessTestCase(InductorTestCase):
         # Recompile from scratch so our sdsc spy always sees the op specs.
         torch._dynamo.reset()
 
-    # -- Work-division split-map assertion -------------------------------
-    def assert_indexed_dim_split(self, code, index_size, data_size):
-        """Assert the work-division split map at the current SENCORES.
-
-        For a gather `out = x[i]` or overwrite-scatter `dest[i] = src`, the
-        planner MUST split the index/entry dim (c0) and MUST NOT split the
-        value-table / destination data dim (c1). The index tensor's entry dim
-        is a runtime row count, not a stick-shaped data layout, so it splits
-        directly on that count -- no stick-alignment padding or rounding is
-        involved, and the split need not be a multiple of the index dtype's
-        elems_per_stick. The split is the largest divisor of ``index_size``
-        that does not exceed SENCORES (so it always divides evenly, and a
-        non-power-of-two core count like 6 rounds down to the nearest divisor).
-        c1 always stays 1. Skips at sencores=1.
-        """
-        from sympy import divisors
-
-        from torch_spyre._inductor import config
-
-        n = config.sencores
-        if n == 1:
-            self.skipTest("no work division at sencores=1")
-        # Find the largest divisor of index_size not exceeding n cores
-        legal = [d for d in divisors(index_size) if d <= n]
-        expected = max(legal) if legal else 1
-        self.assertIn(
-            f"sympify('c0'): (sympify('{index_size}'), {expected})",
-            code,
-            f"index/entry dim {index_size} must split by {expected} at {n} cores "
-            f"(largest divisor of {index_size} not exceeding {n})",
-        )
-        self.assertIn(
-            f"sympify('c1'): (sympify('{data_size}'), 1)",
-            code,
-            f"data dim {data_size} must stay unsplit (split=1) at {n} cores; "
-            "splitting a shared table/destination dim silently corrupts results",
-        )
-
     # -- Dimension naming helpers ----------------------------------------
     def name_dims(self, tensor, dims: dict):
         """Declare and attach named dimensions to a tensor.
