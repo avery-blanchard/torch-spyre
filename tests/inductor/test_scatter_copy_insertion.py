@@ -24,6 +24,8 @@ import unittest
 import torch
 from torch._inductor.utils import run_and_get_code
 
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
 
 class TestScatterCopyInsertion(unittest.TestCase):
     """Tests that unnecessary copies are not inserted for compliant layouts."""
@@ -32,16 +34,35 @@ class TestScatterCopyInsertion(unittest.TestCase):
         """Count 'restickify' operations in generated SDSC code."""
         return code_str.lower().count("restickify_")
 
+    def _create_layout(self, device_size, stride_map):
+        """Create a SpyreTensorLayout with given device_size and stride_map."""
+        return SpyreTensorLayout(
+            device_size=device_size,
+            stride_map=stride_map,
+            device_dtype=get_device_dtype(torch.float16),
+        )
+
     def test_scatter_dim0_slot_major_no_unnecessary_copy(self):
-        """Scatter on dim 0 with slot-major layout: no copy needed.
+        """Scatter on dim 0 with slot-major layout: compliant (no copy needed).
 
         vLLM KV-cache case: [SLOTS, HEADS, HD, T] scattered on dim 0 (SLOTS).
-        Slot-major layout already has SLOTS at device position 0.
-        No relayout copy should be inserted.
+        Create destination with explicit slot-major layout where SLOTS is at
+        device position 0. The fix should detect this as compliant and not
+        insert an unnecessary relayout copy.
         """
-        SLOTS, HEADS, HD, T = 8, 2, 64, 4
-        dst = torch.zeros(SLOTS, HEADS, HD, T, dtype=torch.float16).to("spyre")
-        src = torch.rand(1, HEADS, HD, T, dtype=torch.float16).to("spyre")
+        SLOTS, HEADS, HD = 8, 2, 64
+        eps = get_elem_in_stick(torch.float16)
+        sticks = HD // eps
+
+        layout = self._create_layout(
+            device_size=[SLOTS, HEADS, sticks, eps],
+            stride_map=[HEADS * sticks * eps, sticks * eps, eps, 1],
+        )
+
+        dst = torch.zeros(SLOTS, HEADS, HD, dtype=torch.float16).to(
+            "spyre", device_layout=layout
+        )
+        src = torch.rand(1, HEADS, HD, dtype=torch.float16).to("spyre")
         idx = torch.tensor([3], dtype=torch.int64).to("spyre")
 
         def kernel(dst, src, idx):
@@ -51,17 +72,13 @@ class TestScatterCopyInsertion(unittest.TestCase):
         compiled_fn = torch.compile(kernel, dynamic=False, backend="inductor")
         _, code = run_and_get_code(compiled_fn, dst, src, idx)
 
-        # Count restickify ops in the scatter operation itself.
-        # For a compliant layout, should have minimal/no scatter-specific copies.
+        # With the fix, compliant layouts should NOT insert a destination copy.
+        # The scatter should use the destination layout as-is.
         restickify_count = self.count_restickify_ops(code[0])
-
-        # A compliant scatter on dim 0 of a [8,2,64,4] tensor should not need
-        # the destination copied. We expect 0 or minimal restickify ops.
-        # (The source might have one for alignment, but destination should be ok.)
-        self.assertLessEqual(
+        self.assertEqual(
             restickify_count,
-            1,
-            f"Too many restickify ops ({restickify_count}) for compliant layout",
+            0,
+            f"Compliant scatter destination should have no restickify ops, got {restickify_count}",
         )
 
     def test_scatter_dim2_default_layout_needs_copy(self):
@@ -97,13 +114,21 @@ class TestScatterCopyInsertion(unittest.TestCase):
             pass
 
     def test_scatter_row_major_slot_indexed_no_unnecessary_copy(self):
-        """Scatter with row-major [M, N] on dim 0: no copy for correct layout.
+        """Scatter with [M, N] on dim 0: compliant layout, no copy.
 
-        Simple 2D case: destination already has scatter dim at position 0.
-        No unnecessary copy should be inserted.
+        2D case with explicit layout where M is at device position 0.
+        With the fix, should not insert a copy for compliant layouts.
         """
         M, N = 128, 256
-        dst = torch.zeros(M, N, dtype=torch.float16).to("spyre")
+        eps = get_elem_in_stick(torch.float16)
+        n_sticks = N // eps
+
+        layout = self._create_layout(
+            device_size=[M, n_sticks, eps],
+            stride_map=[n_sticks * eps, eps, 1],
+        )
+
+        dst = torch.zeros(M, N, dtype=torch.float16).to("spyre", device_layout=layout)
         src = torch.rand(8, N, dtype=torch.float16).to("spyre")
         idx = torch.arange(8, dtype=torch.int32).to("spyre")
 
@@ -112,14 +137,14 @@ class TestScatterCopyInsertion(unittest.TestCase):
             return dst
 
         compiled_fn = torch.compile(kernel, dynamic=False, backend="inductor")
-        _, code = run_and_get_code(compiled_fn, dst.to("spyre"), src.to("spyre"), idx)
+        _, code = run_and_get_code(compiled_fn, dst, src, idx)
 
-        # Compliant 2D scatter should not add unnecessary restickify ops.
+        # Compliant 2D scatter should have no destination restickify ops.
         restickify_count = self.count_restickify_ops(code[0])
-        self.assertLessEqual(
+        self.assertEqual(
             restickify_count,
-            1,
-            f"Unnecessary copies for compliant 2D scatter: {restickify_count}",
+            0,
+            f"Compliant scatter destination should have no restickify ops, got {restickify_count}",
         )
 
     def test_scatter_batched_non_leading_dim_needs_copy(self):
