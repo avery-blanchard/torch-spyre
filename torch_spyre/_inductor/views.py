@@ -771,17 +771,19 @@ def align_tensors_pure(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                # Skip stick-size exclusion for index tensors (stick_dim[i] is None)
-                if stick_dim[i] is None or den != stick_size[i] or var != stick_dim[i]:
-                    # add den to splits unless stick dim and stick size
+                # For index tensors (stick_dim[i] is None), add all split factors.
+                # For normal tensors, exclude stick dim/size to preserve stick boundaries.
+                is_stick_tensor = stick_dim[i] is not None
+                is_stick_var = is_stick_tensor and var == stick_dim[i]
+                if not is_stick_var or den != stick_size[i]:
+                    # add den to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(den)
                 if (
-                    stick_dim[i] is None
+                    not is_stick_var
                     or mod != stick_size[i]
-                    or var != stick_dim[i]
                     or var in repeat_info.keys()
                 ):
-                    # add mod to splits unless stick dim and stick size
+                    # add mod to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(mod)
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors

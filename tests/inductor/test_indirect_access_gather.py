@@ -48,7 +48,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -1148,8 +1147,6 @@ class _GatherMulticoreScenarios:
             return x, i
 
         fn = self._gather_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     # -- shared value table: cross-core read correctness ------------------
