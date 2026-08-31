@@ -735,8 +735,8 @@ def align_tensors_pure(
             indirect_sizes,
             _concrete_alignment_value,
         )
-        # Index tensors' entry dimensions don't follow stick-alignment constraints.
-        # Detect by checking if the last coordinate is an indirect entry dimension.
+        # Index tensors' last coordinate is an indirect entry dimension.
+        # Entry dims don't follow stick-alignment (can split at any granularity).
         last_coord_var = (
             next(iter(tensor["coordinates"][-1].free_symbols), None)
             if tensor["coordinates"]
