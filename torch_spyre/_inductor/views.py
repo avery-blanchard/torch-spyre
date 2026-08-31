@@ -719,11 +719,11 @@ def align_tensors_pure(
         _synthetic_var_idx += 1
         return var
 
-    all_terms = []  # terms for each tensor
+    all_terms: list = []  # terms for each tensor
     stick_dim: list[
         Optional[sympy.Symbol]
     ] = []  # stick var for each tensor (None for index tensors)
-    stick_size = []  # stick size for each tensor
+    stick_size: list = []  # stick size for each tensor
 
     for tensor in tensors:
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
@@ -735,13 +735,17 @@ def align_tensors_pure(
             indirect_sizes,
             _concrete_alignment_value,
         )
-        # Check if this is an index tensor: it has an indirect symbol in coordinates.
-        # Index tensors' entry dimensions are runtime row counts, not stick-shaped layouts,
-        # so they don't follow the stick-alignment invariant (split must be multiple of
-        # stick_size). Mark such tensors with stick_dim=None so they're excluded from
-        # the stick-based split clamping logic.
-        is_index_tensor = indirect_sizes is not None and any(
-            sym in indirect_sizes for sym in tensor["coordinates"][-1].free_symbols
+        # Index tensors' entry dimensions don't follow stick-alignment constraints.
+        # Detect by checking if the last coordinate is an indirect entry dimension.
+        last_coord_var = (
+            next(iter(tensor["coordinates"][-1].free_symbols), None)
+            if tensor["coordinates"]
+            else None
+        )
+        is_index_tensor = (
+            indirect_sizes is not None
+            and last_coord_var is not None
+            and last_coord_var in indirect_sizes
         )
         if is_index_tensor:
             stick_dim.append(None)
@@ -816,16 +820,23 @@ def align_tensors_pure(
             bases = {}
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
-                # Re-intersect the committed split against the basis work
-                # division used for this var.
+                # Re-intersect the committed split against the basis work division.
+                # Skip stick-count logic if v is the stick var of an index tensor
+                # (which has stick_dim[i] = None).
+                is_index_tensor_stick_var = False
                 if v == var and v in stick_dim:
-                    # Stick var: stick count. The element range would drop a
-                    # legal split when the size is not a multiple of it
-                    # (e.g. gcd(2, 67) == 1).
+                    stick_idx = stick_dim.index(v)
+                    # If the tensor with this stick var is an index tensor, stick_dim[stick_idx] is None
+                    is_index_tensor_stick_var = (
+                        stick_idx < len(stick_dim) and stick_dim[stick_idx] is None
+                    )
+
+                if v == var and v in stick_dim and not is_index_tensor_stick_var:
+                    # Stick var of normal tensor: use stick count.
                     eps = int(stick_size[stick_dim.index(v)])
-                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                    basis = (int(new_var_ranges[v]) + eps - 1) // eps
                 else:
-                    # Non-stick var (or synthetic sub-dim): element range.
+                    # Non-stick var or stick var of index tensor: use element range.
                     basis = new_var_ranges[v]
                 bases[v] = int(basis)
                 new_op_it_space_splits[v] = math.gcd(div, basis)
