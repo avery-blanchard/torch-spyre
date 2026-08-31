@@ -586,13 +586,9 @@ def _enforce_scatter_destination_layout(
         )
         return
 
-    # Compute write coordinates against the target's layout and find positions
-    # of IndirectAccess markers. The sizes must be the scatter's real
-    # indirect_sizes -- device_coordinates drops indirect symbols outright when
-    # passed None, so the marker search below could never match -- and they
-    # must be resolved against the *target's* layout/strides, since that is
-    # the layout write_coords is computed against (the target and output
-    # layouts can differ; that's exactly why this branch is reached).
+    # Compute write coordinates against target layout. Sizes must be resolved
+    # against target's strides (not output's), since coordinates are computed
+    # against target_stl.
     if target_fixed_tiled_layout is not None:
         subs_from_op, scatter_sizes = _scatter_access_subs_and_sizes(
             scatter_op, target_fixed_tiled_layout, write_dep
@@ -600,19 +596,18 @@ def _enforce_scatter_destination_layout(
         if subs_from_op:
             scatter_access_subs = subs_from_op
     else:
-        scatter_sizes = {}
+        logger.debug(
+            "scatter_destination_check: skipping %s: target is non-FixedTiledLayout",
+            scatter_op.get_name(),
+        )
+        return
     try:
         write_coords = device_coordinates(target_stl, write_dep, scatter_sizes)
-    except Unsupported:
-        # A scatter symbol's size could not be resolved against the target's
-        # layout, so compliance cannot be determined here. Skip enforcement
-        # rather than falling back to an unconditional (possibly unnecessary)
-        # copy -- mirrors the other "cannot enforce" branches above.
+    except Unsupported as e:
         logger.debug(
-            "scatter_destination_check: skipping %s: could not resolve indirect "
-            "sizes against target %r layout",
+            "scatter_destination_check: skipping %s: could not resolve sizes: %s",
             scatter_op.get_name(),
-            target_name,
+            str(e),
         )
         return
     indirect_stride_idxs = []
@@ -621,14 +616,11 @@ def _enforce_scatter_destination_layout(
         if hasattr(substituted, "has") and substituted.has(IndirectAccess):
             indirect_stride_idxs.append(idx)
 
-    # Check compliance: all indirect positions must be at the front (positions 0, 1, ...).
     is_compliant = False
     if indirect_stride_idxs:
-        # Convert stride_idx (from right) to device_pos (from left).
         indirect_device_pos = sorted(
             len(target_stl.stride_map) - 1 - idx for idx in indirect_stride_idxs
         )
-        # Indirect dims must occupy the first N positions (0, 1, ..., N-1).
         expected_pos = list(range(len(indirect_stride_idxs)))
         is_compliant = indirect_device_pos == expected_pos
         logger.debug(
