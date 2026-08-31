@@ -1947,6 +1947,16 @@ def compute_restickify_needed(
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
+    if target_stick == sympy.S.Zero and in_stick_offset_free and _is_matmul_op(op):
+        # The output stick is 0 (sparse) and the input is clean-dense.  For
+        # matmul, y may legally arrive sparse when N=1 collapses the N symbol.
+        # Build a sparse target STL directly — dim_order [..., -1] means the
+        # stick dimension is not mapped to any host dim (sparse/broadcast).
+        host_size = [concretize_expr(s) for s in in_host.size]
+        host_stride = [concretize_expr(s) for s in in_host.stride]
+        dim_order = list(range(len(host_size))) + [-1]
+        return True, SpyreTensorLayout(host_size, host_stride, in_host.dtype, dim_order)
+
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
         # No output dim carries the input's stick var, so compute_restickify_target_layout
         # would fail to match. Promote the reduction var to the stick dimension so the
