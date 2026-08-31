@@ -553,7 +553,9 @@ def align_tensors(
         return var
 
     all_terms = []  # terms for each tensor
-    stick_dim = []  # stick var for each tensor
+    stick_dim: list[
+        Optional[sympy.Symbol]
+    ] = []  # stick var for each tensor (None for index tensors)
     stick_size = []  # stick size for each tensor
 
     for tensor in tensors:
@@ -565,8 +567,23 @@ def align_tensors(
             synthetic_var,
             indirect_sizes,
         )
-        stick_dim.append(terms[-1].var)
-        stick_size.append(terms[-1].dim_size)
+        # Check if this is an index tensor: its last coordinate is an indirect entry dimension.
+        # Index tensors' entry dimensions are runtime row counts, not stick-shaped layouts,
+        # so they don't follow the stick-alignment invariant (split must be multiple of
+        # stick_size). Mark such tensors with stick_dim=None so they're excluded from
+        # the stick-based split factor collection.
+        last_coord_syms = (
+            tensor["coordinates"][-1].free_symbols if tensor["coordinates"] else set()
+        )
+        is_index_tensor = indirect_sizes is not None and any(
+            sym in indirect_sizes for sym in last_coord_syms
+        )
+        if is_index_tensor:
+            stick_dim.append(None)
+            stick_size.append(1)
+        else:
+            stick_dim.append(terms[-1].var)
+            stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
 
     _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
@@ -589,15 +606,19 @@ def align_tensors(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                if den != stick_size[i] or var != stick_dim[i]:
-                    # add den to splits unless stick dim and stick size
+                # For index tensors (stick_dim[i] is None), add all split factors.
+                # For normal tensors, exclude stick dim/size to preserve stick boundaries.
+                is_stick_tensor = stick_dim[i] is not None
+                is_stick_var = is_stick_tensor and var == stick_dim[i]
+                if not is_stick_var or den != stick_size[i]:
+                    # add den to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(den)
                 if (
-                    mod != stick_size[i]
-                    or var != stick_dim[i]
+                    not is_stick_var
+                    or mod != stick_size[i]
                     or var in repeat_info.keys()
                 ):
-                    # add mod to splits unless stick dim and stick size
+                    # add mod to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(mod)
 
     if hasattr(V.graph, "_repeat_info"):
