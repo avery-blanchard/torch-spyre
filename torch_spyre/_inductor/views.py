@@ -679,6 +679,31 @@ def _concrete_alignment_value(expr: sympy.Expr) -> int | float:
     return int(expr)
 
 
+def _is_index_tensor(tensor: dict, tensors: list[dict]) -> bool:
+    """Identify index tensor by comparing dimensions to indirect access tensor.
+
+    The index tensor is missing dimensions that appear in the tensor
+    with IndirectAccess in its symbolic coordinates.
+    """
+    if not tensor["coordinates"]:
+        return False
+
+    # Find which tensor(s) might have indirect access
+    # (they would have variables or patterns suggesting indirect indexing)
+    tensor_coord_len = len(tensor["coordinates"])
+
+    # Index tensor has fewer distinct coordinates than value tensor
+    for other in tensors:
+        if other is tensor:
+            continue
+        if len(other["coordinates"]) > tensor_coord_len:
+            # other has more coords, so this tensor might be index tensor
+            # Verify: all coords of this tensor should appear in other
+            return True
+
+    return False
+
+
 def align_tensors_pure(
     inputs: AlignmentInputs,
 ) -> tuple[
@@ -724,8 +749,9 @@ def align_tensors_pure(
         Optional[sympy.Symbol]
     ] = []  # stick var for each tensor (None for index tensors)
     stick_size: list = []  # stick size for each tensor
+    index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    for tensor in tensors:
+    for tensor_idx, tensor in enumerate(tensors):
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
         terms = normalize_coordinates(
             var_ranges,
@@ -735,21 +761,21 @@ def align_tensors_pure(
             indirect_sizes,
             _concrete_alignment_value,
         )
-        # Index tensors' last coordinate is an indirect entry dimension.
-        # Entry dims don't follow stick-alignment (can split at any granularity).
-        last_coord_var = (
-            next(iter(tensor["coordinates"][-1].free_symbols), None)
-            if tensor["coordinates"]
-            else None
+        # Index tensors have fewer coordinate dimensions than value tensors.
+        # Their entry dimension doesn't follow stick-alignment constraints.
+        is_index_tensor = indirect_sizes is not None and _is_index_tensor(
+            tensor, tensors
         )
-        is_index_tensor = (
-            indirect_sizes is not None
-            and last_coord_var is not None
-            and last_coord_var in indirect_sizes
+        import sys
+
+        print(
+            f"[align_tensors] tensor {tensor_idx}: coords={tensor['coordinates']}, is_index={is_index_tensor}",
+            file=sys.stderr,
         )
         if is_index_tensor:
             stick_dim.append(None)
             stick_size.append(1)
+            index_tensor_indices.add(tensor_idx)
         else:
             stick_dim.append(terms[-1].var)
             stick_size.append(terms[-1].dim_size)
@@ -821,26 +847,36 @@ def align_tensors_pure(
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
                 # Re-intersect the committed split against the basis work division.
-                # Skip stick-count logic if v is the stick var of an index tensor
-                # (which has stick_dim[i] = None).
+                # Skip stick-count logic if v is the stick var of an index tensor.
                 is_index_tensor_stick_var = False
                 if v == var and v in stick_dim:
                     stick_idx = stick_dim.index(v)
-                    # If the tensor with this stick var is an index tensor, stick_dim[stick_idx] is None
-                    is_index_tensor_stick_var = (
-                        stick_idx < len(stick_dim) and stick_dim[stick_idx] is None
-                    )
+                    is_index_tensor_stick_var = stick_idx in index_tensor_indices
+
+                import sys
+
+                print(
+                    f"[align_tensors remap] var={var}, v={v}, v_in_stick_dim={v in stick_dim}, is_index_tensor_stick_var={is_index_tensor_stick_var}, new_var_ranges[v]={new_var_ranges.get(v)}, div={div}",
+                    file=sys.stderr,
+                )
 
                 if v == var and v in stick_dim and not is_index_tensor_stick_var:
                     # Stick var of normal tensor: use stick count.
                     eps = int(stick_size[stick_dim.index(v)])
                     basis = (int(new_var_ranges[v]) + eps - 1) // eps
+                    print(
+                        f"  -> using stick count: eps={eps}, basis={basis}",
+                        file=sys.stderr,
+                    )
                 else:
                     # Non-stick var or stick var of index tensor: use element range.
                     basis = new_var_ranges[v]
+                    print(f"  -> using element range: basis={basis}", file=sys.stderr)
                 bases[v] = int(basis)
-                new_op_it_space_splits[v] = math.gcd(div, basis)
-                div //= new_op_it_space_splits[v]
+                new_split = math.gcd(div, basis)
+                print(f"  -> gcd({div}, {basis}) = {new_split}", file=sys.stderr)
+                new_op_it_space_splits[v] = new_split
+                div //= new_split
             work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
         else:
             # no splits keep existing var, range, and work division
