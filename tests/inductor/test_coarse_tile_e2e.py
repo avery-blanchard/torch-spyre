@@ -41,6 +41,7 @@ ORIGINAL TESTS (below the boundary marker)
     Original class-based tests preserved for coverage and reference, to be cleaned up in future.
 """
 
+import ast
 import dataclasses
 import math
 import os
@@ -6598,7 +6599,297 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return x.sum(dim=0)
 
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            x,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_hinted_terminal_sum_is_carried_in_lx(self):
+        """A terminal E sum keeps one [T,H] running value in LX."""
+
+        E, T, H = 2, 64, 64
+        base = torch.linspace(-4.0, 4.0, E * T * H, dtype=torch.float32)
+        values = base.reshape(E, T, H).to(torch.float16)
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertIn("LoopSpec(", source)
+            self.assertIn("coarse_tile_reduction_drain", source)
+            self.assertIn("'lx'", source)
+
+        with config.patch({"sencores": 32, "lx_planning": True}):
+            compare_with_cpu(
+                fn,
+                values,
+                run_compile=True,
+                run_eager=False,
+                source_check=check_source,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    def test_hinted_terminal_sum_e128_matches_ordinary_and_cpu(self):
+        """The E=128 carried sum preserves the existing reduction result."""
+
+        E, T, H = 128, 64, 64
+        values = (
+            torch.linspace(-3.0, 4.0, E * T * H, dtype=torch.float32)
+            .reshape(E, T, H)
+            .to(torch.float16)
+        )
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def ordinary(values):
+            return values.sum(dim=0)
+
+        def carried(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertIn("LoopSpec(count=sympify('128')", source)
+            self.assertIn("coarse_tile_reduction_drain", source)
+            self.assertIn("'lx'", source)
+
+        with config.patch({"sencores": 32, "lx_planning": True}):
+            ordinary_result = _compile_and_run(ordinary, (values,), "spyre")
+            _declare_tensor_dim("E", E)
+            _declare_tensor_dim("T", T)
+            _declare_tensor_dim("H", H)
+            carried_result = _compile_and_run(
+                carried, (values,), "spyre", source_check=check_source
+            )
+
+        cpu_result = ordinary(values)
+        torch.testing.assert_close(carried_result, ordinary_result, atol=1.0, rtol=0.05)
+        torch.testing.assert_close(carried_result, cpu_result, atol=1.0, rtol=0.05)
+
+    def test_carried_sum_hbm_fallback_is_correct_and_visible(self):
+        """Capacity spill keeps correct execution and emits a warning."""
+
+        E, T, H = 2, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertIn("coarse_tile_reduction_drain", source)
+            self.assertNotIn("'lx'", source)
+
+        with (
+            config.patch(
+                {
+                    "sencores": 32,
+                    "lx_planning": True,
+                    "dxp_lx_frac_avail": 1.0,
+                }
+            ),
+            self.assertLogs("spyre.inductor.scheduler", level="WARNING") as logs,
+        ):
+            compare_with_cpu(
+                fn,
+                values,
+                run_compile=True,
+                run_eager=False,
+                source_check=check_source,
+                atol=0.05,
+                rtol=0.05,
+            )
+        self.assertTrue(any("remained in HBM" in line for line in logs.output))
+
+    def test_carried_sum_requires_explicit_work_div(self):
+        """Without row ownership, the existing reduction path is unchanged."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(num_tiles_per_dim={"E": 2}):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_carried_sum_does_not_apply_without_an_expert_loop(self):
+        """E=1 remains an ordinary reduction because there is nothing to carry."""
+
+        E, T, H = 1, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_carried_sum_does_not_apply_to_nested_tiling(self):
+        """Tiling an output axis keeps the existing nested-reduction path."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"T": 2},
+                work_div={"T": 32},
+            ):
+                with spyre_hint(num_tiles_per_dim={"E": 2}):
+                    return values.sum(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=0.05,
+            rtol=0.05,
+        )
+
+    def test_carried_sum_requires_terminal_reduction(self):
+        """A sum with a consumer retains the existing unsupported result."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": 2},
+                work_div={"T": 32},
+            ):
+                reduced = values.sum(dim=0)
+                return reduced + 1
+
+        with self.assertRaisesRegex(
+            Exception, "partial reduction result consumed before accumulation"
+        ):
+            _compile_and_run(fn, (values,), "spyre")
+
+    def test_carried_sum_rejects_reduction_dim_work_div(self):
+        """The hint must name an output row, not the reduced expert dim."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16) * 0.1
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": 2},
+                work_div={"E": 2},
+            ):
+                return values.sum(dim=0)
+
+        with self.assertRaisesRegex(Exception, "work_div on an output row dimension"):
+            _compile_and_run(fn, (values,), "spyre")
+
+    def test_carried_sum_does_not_apply_to_max(self):
+        """Only sums are converted into loop-carried accumulators."""
+
+        E, T, H = 4, 64, 64
+        values = torch.randn(E, T, H, dtype=torch.float16)
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+
+        def fn(values):
+            _name_tensor_dims(values, ["E", "T", "H"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": 2},
+                work_div={"T": 32},
+            ):
+                return values.amax(dim=0)
+
+        def check_source(source):
+            self.assertNotIn("coarse_tile_reduction_drain", source)
+
+        compare_with_cpu(
+            fn,
+            values,
+            run_compile=True,
+            run_eager=False,
+            source_check=check_source,
+            atol=1e-3,
+            rtol=1e-3,
+        )
 
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
@@ -6795,8 +7086,8 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    def test_unsqueeze_broadcast_matmul_emits_expert_weight_step(self):
-        """The read of packed weights advances once per expert loop trip."""
+    def test_unsqueeze_broadcast_matmul_reads_expert_weights_directly(self):
+        """Activation stays fixed while weights advance without staging."""
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 3, 64, 64, 64
@@ -6820,15 +7111,137 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, w)
 
+        tensor_args = []
+        for node in ast.walk(ast.parse(source_codes[0])):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TensorArg"
+            ):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            size_node = keywords.get("device_size")
+            if not isinstance(size_node, ast.List):
+                continue
+            size = [ast.literal_eval(elt) for elt in size_node.elts]
+            advance_node = keywords.get("device_tile_advance_expr")
+            advance = (
+                ast.literal_eval(advance_node.args[0])
+                if isinstance(advance_node, ast.Call) and advance_node.args
+                else None
+            )
+            tensor_args.append((ast.literal_eval(keywords["is_input"]), size, advance))
+
+        activation_reads = [
+            advance
+            for is_input, size, advance in tensor_args
+            if is_input and size == [1, T, H]
+        ]
+        self.assertEqual(activation_reads, [None])
+
+        weight_reads = [
+            advance
+            for is_input, size, advance in tensor_args
+            if is_input and size == [1, H, E, F]
+        ]
+        self.assertEqual(len(weight_reads), 1)
+        self.assertIsInstance(weight_reads[0], str)
+        weight_step = re.fullmatch(r"floor\((\d+)\*[^)]+\)", weight_reads[0])
+        self.assertIsNotNone(weight_step)
+        # TensorArg addresses are in df16 sticks.  64 sticks * 64 elements
+        # per stick is one H*F = 4096-element expert slab.
+        self.assertEqual(int(weight_step.group(1)) * 64, H * F)
+        self.assertNotIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+
+    def test_unsqueeze_broadcast_matmul_keeps_copy_when_proof_declines(self):
+        """A failed proof leaves the original staging copy authoritative."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 3, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16).to("spyre")
+        w = torch.randn(E, H, F, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read",
+                return_value=(None, "forced test decline"),
+            ),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, w)
+
         src = source_codes[0]
-        weight_copy = re.search(
-            r"op='identity'.*?arg_index=1.*?"
-            r"device_tile_advance_expr=sympify\('([^']+)'\)",
-            src,
-            flags=re.DOTALL,
+        self.assertIn("coarse_tile_read_copy_0_arg1_1", src)
+
+    def test_unsqueeze_broadcast_matmul_keeps_copy_for_different_core_views(self):
+        """A legal but different source ownership cannot replace the copy."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 3, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16).to("spyre")
+        w = torch.randn(E, H, F, dtype=torch.float16).to("spyre")
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch(
+                "torch_spyre._inductor.read_copy_elision._per_core_view_on_buf",
+                side_effect=[
+                    ("output", None, True),
+                    ("output", None, True),
+                    ("staged-weight", None, True),
+                    ("direct-weight", None, True),
+                ],
+            ),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, w)
+
+        self.assertIn("coarse_tile_read_copy_0_arg1_1", source_codes[0])
+
+    def test_unsqueeze_broadcast_matmul_distinguishes_experts_exactly(self):
+        """Each trip reads its own weight slab, not expert zero or stale HBM."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 3, 64, 64, 64
+        x = torch.eye(T, H, dtype=torch.float16)
+        w = torch.stack(
+            [torch.eye(H, F, dtype=torch.float16) * scale for scale in range(1, E + 1)]
         )
-        self.assertIsNotNone(weight_copy)
-        self.assertIn("_tile_adv_coarse_tile_read_copy", weight_copy.group(1))
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        compare_with_cpu(fn, x, w, run_compile=True, run_eager=False, atol=0, rtol=0)
 
     def test_unsqueeze_broadcast_matmul_tile_E_poisoned_correct(self):
         """Same pattern as test_unsqueeze_broadcast_matmul_tile_E_correct,
