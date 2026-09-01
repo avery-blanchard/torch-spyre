@@ -684,21 +684,37 @@ def _is_index_tensor(
 ) -> bool:
     """Identify index tensor when indirect access is present.
 
-    Index tensor has fewer coordinate dimensions than other tensors,
-    and does NOT contain indirect variables in its coordinates.
+    Index tensor does NOT have IndirectAccess in its coordinates,
+    while other tensors do. Index tensor also has fewer dimensions.
     """
-    if indirect_sizes is None or not tensor["coordinates"]:
+    if not indirect_sizes or not tensor["coordinates"]:
         return False
 
-    # Index tensor must NOT reference indirect variables
-    for coord in tensor["coordinates"]:
-        coord_vars = coord.free_symbols if hasattr(coord, "free_symbols") else set()
-        if any(v in indirect_sizes for v in coord_vars):
-            return False  # Contains indirect var, so not the index tensor
+    def has_indirect_access(coords):
+        """Check if any coordinate contains IndirectAccess."""
+        for coord in coords:
+            # Check if coord is or contains an IndirectAccess object
+            if hasattr(coord, "__class__") and "IndirectAccess" in str(
+                coord.__class__.__name__
+            ):
+                return True
+        return False
 
+    # Index tensor must NOT have IndirectAccess in its coordinates
+    if has_indirect_access(tensor["coordinates"]):
+        return False
+
+    # At least one other tensor must have IndirectAccess
+    has_indirect_tensor = any(
+        has_indirect_access(other["coordinates"])
+        for other in tensors
+        if other is not tensor
+    )
+    if not has_indirect_tensor:
+        return False
+
+    # Index tensor typically has fewer coordinates
     tensor_coord_len = len(tensor["coordinates"])
-
-    # Index tensor has fewer coordinates than some other tensor
     for other in tensors:
         if other is not tensor and len(other["coordinates"]) > tensor_coord_len:
             return True
