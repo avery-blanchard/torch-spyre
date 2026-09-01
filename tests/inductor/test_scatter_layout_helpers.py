@@ -23,8 +23,9 @@ Tests the core layout-checking logic in enforce_indirect_access_layout.py:
 import unittest
 
 import sympy
+import torch
 
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor.enforce_indirect_access_layout import (
     _dim_order_is_compliant,
     _indirect_stride_idx,
@@ -41,7 +42,7 @@ class TestDimOrderCompliance(unittest.TestCase):
         stl = SpyreTensorLayout(
             device_size=[8, 2, 64, 1],
             stride_map=[128, 64, 1, 1],
-            device_dtype=15,  # fp16
+            device_dtype=get_device_dtype(torch.float16),
         )
         # stride_idx from right: 3 (rightmost coordinate)
         # device_pos = 4 - 1 - 3 = 0 ✓
@@ -52,7 +53,7 @@ class TestDimOrderCompliance(unittest.TestCase):
         stl = SpyreTensorLayout(
             device_size=[2, 8, 64, 1],
             stride_map=[512, 64, 1, 1],
-            device_dtype=15,
+            device_dtype=get_device_dtype(torch.float16),
         )
         # stride_idx from right: 2
         # device_pos = 4 - 1 - 2 = 1 ✗
@@ -63,7 +64,7 @@ class TestDimOrderCompliance(unittest.TestCase):
         stl = SpyreTensorLayout(
             device_size=[2, 4, 64, 1],
             stride_map=[256, 64, 1, 1],
-            device_dtype=15,
+            device_dtype=get_device_dtype(torch.float16),
         )
         # stride_idx from right: 1
         # device_pos = 4 - 1 - 1 = 2 ✗
@@ -133,7 +134,7 @@ class TestBuildRequiredStl(unittest.TestCase):
         original_stl = SpyreTensorLayout(
             device_size=[2, 4, 8, 1],
             stride_map=[256, 64, 1, 1],
-            device_dtype=15,
+            device_dtype=get_device_dtype(torch.float16),
         )
         required_stl = _build_required_stl(original_stl, indirect_device_pos=2)
 
@@ -149,7 +150,7 @@ class TestBuildRequiredStl(unittest.TestCase):
         original_stl = SpyreTensorLayout(
             device_size=[8, 2, 64, 1],
             stride_map=[128, 64, 1, 1],
-            device_dtype=15,
+            device_dtype=get_device_dtype(torch.float16),
         )
         required_stl = _build_required_stl(original_stl, indirect_device_pos=0)
 
@@ -161,7 +162,7 @@ class TestBuildRequiredStl(unittest.TestCase):
         original_stl = SpyreTensorLayout(
             device_size=[2, 8, 64, 1],
             stride_map=[512, 64, 1, 1],
-            device_dtype=15,
+            device_dtype=get_device_dtype(torch.float16),
         )
         required_stl = _build_required_stl(original_stl, indirect_device_pos=1)
 
