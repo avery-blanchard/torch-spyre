@@ -113,7 +113,7 @@ class TestIndirectStrideIdx(unittest.TestCase):
         self.assertIsNone(stride_idx)
 
     def test_finds_first_indirect_from_right(self):
-        """Returns index of first (rightmost) IndirectAccess."""
+        """Returns stride_idx (0-indexed from right) of first IndirectAccess."""
         idx_sym = sympy.Symbol("idx")
         coords = [
             IndirectAccess(idx_sym),
@@ -123,7 +123,9 @@ class TestIndirectStrideIdx(unittest.TestCase):
         ]
         access_subs = {}
         stride_idx = _indirect_stride_idx(coords, access_subs)
-        self.assertEqual(stride_idx, 1)  # rightmost indirect
+        # rightmost IndirectAccess is at index 1 in original list
+        # which is index 2 in reversed list (4 - 1 - 1 = 2)
+        self.assertEqual(stride_idx, 2)
 
 
 class TestBuildRequiredStl(unittest.TestCase):
