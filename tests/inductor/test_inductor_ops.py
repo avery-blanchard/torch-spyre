@@ -8390,14 +8390,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    def test_matmul_transformer_3d_linear(self):
-        """3D matmul with transformer inference shapes."""
-
+    def test_matmul_bs1_3d_linear(self):
         def fn(x, w):
             return torch.matmul(x, w.T)
 
-        x = torch.randn(1, 16, 4096, dtype=torch.float16)
-        w = torch.randn(6144, 4096, dtype=torch.float16)
+        x = cached_xavier((1, 16, 4096))
+        w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
 
