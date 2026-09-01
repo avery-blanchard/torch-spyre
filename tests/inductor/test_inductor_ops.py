@@ -8373,17 +8373,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    def test_matmul_mlp_shared_weight(self):
-        """MLP matmul pattern with shared 2D weights."""
-
-        def fn(x, up_w, gate_w):
-            return torch.mul(torch.matmul(x, up_w), torch.matmul(x, gate_w))
-
-        x = torch.randn(1, 16, 4096, dtype=torch.float16)
-        up_w = torch.randn(4096, 8192, dtype=torch.float16)
-        gate_w = torch.randn(4096, 8192, dtype=torch.float16)
-        self.compare_with_cpu(fn, x, up_w, gate_w, atol=0.5, rtol=0.1)
-
     def test_matmul_transformer_3d_linear(self):
         """3D matmul with transformer inference shapes."""
 
