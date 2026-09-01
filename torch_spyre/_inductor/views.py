@@ -679,26 +679,28 @@ def _concrete_alignment_value(expr: sympy.Expr) -> int | float:
     return int(expr)
 
 
-def _is_index_tensor(tensor: dict, tensors: list[dict]) -> bool:
-    """Identify index tensor by comparing dimensions to indirect access tensor.
+def _is_index_tensor(
+    tensor: dict, tensors: list[dict], indirect_sizes: dict | None
+) -> bool:
+    """Identify index tensor when indirect access is present.
 
-    The index tensor is missing dimensions that appear in the tensor
-    with IndirectAccess in its symbolic coordinates.
+    Index tensor has fewer coordinate dimensions than other tensors,
+    and does NOT contain indirect variables in its coordinates.
     """
-    if not tensor["coordinates"]:
+    if indirect_sizes is None or not tensor["coordinates"]:
         return False
 
-    # Find which tensor(s) might have indirect access
-    # (they would have variables or patterns suggesting indirect indexing)
+    # Index tensor must NOT reference indirect variables
+    for coord in tensor["coordinates"]:
+        coord_vars = coord.free_symbols if hasattr(coord, "free_symbols") else set()
+        if any(v in indirect_sizes for v in coord_vars):
+            return False  # Contains indirect var, so not the index tensor
+
     tensor_coord_len = len(tensor["coordinates"])
 
-    # Index tensor has fewer distinct coordinates than value tensor
+    # Index tensor has fewer coordinates than some other tensor
     for other in tensors:
-        if other is tensor:
-            continue
-        if len(other["coordinates"]) > tensor_coord_len:
-            # other has more coords, so this tensor might be index tensor
-            # Verify: all coords of this tensor should appear in other
+        if other is not tensor and len(other["coordinates"]) > tensor_coord_len:
             return True
 
     return False
@@ -763,15 +765,7 @@ def align_tensors_pure(
         )
         # Index tensors have fewer coordinate dimensions than value tensors.
         # Their entry dimension doesn't follow stick-alignment constraints.
-        is_index_tensor = indirect_sizes is not None and _is_index_tensor(
-            tensor, tensors
-        )
-        import sys
-
-        print(
-            f"[align_tensors] tensor {tensor_idx}: coords={tensor['coordinates']}, is_index={is_index_tensor}",
-            file=sys.stderr,
-        )
+        is_index_tensor = _is_index_tensor(tensor, tensors, indirect_sizes)
         if is_index_tensor:
             stick_dim.append(None)
             stick_size.append(1)
@@ -853,30 +847,16 @@ def align_tensors_pure(
                     stick_idx = stick_dim.index(v)
                     is_index_tensor_stick_var = stick_idx in index_tensor_indices
 
-                import sys
-
-                print(
-                    f"[align_tensors remap] var={var}, v={v}, v_in_stick_dim={v in stick_dim}, is_index_tensor_stick_var={is_index_tensor_stick_var}, new_var_ranges[v]={new_var_ranges.get(v)}, div={div}",
-                    file=sys.stderr,
-                )
-
                 if v == var and v in stick_dim and not is_index_tensor_stick_var:
                     # Stick var of normal tensor: use stick count.
                     eps = int(stick_size[stick_dim.index(v)])
                     basis = (int(new_var_ranges[v]) + eps - 1) // eps
-                    print(
-                        f"  -> using stick count: eps={eps}, basis={basis}",
-                        file=sys.stderr,
-                    )
                 else:
                     # Non-stick var or stick var of index tensor: use element range.
                     basis = new_var_ranges[v]
-                    print(f"  -> using element range: basis={basis}", file=sys.stderr)
                 bases[v] = int(basis)
-                new_split = math.gcd(div, basis)
-                print(f"  -> gcd({div}, {basis}) = {new_split}", file=sys.stderr)
-                new_op_it_space_splits[v] = new_split
-                div //= new_split
+                new_op_it_space_splits[v] = math.gcd(div, basis)
+                div //= new_op_it_space_splits[v]
             work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
         else:
             # no splits keep existing var, range, and work division
