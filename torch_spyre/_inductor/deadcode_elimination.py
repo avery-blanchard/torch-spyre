@@ -95,3 +95,21 @@ def deadcode_elimination(graph: GraphLowering) -> None:
         for dep in rw.writes:
             graph.removed_buffers.add(dep.name)
         operations.remove(op)
+
+
+def unread_graph_input_names(graph: GraphLowering) -> frozenset[str]:
+    """Return graph inputs that no surviving operation reads.
+
+    Meant to run last in the pre-scheduling pipeline, after fusion passes
+    (e.g. split_multi_ops folding an index_select into a fused SDSC kernel)
+    may have consumed a graph input's only reader without leaving behind an
+    Operation that still reads it by name. Such an input is still part of
+    ``graph.graph_input_names`` (that list is fixed at FX-placeholder time
+    and never pruned -- see wrapper.py's codegen_input_size_asserts override)
+    but codegen no longer has anything useful to assert about it.
+    """
+    read_names: set[str] = set()
+    for op in graph.operations:
+        for dep in op.get_read_writes().reads:
+            read_names.add(dep.name)
+    return frozenset(graph.graph_input_names) - read_names

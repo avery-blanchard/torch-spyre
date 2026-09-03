@@ -89,7 +89,7 @@ from .scheduler import (
     verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
-from .deadcode_elimination import deadcode_elimination
+from .deadcode_elimination import deadcode_elimination, unread_graph_input_names
 from .dedup_constants import dedup_and_promote_constants
 from .read_copy_elision import elide_proven_read_copies
 from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
@@ -418,6 +418,14 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     scratchpad_planning(graph)
 
 
+def _record_unread_graph_input_names(graph: GraphLowering) -> None:
+    # Stashed for SpyrePythonWrapperCodegen.codegen_input_size_asserts (see
+    # wrapper.py), which needs this post-fusion liveness result but runs
+    # from PythonWrapperCodegen.__init__ -- before this pipeline executes.
+    # It reads the attribute lazily via a DeferredLineBase.
+    graph._spyre_unread_graph_input_names = unread_graph_input_names(graph)
+
+
 class CustomPreSchedulingPasses:
     """
     Spyre-specific passes that run on the GraphLowering immediately before the
@@ -493,6 +501,9 @@ class CustomPreSchedulingPasses:
             # Preserve copies through physical planning, then remove only
             # those whose direct-read form is proven equivalent.
             elide_proven_read_copies,
+            # Must run last: relies on every fusion/rewrite pass above having
+            # already reached its final graph.operations shape.
+            _record_unread_graph_input_names,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:

@@ -20,12 +20,47 @@ from torch._inductor.codegen.wrapper import (
     PythonWrapperCodegen,
     SubgraphPythonWrapperCodegen,
 )
-from torch._inductor.ir import GraphPartitionSignature
+from torch._inductor.ir import GeneratorState, GraphPartitionSignature, TorchBindObject
+from torch._inductor.utils import DeferredLineBase, sympy_product
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+
+
+class _DeferredInputSizeAssertLine(DeferredLineBase):
+    """An assert_size_stride line for a graph input, dropped if that input
+    turns out to have no reader left once Spyre's pre-scheduling pass
+    pipeline (split_multi_ops et al.) finishes.
+
+    This line is written from PythonWrapperCodegen.__init__ (via
+    write_prefix), which runs before GraphLowering._update_scheduler --
+    i.e. before graph._spyre_unread_graph_input_names exists (see
+    _record_unread_graph_input_names in passes.py). Resolution is deferred
+    to codegen finalization (IndentedBuffer.getvalue), by which point the
+    pipeline has already run, so the attribute is always present.
+
+    Binds to the specific GraphLowering passed at construction time (the one
+    active when write_prefix ran) rather than reading V.graph at resolution
+    time: for an invoke_subgraph body, the subgraph's wrapper lines are
+    resolved later from the PARENT's generate() call, by which point V.graph
+    is the parent, not the subgraph these lines were written for.
+    """
+
+    def __init__(self, graph, input_name: str, line: str):
+        super().__init__(line)
+        self.graph = graph
+        self.input_name = input_name
+
+    def __call__(self) -> Optional[str]:
+        dead: frozenset[str] = getattr(
+            self.graph, "_spyre_unread_graph_input_names", frozenset()
+        )
+        return None if self.input_name in dead else self.line
+
+    def _new_line(self, line: str) -> "_DeferredInputSizeAssertLine":
+        return _DeferredInputSizeAssertLine(self.graph, self.input_name, line)
 
 
 class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
@@ -67,6 +102,27 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
         )
 
         return out
+
+    def codegen_input_size_asserts(self) -> None:
+        # Same skip conditions as PythonWrapperCodegen.codegen_input_size_asserts,
+        # except the emitted line is deferred so it can self-elide once a graph
+        # input turns out to have no reader left after Spyre's pre-scheduling
+        # pass pipeline runs (e.g. an index_select folded into a fused SDSC
+        # kernel by split_multi_ops -- see _DeferredInputSizeAssertLine).
+        for name, buf in self.get_graph_inputs().items():
+            if isinstance(buf, (sympy.Expr, TorchBindObject)):
+                continue
+            if name not in V.graph.graph_input_names or isinstance(buf, GeneratorState):
+                continue
+            if sympy_product(buf.get_size()) == 0:
+                continue
+            size = self.codegen_python_shape_tuple(buf.get_size())
+            stride = self.codegen_python_shape_tuple(buf.get_stride())
+            self.prefix.writeline(
+                _DeferredInputSizeAssertLine(
+                    V.graph, name, f"assert_size_stride({name}, {size}, {stride})"
+                )
+            )
 
     def generate_const_tensor_fallback(self, node):
         value = node.constant_args[0]
