@@ -8491,29 +8491,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
     def test_index_select_reshape_matmul_4033(self):
-        """Regression test for issue #4033: index_select + reshape + matmul.
+        """Regression test for issue #4033: fused index_select + reshape + matmul.
 
-        Verifies specific operation sequence does not trigger compute
-        control block error (NQ=1, PAGES=2, D=128, BLOCK=128).
+        Verifies that the specific kernel pattern (multi-index gather + reshape
+        + matmul with NKV=4, NQ=1, D=128, PAGES=2, BLOCK=128) compiles and
+        runs correctly. This was the exact configuration that triggered
+        the dead arguments bug where gather indices were still passed to kernel
+        .run() calls despite being simplified away.
         See: https://github.com/torch-spyre/torch-spyre/issues/4033
         """
+        NKV = 4
         NQ = 1
-        PAGES = 2
         D = 128
+        PAGES = 2
         BLOCK = 128
+        H = NKV * NQ
 
-        def fn(queries, keys, indices):
-            selected_keys = keys[indices]
-            queries_expanded = queries.unsqueeze(1)
-            keys_expanded = selected_keys.unsqueeze(0)
-            return torch.matmul(queries_expanded, keys_expanded.transpose(-2, -1))
+        def fn(query, query_idx, k_pages, page_idx):
+            query = query.reshape(1, H, D).contiguous()
+            q = query.index_select(0, query_idx).reshape(NKV, NQ, 1, D)
+            k = k_pages.index_select(0, page_idx).reshape(NKV, 1, BLOCK, D)
+            return torch.matmul(q, k)
 
-        queries = cached_randn((NQ, D))
-        keys = cached_randn((PAGES * BLOCK, D))
-        indices = torch.tensor([0, BLOCK // 2], dtype=torch.long)
+        torch.manual_seed(0)
+        k_pages = torch.randn(PAGES, BLOCK, NKV, D, dtype=torch.float16).mul_(0.1)
+        query = torch.randn(1, H * D, dtype=torch.float16)
+        query_idx = torch.zeros(1, dtype=torch.int32)
+        page_idx = torch.zeros(1, dtype=torch.int32)
 
         self.compare_with_cpu(
-            fn, queries, keys, indices, atol=0.2, rtol=0.2, run_eager=False
+            fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
         )
 
 
