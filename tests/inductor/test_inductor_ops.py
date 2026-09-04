@@ -8392,6 +8392,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
+    def test_index_select_reshape_matmul_4033(self):
+        """Regression test for issue #4033: index_select + reshape + matmul.
+
+        This test verifies that the specific operation sequence does not
+        trigger a hardware error on the compute control block. The bug
+        manifested with a single query row (NQ=1), 2 key-value pages, 4
+        key-value heads, 128-D embeddings, and 128-element blocks.
+
+        See: https://github.com/torch-spyre/torch-spyre/issues/4033
+        """
+        NQ = 1  # Number of query rows (1 triggers the bug)
+        PAGES = 2  # Number of key-value pages
+        D = 128  # Embedding dimension
+        BLOCK = 128  # Block size
+
+        def fn(queries, keys, indices):
+            # Gather specific rows via index_select
+            selected_keys = keys[indices]  # Shape: (len(indices), D)
+
+            # Reshape for matmul: queries (NQ, D) -> (NQ, 1, D)
+            # selected_keys (len(indices), D) -> (1, len(indices), D)
+            queries_expanded = queries.unsqueeze(1)
+            keys_expanded = selected_keys.unsqueeze(0)
+
+            # Perform batched matmul
+            return torch.matmul(queries_expanded, keys_expanded.transpose(-2, -1))
+
+        queries = cached_randn((NQ, D))
+        keys = cached_randn((PAGES * BLOCK, D))
+        indices = torch.tensor([0, BLOCK // 2], dtype=torch.long)
+
+        # The bug triggered during compilation, so test the compiled path
+        # with slightly relaxed tolerances for gather operations
+        self.compare_with_cpu(
+            fn, queries, keys, indices, atol=0.2, rtol=0.2, run_eager=False
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
