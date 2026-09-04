@@ -515,17 +515,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_access_by_tensor_arg: dict[int, AlignmentAccess] = {}
         self._alignment_inputs_by_spec: dict[int, AlignmentInputs] = {}
         self.pool_size: int = pool_size
-        # Populated by codegen_kernel(), once TensorArg.arg_index assignment
-        # has settled on the definitive set of names the op specs actually
-        # reference. call_kernel() must build its `.run()` call from this
-        # list rather than re-deriving one from python_argdefs(), which also
-        # includes any name that self.args.input()/.output() registered
-        # during initial load()/store() tracing but that no surviving
-        # TensorArg ended up needing (e.g. a gather's index tensor whose
-        # indirect access was later algebraically folded into static
-        # coordinates by simplify_op_spec) -- passing such a name into
-        # .run() would desync the positional args from the arg_index values
-        # baked into the emitted op specs.
+        # Live call args, deduped and filtered to names in spyre_kernel_args.
+        # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
+        # values match .run() positional args.
         self._live_call_arg_names: list[str] | None = None
 
     def indirect_var_names(self) -> "frozenset[str] | None":
@@ -1307,14 +1299,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return f"IndirectAccess('{name_sym}')"
             return "sympify('" + str(x) + "')"
 
-        # Now that all loads/stores have been processed we know the final kernel_args
-        # and can map names to indices. python_argdefs() includes every name that
-        # load()/store() ever registered with self.args during tracing, which can be
-        # a strict superset of the names self.spyre_kernel_args actually ended up
-        # needing (see _live_call_arg_names docstring above) -- e.g. a gather's index
-        # tensor whose only use was simplified away by simplify_op_spec. Compute the
-        # live, deduped call-arg list once here, in the same order call_kernel() will
-        # emit .run() args, so arg_index always matches that call's positional args.
+        # Compute live, deduped call-arg list from names in spyre_kernel_args.
+        # python_argdefs() includes all registered names from load()/store(),
+        # but spyre_kernel_args only has those surviving to the final op specs
+        # (excludes dead names like gather indices folded away by simplify_op_spec).
+        # Use this list for arg_index assignment so positional .run() args match.
         live_names = {name for name, _ in self.spyre_kernel_args}
         actuals = []
         seen_actuals: set[str] = set()
@@ -1390,16 +1379,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             call_args.append(pool_var_name)
 
-        # Add remaining kernel arguments. codegen_kernel() has already reduced
-        # python_argdefs() to the live, deduped names the op specs actually
-        # reference (dropping e.g. an in-place tensor's duplicate entry, or a
-        # gather index tensor later folded away by simplify_op_spec) and
-        # assigned each TensorArg.arg_index against that same list, so using
-        # it here keeps positional .run() args in sync with arg_index. With
-        # symbolic args the MLIR bundle emits one !sdscbundle.input_arg<index>
-        # per unique arg_index; passing an extra or misaligned tensor would
-        # cause a runtime "Number of inputs mismatches" error in
-        # processComputeOnHostCommand.
+        # Use live call args computed in codegen_kernel() to keep positional
+        # .run() args in sync with arg_index values baked into op specs.
         assert self._live_call_arg_names is not None, (
             "call_kernel() requires codegen_kernel() to have run first"
         )
