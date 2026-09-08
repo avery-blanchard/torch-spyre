@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import builtins
 import dataclasses
 import itertools
+import sympy
 import logging
 import math
 from collections.abc import Callable
@@ -65,6 +67,7 @@ from .pass_utils import (
 )
 from .propagate_hints import get_op_hints
 from .work_division_constraints import (
+    ConstraintResult,
     WorkDivConstraintContext,
     collect_work_division_constraints,
     has_qfp8wt_tensor,
@@ -72,12 +75,8 @@ from .work_division_constraints import (
 
 logger = get_inductor_logger("work_division")
 
-# Maximum memory-access span per core.
-#
-# MVLOC supports a maximum value of 65535, with each entry representing
-# 4096 bytes. Therefore, the maximum addressable offset is:
-# 65535 * 4096 = 268431360 bytes (255.996 MiB).
-MAX_SPAN_BYTES = 65535 * 4096
+# Maximum memory-access span per core: 256MB hardware limit
+MAX_SPAN_BYTES = 256 * 1024 * 1024
 
 
 @dataclasses.dataclass
@@ -817,39 +816,154 @@ def apply_splits(op: ComputedBuffer, splits: dict) -> None:
     commit_iteration_space_ownership(op, splits)
 
 
-def enumerate_work_division_candidates(
-    op: ComputedBuffer,
-    max_cores: int,
-) -> list[dict[Symbol, int]]:
-    """Return every permissible core-division split for ``op``.
+@dataclasses.dataclass
+class WorkDivisionContext:
+    """Everything about ``op`` that a work-division candidate is judged against.
 
-    A split (``dict[Symbol, int]``, same form as :func:`apply_splits`) is
-    permissible iff: each per-dim factor divides its dim's size,
-    ``prod(factors) <= max_cores``, every tensor's per-core span
-    ``<= MAX_SPAN_BYTES``, and at most one reduction (K) dim is split. A factor
-    of ``1`` means the dim is unsplit; the all-ones single-core split is
-    included when it is itself permissible.
+    Derived once per operation by :func:`work_division_context_for_op` -- the
+    iteration space and its stick-adjusted copy, symbol metadata, tensor deps,
+    and the op's constraint result -- so that judging a candidate is a pure
+    query. A caller can therefore generate and test candidates one at a time;
+    :func:`enumerate_work_division_candidates` is the cross product over this
+    object and holds no logic of its own.
 
-    Op-specific limits are supplied by ``collect_work_division_constraints``;
-    this planner only consumes their generic legal split domains.
+    ``max_cores`` is ``None`` for a caller validating an already-committed
+    split rather than proposing one, and the core budget is then not applied.
     """
-    # TODO: Enumerate compute bound ops and for seeds or compute optimized
-    # work division where HBM bandwidth can saturate compute.
 
+    op: ComputedBuffer
+    max_cores: int | None
+    # Element-valued ranges: device coordinate expressions are written in these.
+    it_space: dict[Symbol, Expr]
+    # The same ranges with stick vars counted in sticks -- the divisible axes.
+    it_space_adjusted: dict[Symbol, Expr]
+    stick_vars: dict[Symbol, int]
+    symbol_meta: SymbolMeta
+    tensor_deps: list[TensorDep]
+    # Dims absent from the output's device coordinates, i.e. reduction (K) dims.
+    reduction_vars: list[Symbol]
+    constraints: ConstraintResult
+    # Hard per-axis floors ``span_reduction_pass`` has already committed.
+    span_min_splits: dict[Symbol, int]
+    # factor_domain is asked once per axis by the enumeration and again per
+    # candidate by is_legal; the derivation is sympy-heavy, so memoize it.
+    _factor_domains: dict[Symbol, list[int]] = dataclasses.field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    @property
+    def axes(self) -> list[Symbol]:
+        """The divisible axes, in the order a candidate split is keyed by."""
+        return list(self.it_space_adjusted)
+
+    def factor_domain(self, v: Symbol) -> list[int]:
+        """Ascending legal per-dim factors for axis ``v``: those that divide it.
+
+        Mirrors ``must_split_vars.valid_splits``, minus that helper's own
+        ``>= current_min`` search floor: the full set, narrowed by the op's
+        allowed-split domains and by any span floor ``span_reduction_pass``
+        committed. The committed floor is applied here, so ``1`` is absent
+        wherever a floor or an exact domain excludes it.
+        """
+        if v not in self._factor_domains:
+            if v in self.symbol_meta:
+                basis = self.symbol_meta[v][1]  # granularity
+            elif v in self.stick_vars:
+                basis = concretize_expr(self.it_space_adjusted[v])  # stick count
+            else:
+                basis = concretize_expr(self.it_space[v])  # element count
+            self._factor_domains[v] = _legal_split_factors(
+                v, basis, self.constraints.allowed_splits, self.span_min_splits
+            )
+        return self._factor_domains[v]
+
+    def is_legal(self, splits: dict[Symbol, int]) -> bool:
+        """Whether a proposed split is permissible, on every count.
+
+        Total, so a caller proposing a split it did not enumerate gets the same
+        verdict as one drawing its factors from :meth:`factor_domain`.
+        """
+        return (
+            self._factors_in_domain(splits)
+            and self._within_core_budget(splits)
+            and self._one_reduction_split_at_most(splits)
+            and self._spans_within_cap(splits)
+            and self._in_split_domains(splits)
+            and self.meets_span_floors(splits)
+        )
+
+    def obeys_op_constraints(self, splits: dict[Symbol, int]) -> bool:
+        """The subset of :meth:`is_legal` intrinsic to the op, dropping the
+        core budget, the ``MAX_SPAN_BYTES`` cap, the committed span floors and
+        the divisibility check -- so a split committed under one core budget
+        stays legal under another.
+
+        A caller checking a committed split asks :meth:`meets_span_floors`
+        alongside this. Divisibility it takes on trust, the split having come
+        from a division that was legal when it was made.
+        """
+        return self._one_reduction_split_at_most(splits) and self._in_split_domains(
+            splits
+        )
+
+    def meets_span_floors(self, splits: dict[Symbol, int]) -> bool:
+        """Whether ``splits`` meets the hard span floors ``span_reduction_pass``
+        committed. A factor that is present is already checked against the
+        axis's :meth:`factor_domain`, which applies the floor, so this is what
+        rejects a split that omits a floored axis altogether."""
+        return all(
+            splits.get(v, 1) >= minimum for v, minimum in self.span_min_splits.items()
+        )
+
+    def _factors_in_domain(self, splits: dict[Symbol, int]) -> bool:
+        """Nothing else in :meth:`is_legal` rejects a factor that simply does
+        not divide its axis: :meth:`_in_split_domains` iterates the op's *hard*
+        domains, which for most axes are empty. Only a caller proposing a split
+        rather than enumerating one can get here. Asked first, because the span
+        arithmetic divides by the factors.
+        """
+        return all(
+            v in self.it_space_adjusted and factor in self.factor_domain(v)
+            for v, factor in splits.items()
+        )
+
+    def _within_core_budget(self, splits: dict[Symbol, int]) -> bool:
+        return self.max_cores is None or math.prod(splits.values()) <= self.max_cores
+
+    def _spans_within_cap(self, splits: dict[Symbol, int]) -> bool:
+        return all(
+            get_per_core_span(td, splits, self.it_space, self.symbol_meta)
+            <= MAX_SPAN_BYTES
+            for td in self.tensor_deps
+        )
+
+    def _one_reduction_split_at_most(self, splits: dict[Symbol, int]) -> bool:
+        return sum(1 for v in self.reduction_vars if splits.get(v, 1) > 1) <= 1
+
+    def _in_split_domains(self, splits: dict[Symbol, int]) -> bool:
+        if any(  # a coordinate-masked dim cannot be split across cores
+            splits.get(v, 1) > 1 for v in self.constraints.blocked
+        ):
+            return False
+        return all(
+            splits.get(v, 1) in allowed
+            for v, allowed in self.constraints.allowed_splits.items()
+        )
+
+
+def work_division_context_for_op(
+    op: ComputedBuffer, max_cores: int | None = None
+) -> WorkDivisionContext:
+    """Build the context for ``op``, doing the candidate-invariant work once."""
     it_space = iteration_space_from_op(op)
-
     input_tds, output_td = collect_tensor_deps(
         op,
         _apply_input_layout_overrides(op, get_mem_deps_from_rw(op_read_writes(op))),
     )
-    all_tds = input_tds + [output_td]
-
     symbol_meta = _collect_symbol_metadata(it_space)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, _non_index_tensor_deps(op, all_tds), symbol_meta
+        it_space, _non_index_tensor_deps(op, input_tds + [output_td]), symbol_meta
     )
-
-    # Reduction (K) dims are absent from output device coordinates.
     coord_vars = {
         v
         for e in output_td.device_coords[:-1]
@@ -857,7 +971,6 @@ def enumerate_work_division_candidates(
         if isinstance(v, Symbol)
     }
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-
     constraint_result = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
@@ -870,98 +983,59 @@ def enumerate_work_division_candidates(
             committed_splits={},
         )
     )
-    blocked = constraint_result.blocked
-    allowed_splits = constraint_result.allowed_splits
+    return WorkDivisionContext(
+        op=op,
+        max_cores=max_cores,
+        it_space=it_space,
+        it_space_adjusted=it_space_adjusted,
+        stick_vars=stick_vars,
+        symbol_meta=symbol_meta,
+        tensor_deps=input_tds + [output_td],
+        reduction_vars=reduction_vars,
+        constraints=constraint_result,
+        span_min_splits=_span_min_splits(op),
+    )
 
-    # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
-    # no ``>= current_min`` floor (we want the full set, including 1).
-    def factors(v: Symbol) -> list[int]:
-        if v in symbol_meta:
-            basis = symbol_meta[v][1]  # granularity
-        elif v in stick_vars:
-            basis = concretize_expr(it_space_adjusted[v])  # stick count
-        else:
-            basis = concretize_expr(it_space[v])  # element count
-        return _legal_split_factors(v, basis, allowed_splits, _span_min_splits(op))
 
-    def create_splits(axis_vars, combo):
-        return dict(zip(axis_vars, combo))
-
-    def valid_split(splits):
-        if math.prod(splits.values()) > max_cores:  # core budget
-            return False
-        if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
-            return False
-        if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
-            get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
-            for td in all_tds
-        ):
-            return False
-        if any(  # a coordinate-masked dim cannot be split across cores
-            splits.get(v, 1) > 1 for v in blocked
-        ):
-            return False
-        return all(splits.get(v, 1) in allowed for v, allowed in allowed_splits.items())
-
-    vars_ = list(it_space_adjusted.keys())
-    candidates = [
+def enumerate_work_division_candidates(
+    op: ComputedBuffer,
+    max_cores: int,
+) -> list[dict[Symbol, int]]:
+    """Every split (``dict[Symbol, int]``, as :func:`apply_splits` takes) that
+    :meth:`WorkDivisionContext.is_legal` admits under ``max_cores``, drawn from
+    each axis's :meth:`~WorkDivisionContext.factor_domain`. A factor of ``1``
+    leaves its dim unsplit. Both halves are the context's, leaving only
+    the cross product here; a caller that would rather propose one split at a
+    time uses the context directly.
+    """
+    # TODO: Enumerate compute bound ops and for seeds or compute optimized
+    # work division where HBM bandwidth can saturate compute.
+    ctx = work_division_context_for_op(op, max_cores)
+    axes = ctx.axes
+    return [
         splits
-        for combo in itertools.product(*(factors(v) for v in vars_))
-        if valid_split(splits := create_splits(vars_, combo))
+        for combo in itertools.product(*(ctx.factor_domain(v) for v in axes))
+        if ctx.is_legal(splits := dict(zip(axes, combo)))
     ]
-
-    return candidates
 
 
 def work_division_splits_are_legal(
     op: ComputedBuffer, splits: dict[Symbol, int]
 ) -> bool:
-    """Return whether symbol-keyed splits obey this op's hard constraints."""
+    """Return whether symbol-keyed splits obey this op's hard constraints.
+
+    The op's own constraints only: unlike :meth:`WorkDivisionContext.is_legal`
+    this asks nothing about a core budget or per-core spans, because the splits
+    are already committed rather than proposed.
+    """
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
         return True
 
-    it_space = iteration_space_from_op(op)
-    rw = op_read_writes(op)
-    input_tds, output_td = collect_tensor_deps(
-        op, _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
-    )
-    symbol_meta = _collect_symbol_metadata(it_space)
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
-        it_space, _non_index_tensor_deps(op, input_tds + [output_td]), symbol_meta
-    )
-    coord_vars = {
-        v
-        for expr in output_td.device_coords[:-1]
-        for v in expr.free_symbols
-        if isinstance(v, Symbol)
-    }
-    result = collect_work_division_constraints(
-        WorkDivConstraintContext(
-            op=op,
-            it_space=it_space,
-            it_space_adjusted=it_space_adjusted,
-            output_td=output_td,
-            input_tds=input_tds,
-            stick_vars=stick_vars,
-            reduction_vars=[v for v in it_space_adjusted if v not in coord_vars],
-            committed_splits={},
-        )
-    )
-    min_splits = _span_min_splits(op)
-    split_reduction_dims = [
-        v for v in it_space_adjusted if v not in coord_vars and splits.get(v, 1) > 1
-    ]
-    return (
-        len(split_reduction_dims) <= 1
-        and not any(splits.get(v, 1) > 1 for v in result.blocked)
-        and all(
-            splits.get(v, 1) in allowed for v, allowed in result.allowed_splits.items()
-        )
-        and all(splits.get(v, 1) >= minimum for v, minimum in min_splits.items())
-    )
+    ctx = work_division_context_for_op(op)
+    return ctx.obeys_op_constraints(splits) and ctx.meets_span_floors(splits)
 
 
 def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
@@ -1368,6 +1442,34 @@ def work_distribution_pass(
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
+def max(*args, **kwargs):
+    """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
+    a sympy expression (whose truth-valued comparisons the builtin can't
+    resolve), otherwise defers to the builtin -- including its ``key``/
+    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
+    supports."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Max(*args)
+    return builtins.max(*args, **kwargs)
+
+
+def min(*args, **kwargs):
+    """``min`` counterpart of :func:`max`; see its docstring."""
+    if any(isinstance(a, sympy.Basic) for a in args):
+        return sympy.Min(*args)
+    return builtins.min(*args, **kwargs)
+
+
+def log2(arg):
+    """``log2`` counterpart of :func:`max`; see its docstring."""
+    if isinstance(arg, sympy.Basic):
+        if isinstance(arg, sympy.Rational):
+            return sympy.log(arg.n(), 2.0)
+        else:
+            return sympy.log(arg, 2.0)
+    return math.log2(arg)
+
+
 _PT_ROWS = 8  # PT block rows per corelet
 
 # Constants for the matmul cost model (_matmul_split_cost). Each is either an
@@ -1405,15 +1507,26 @@ def _matmul_split_cost(
     k_axis: tuple[int, int],
     max_cores: int,
     shared_weight: bool = False,
+    include_hbm: bool = True,
 ) -> float:
     """Estimated kernel time in microseconds for ``[B,M,K]@[B,K,N]`` run with
     the given core split. Each axis is a ``(size, split)`` pair so a dim's size
     cannot be paired with another dim's split. Lower is better; inf if infeasible.
+
+    ``include_hbm=False`` drops the operand/output HBM-traffic term for a caller
+    that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
+    bundle memory term counts the same bytes and knows about LX residency). The
+    cohort bandwidth penalty scales only that term, so it drops out with it.
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    if cores_used == 0 or cores_used > max_cores:
+    if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
+
+    num_elems = B * M * N * K
+    is_symbolic = isinstance(cores_used, sympy.Basic) or isinstance(
+        num_elems, sympy.Basic
+    )
 
     # Compute: per-core MACs over peak, derated when the per-core M tile is too
     # short to fill the PT pipeline. The PT array streams M in passes of
@@ -1421,25 +1534,36 @@ def _matmul_split_cost(
     # amortised over too little work, and that overhead grows sub-linearly.
     m_t = M // m if m else 1
     pt_passes = max(1.0, m_t / _PT_ROWS)
-    pt_eff = min(1.0, (pt_passes / _TARGET_PT_PASSES) ** _PT_EFFICIENCY_EXPONENT)
-    compute_us = (B * M * N * K / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
+    pt_eff = (
+        # TODO: allow symbolic
+        1.0
+        if is_symbolic
+        else min(1.0, (pt_passes / _TARGET_PT_PASSES) ** _PT_EFFICIENCY_EXPONENT)
+    )
+    compute_us = (num_elems / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
     # link, so effective bandwidth falls off linearly with cohort size.
-    weight_batches = 1 if shared_weight else B
-    bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
-    fanout_split = max(m, n) if shared_weight else n
-    cohort_penalty = max(
-        1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
-    )
-    hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    if include_hbm:
+        weight_batches = 1 if shared_weight else B
+        bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
+        fanout_split = max(m, n) if shared_weight else n
+        # TODO: Remove special casing symbolic
+        cohort_penalty = (
+            1.0
+            if is_symbolic
+            else max(1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+        )
+        hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
+    else:
+        hbm_us = 0.0
 
     # PSUM: a K-split spreads the reduction over k cores, costing (k-1)
     # partial-sum hops. Charge each core's output tile rather than the whole
     # output, so useful K-splits are not over-penalized.
     psum_coeff = _PSUM_PER_CORE_ELEM_US if shared_weight else _BMM_PSUM_PER_CORE_ELEM_US
-    output_elems_per_core = (B * M * N) / max(1, b * m * n)
+    output_elems_per_core = (B * M * N) / (b * m * n)
     psum_us = max(0, k - 1) * output_elems_per_core * psum_coeff
 
     # Tie-break: among compute-equivalent splits prefer exposing enough M lanes
@@ -1449,11 +1573,9 @@ def _matmul_split_cost(
         _M_MIN,
         min(max_cores // 2, max(1, M // (_TARGET_M_TIE_PASSES * _PT_ROWS))),
     )
-    m_lane_underuse_us = (
-        max(0.0, math.log2(target_m / max(1, m))) * _M_LANE_UNDERUSE_PENALTY_US
-    )
+    m_lane_underuse_us = max(0.0, log2(target_m / m)) * _M_LANE_UNDERUSE_PENALTY_US
     m_tile_underfill_us = (
-        max(0.0, math.log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
+        max(0.0, log2(_M_TILE_UNDERFILL_TARGET / max(1, m_t)))
         * _M_TILE_UNDERFILL_PENALTY_US
     )
 
@@ -1462,8 +1584,7 @@ def _matmul_split_cost(
     # are not pulled away from PT-friendly M tiles.
     n_t = N // n if n else N
     wide_n_us = (
-        max(0.0, math.log2(max(1, n_t) / _TARGET_N_TILE_ELEMS))
-        * _WIDE_N_TILE_PENALTY_US
+        max(0.0, log2(max(1, n_t) / _TARGET_N_TILE_ELEMS)) * _WIDE_N_TILE_PENALTY_US
     )
 
     # Once M is large enough to feed the PT, prefer tile shapes that avoid
@@ -1473,45 +1594,48 @@ def _matmul_split_cost(
     # means avoiding very wide per-core N tiles when the whole projection is
     # narrow enough that more N lanes are available. Both effects are expressed
     # as ratios rather than op names or workload-specific shapes.
-    filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
-    true_bmm_value_split_us = (
-        0.0
-        if shared_weight or n <= 1
-        else filled_m_tile_factor
-        * max(0.0, math.log2(max(1, K) / max(1, N)))
-        * math.log2(n)
-        * _LARGE_M_TILE_SHAPE_PENALTY_US
-    )
-    shared_narrow_tile_us = (
-        0.0
-        if not shared_weight
-        else filled_m_tile_factor
-        * max(0.0, math.log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
-        * max(0.0, math.log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
-        * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
-    )
-    shared_down_n_split_us = (
-        0.0
-        if not shared_weight or n <= 1
-        else max(0.0, math.log2(max(1, K) / max(1, N)))
-        * math.log2(n)
-        * _SHARED_DOWN_N_SPLIT_PENALTY_US
-    )
-    large_m_tile_shape_us = (
-        true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
-    )
+    # filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
+    # TODO: Remove special casing symbolic
+    if not is_symbolic:
+        filled_m_tile_factor = 1.0 if m_t >= _M_TILE_UNDERFILL_TARGET else 0.0
+        true_bmm_value_split_us = (
+            0.0
+            if shared_weight or n <= 1
+            else filled_m_tile_factor
+            * max(0.0, log2(max(1, K) / max(1, N)))
+            * log2(n)
+            * _LARGE_M_TILE_SHAPE_PENALTY_US
+        )
+        shared_narrow_tile_us = (
+            0.0
+            if not shared_weight
+            else filled_m_tile_factor
+            * max(0.0, log2(_SHARED_NARROW_OUTPUT_REF / max(1, N)))
+            * max(0.0, log2(max(1, n_t) / _SHARED_N_TILE_TARGET))
+            * (_LARGE_M_TILE_SHAPE_PENALTY_US / 4)
+        )
+        shared_down_n_split_us = (
+            0.0
+            if not shared_weight or n <= 1
+            else max(0.0, log2(max(1, K) / max(1, N)))
+            * log2(n)
+            * _SHARED_DOWN_N_SPLIT_PENALTY_US
+        )
+        large_m_tile_shape_us = (
+            true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us
+        )
+    else:
+        large_m_tile_shape_us = 0.0
 
     # Prefer using the full core budget, but keep this soft so measured-good
     # lower-core candidates can still win.
     core_underuse_us = (
-        max(0.0, math.log2(max_cores / cores_used)) * _CORE_UNDERUSE_PENALTY_US
+        max(0.0, log2(max_cores / cores_used)) * _CORE_UNDERUSE_PENALTY_US
     )
 
     # True BMMs often need batch parallelism to avoid tiny-M underfill. Charge a
     # small additive split overhead instead of multiplying the whole estimate.
-    batch_split_us = (
-        0.0 if shared_weight else math.log2(max(1, b)) * _BMM_BATCH_SPLIT_PENALTY_US
-    )
+    batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
 
     return (
         compute_us

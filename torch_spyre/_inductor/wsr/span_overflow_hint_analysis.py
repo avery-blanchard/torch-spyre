@@ -664,10 +664,9 @@ def _input_span_infos_controlled_by_output_dims(
             if not coord.free_symbols:
                 continue
 
-            output_syms = [sym for sym in coord.free_symbols if sym in symbol_to_dim]
-            reduction_syms = [
-                sym for sym in coord.free_symbols if sym not in symbol_to_dim
-            ]
+            coord_syms = sorted(coord.free_symbols, key=str)
+            output_syms = [sym for sym in coord_syms if sym in symbol_to_dim]
+            reduction_syms = [sym for sym in coord_syms if sym not in symbol_to_dim]
             if reduction_syms and not (
                 k_symbol is not None and set(reduction_syms) == {k_symbol}
             ):
@@ -1007,7 +1006,9 @@ def _output_span_candidates_from_op(
     for device_dim, coord in enumerate(device_coords[:-1]):
         if not coord.free_symbols:
             continue
-        output_syms = [sym for sym in coord.free_symbols if sym in symbol_to_dim]
+        output_syms = sorted(
+            [sym for sym in coord.free_symbols if sym in symbol_to_dim], key=str
+        )
         # A coordinate can be jointly controlled by more than one output
         # symbol, for example two interleaved dims sharing one physical
         # stride -- ``floor(d1 / 64)`` maps cleanly to the output dim for
@@ -1180,7 +1181,7 @@ def _candidate_required_split_count(candidate: SpanOverflowCandidate) -> int:
     """Return the minimum split needed if this candidate's dim tiled alone.
 
     This is ``ceil(per_core_span / MAX_SPAN_BYTES)``: if a dim creates a
-    384 MB span and the limit is 255.996 MB it needs at least split ``2`` when
+    384 MB span and the limit is 256 MB it needs at least split ``2`` when
     considered by itself.
 
     The combined search can still choose a different legal divisor or combine
