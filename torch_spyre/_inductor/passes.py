@@ -38,11 +38,10 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding
+from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
-    mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
 from .wsr.coarse_tile import validate_coarse_tile_groups
@@ -54,7 +53,6 @@ from .wsr.coarse_tile_hints import (
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
-    recover_spyre_hints,
 )
 from .wsr.propagate_named_dims import (
     propagate_named_dims,
@@ -70,6 +68,7 @@ from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
     insert_restickify,
+    validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
@@ -78,7 +77,7 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import format_operations
+from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
@@ -87,11 +86,20 @@ from .scheduler import (
     align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
     demote_incoherent_lx_buffers,
+    verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-from .wsr.coarse_tile import coarse_tile
+from .read_copy_elision import elide_proven_read_copies
+from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
+from .dump_cost_model import dump_cost_model
+
+# The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
+# through a module ``__getattr__``, so it has to be read as an attribute at call time.
+# ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
+from . import cost_model_pass as cost_model_pass_module
+from .cost_model_pass import CostReport, cost_model_pass
 from .split_multi_ops import split_multi_ops, validate_ops
 
 
@@ -231,7 +239,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
     def __init__(self):
         super().__init__(
             [
-                recover_spyre_hints,
                 # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
                 # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
                 # constants are materialized later by the LoopLevel IR multi-ops
@@ -239,7 +246,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 # falling back to extern_kernels.addmm.
                 decompose_addmm,
                 mm_to_bmm_pass.apply,
-                mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
             ]
         )
@@ -285,8 +291,15 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
         # coherence now that loop orders are final, and anything it demotes must
         # still be visible to hbm_pool_planning as an unclaimed intermediate.
+        # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
+        # bundle-scoped live ranges.
         super().__init__(
-            [demote_incoherent_lx_buffers, hbm_pool_planning, spyre_fuse_nodes]
+            [
+                demote_incoherent_lx_buffers,
+                spyre_fuse_nodes,
+                hbm_pool_planning,
+                verify_carried_reduction_ownership,
+            ]
         )
 
 
@@ -321,7 +334,7 @@ def _maybe_reorder_unhinted_interlopers(graph: GraphLowering) -> None:
 @_runs(
     hints_to_coarse_tile_groups,
     validate_coarse_tile_groups,
-    coarse_tile,
+    coarse_tile_pre_stickify,
 )
 def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
     """Hint-driven coarse tiling only.  Runs PRE-stickification.
@@ -337,13 +350,13 @@ def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
-    coarse_tile(graph, groups=groups)
+    coarse_tile_pre_stickify(graph, groups=groups)
 
 
 @_runs(
     span_overflow_groups,
     validate_coarse_tile_groups,
-    coarse_tile,
+    coarse_tile_post_stickify,
 )
 def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """Span-overflow coarse tiling only.  Runs POST-stickification.
@@ -351,6 +364,11 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     Requires FixedTiledLayout (device_layout) on all ops.
     hint-driven groups (hints_to_coarse_tile_groups) are intentionally
     absent: they have already run pre-stickification.
+
+    Uses coarse_tile_post_stickify: layout propagation has already
+    committed every op's device layout by this point, so a read-copy here
+    would only produce an HBM-to-HBM copy with no layout-reconciliation
+    benefit.
     """
     if config.ignore_span_overflow_hints:
         return
@@ -359,9 +377,9 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
         return
     # span_overflow_groups is a pure planning step: it decides each op's
     # dim_hints but does not set them.  Apply them now, before
-    # validate_coarse_tile_groups/coarse_tile run, since dim_hints is an
-    # input those consume (via plan_coarse_tile_groups's hint lookups), not
-    # something they produce.
+    # validate_coarse_tile_groups/coarse_tile_post_stickify run, since
+    # dim_hints is an input those consume (via plan_coarse_tile_groups's
+    # hint lookups), not something they produce.
     for op, dim_hints in dim_hint_assignments:
         op.dim_hints = dim_hints  # type: ignore[attr-defined]
     # Compute offset to avoid loop_group_id collision with any hint-driven
@@ -376,7 +394,11 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
-    coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
+    coarse_tile_post_stickify(
+        graph,
+        groups=groups,
+        group_idx_offset=group_idx_offset,
+    )
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -412,6 +434,19 @@ class CustomPreSchedulingPasses:
     in order, and the inherited :meth:`uuid` keys the cache on their sources.
     """
 
+    @property
+    def last_cost_report(self) -> CostReport | None:
+        """Predicted runtime for the graph THIS THREAD most recently compiled.
+
+        None when the cost model is disabled, which is the default. A property
+        rather than an attribute because Inductor reuses one pipeline instance
+        across compiles: storing the report on ``self`` would let a concurrent
+        compile overwrite another's. The read goes to per-thread storage in
+        ``cost_model_pass`` instead. Being on the class also means it resolves on
+        an instance built without ``__init__`` -- test_log_passes.py does that.
+        """
+        return cost_model_pass_module.LAST_REPORT
+
     def __init__(self):
         self.passes = [
             deadcode_elimination,
@@ -429,6 +464,17 @@ class CustomPreSchedulingPasses:
             _maybe_reorder_unhinted_interlopers,
             _maybe_coarse_tile_hints,
             #
+            # Matmul K padding (pre-stickification)
+            # Pads y's K to a stick boundary while every buffer still has a
+            # plain host FixedLayout.  The padded buffer then flows through
+            # stickification like a user-written F.pad: propagate_spyre_tensor_layouts
+            # picks its layout and finalize_layouts plans any restickify it needs
+            # (e.g. a transposed nn.Linear weight, issue #4208).  Running after
+            # insert_restickify would have to pad a restickify output, whose
+            # device layout and index expressions cannot be reconciled with a
+            # grown host extent.
+            insert_bmm_padding,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -436,9 +482,10 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
-            insert_bmm_padding,
+            insert_restickify_padding,
             #
             dedup_and_promote_constants,
             #
@@ -453,6 +500,9 @@ class CustomPreSchedulingPasses:
             #
             # LX Planning
             _maybe_scratchpad_planning,
+            # Preserve copies through physical planning, then remove only
+            # those whose direct-read form is proven equivalent.
+            elide_proven_read_copies,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:
@@ -491,6 +541,21 @@ class CustomPreSchedulingPasses:
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
+        # Predicted runtime for this graph, or None when config.cost_model is off.
+        # Kept OUTSIDE self.passes on purpose: it only reads the IR, so hashing it
+        # into the Inductor cache key (see _uuid) would invalidate caches for a
+        # report that cannot change the compiled result. The pass stores the report
+        # per-thread, readable as `last_cost_report`, so another pass or an external
+        # tool can compare two plans by total_us without compiling or running either.
+        #
+        # BEFORE the per-op dump on purpose: the report is the answer -- one number and
+        # a per-kernel breakdown -- while the dump is the evidence behind it, hundreds
+        # of lines on a real graph. Printing the evidence first buries the answer.
+        cost_model_pass(graph)
+        dump_cost_model(graph.operations)
+        # Keep rich symbol-keyed ownership through every pre-Scheduler reader;
+        # legacy coefficient transport exists only for Scheduler/codegen.
+        finalize_work_division_for_scheduler(graph)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

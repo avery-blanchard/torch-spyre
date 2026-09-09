@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Union
+from typing import Iterator, Sequence, Union
 
 import sympy
 
@@ -34,12 +34,49 @@ from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
-from .pass_utils import iteration_space, per_core_view_scheduled
+from .ir import FixedTiledLayout
+from .pass_utils import (
+    PerCoreView,
+    iteration_space,
+    iteration_space_from_op,
+    per_core_view_scheduled,
+    try_device_coordinates,
+)
 from .logging_utils import get_inductor_logger
+from .scratchpad.lx_relayout import (
+    demote_lx_relayout_group,
+    materialized_lx_relayouts,
+    work_division_from_view,
+)
 from .op_spec import LoopSpec
 from . import config as _spyre_config
+from .errors import Unsupported
 
 logger = get_inductor_logger("scheduler")
+
+
+def _ownership_projectable(
+    node: SchedulerNode,
+    dep: MemoryDep,
+    name: str,
+    view: PerCoreView,
+) -> bool:
+    """Whether final scheduled coordinates can carry ``view`` into codegen."""
+
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return False
+    layout = buffer.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return False
+    coordinates = try_device_coordinates(layout.device_layout, dep, None)
+    if coordinates is None:
+        return False
+    try:
+        work_division_from_view(view, coordinates, tuple(iteration_space(node)))
+    except ValueError:
+        return False
+    return True
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -102,7 +139,8 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     """Return the loop_count for ``depth`` from the ir.Operation inside node.
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
-    nesting level from outermost to innermost (stamped by coarse_tile()).
+    nesting level from outermost to innermost (stamped by
+    coarse_tile_pre_stickify()/coarse_tile_post_stickify()).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
@@ -320,6 +358,18 @@ def _lx_resident(node: SchedulerNode) -> bool:
     return allocation is not None and "lx" in allocation
 
 
+def _lx_view(name: str):
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return None
+    layout = buffer.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    if "lx" not in layout.allocation:
+        return None
+    return layout.lx_view
+
+
 def align_lx_producer_loop_order(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -353,7 +403,7 @@ def align_lx_producer_loop_order(
     for node in nodes:
         if isinstance(node, SchedulerNode) and _lx_resident(node):
             for dep in node.read_writes.writes:
-                if isinstance(dep, MemoryDep):
+                if isinstance(dep, MemoryDep) and _lx_view(dep.name) is None:
                     producers[dep.name] = node
 
     if not producers:
@@ -432,32 +482,107 @@ def demote_incoherent_lx_buffers(
     if not _spyre_config.lx_planning:
         return nodes
 
-    # dep is needed per (node, buffer): a node reading and writing the same
-    # buffer contributes one entry per access, so an in-place op whose read and
-    # write views diverge is caught too.
+    # dep is needed per (node, buffer), including in-place read/write pairs.
     users: dict[str, list[tuple[SchedulerNode, MemoryDep]]] = {}
     lx_names: OrderedSet[str] = OrderedSet()
-    for node in nodes:
-        for inner in node.get_nodes():
-            if not isinstance(inner, SchedulerNode):
-                continue
-            if _lx_resident(inner):
-                for dep in inner.read_writes.writes:
-                    if isinstance(dep, MemoryDep):
-                        lx_names.add(dep.name)
-            rw = inner.read_writes
-            for dep in list(rw.reads) + list(rw.writes):
+    scheduled = [
+        inner
+        for node in nodes
+        for inner in node.get_nodes()
+        if isinstance(inner, SchedulerNode)
+    ]
+    plans_by_copy = {
+        copy_name: plan
+        for copy_name, plan in materialized_lx_relayouts(V.graph).values()
+    }
+    source_by_copy = {
+        copy_name: plan.source_name for copy_name, plan in plans_by_copy.items()
+    }
+    relayout_sources = set(source_by_copy.values())
+
+    copy_reads = set()
+    invalid_sources = {}
+    seen_copies = set()
+    for node in scheduled:
+        if _lx_resident(node):
+            for dep in node.read_writes.writes:
                 if isinstance(dep, MemoryDep):
-                    users.setdefault(dep.name, []).append((inner, dep))
+                    lx_names.add(dep.name)
+        rw = node.read_writes
+        reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+        writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+        for dep in [*reads, *writes]:
+            users.setdefault(dep.name, []).append((node, dep))
+        copies = [dep for dep in writes if dep.name in plans_by_copy]
+        if not copies:
+            continue
+        for dep in copies:
+            seen_copies.add(dep.name)
+            plan = plans_by_copy[dep.name]
+            source_view = _lx_view(plan.source_name)
+            destination_view = _lx_view(dep.name)
+            if (
+                source_view is None
+                or destination_view is None
+                or source_view == destination_view
+                or len(reads) != 1
+                or len(writes) != 1
+                or reads[0].name != plan.source_name
+                or not _ownership_projectable(
+                    node, reads[0], plan.source_name, source_view
+                )
+                or not _ownership_projectable(node, dep, dep.name, destination_view)
+            ):
+                invalid_sources[plan.source_name] = f"invalid relayout copy {dep.name}"
+            else:
+                copy_reads.add((node.get_name(), plan.source_name))
+    for copy_name, plan in plans_by_copy.items():
+        if copy_name not in seen_copies:
+            invalid_sources[plan.source_name] = f"missing relayout copy {copy_name}"
+
+    demoted = set()
+
+    def demote(source_name: str, reason: str) -> None:
+        if source_name in demoted:
+            return
+        demoted.add(source_name)
+        if source_name in relayout_sources:
+            # Scheduling supplies the final ownership verdict; the relayout
+            # layer owns atomic group fallback and registry cleanup.
+            demote_lx_relayout_group(V.graph, source_name, reason)
+            return
+        buffer = V.graph.try_get_buffer(source_name)
+        if buffer is not None:
+            layout = buffer.get_layout()
+            if isinstance(layout, FixedTiledLayout):
+                layout.allocation.pop("lx", None)
+                layout.lx_view = None
+        logger.info("demoted %s out of LX: %s", source_name, reason)
+
+    for source_name, reason in invalid_sources.items():
+        demote(source_name, reason)
 
     for name in lx_names:
         ref = None
         culprit = None
+        expected = _lx_view(name)
         for node, dep in users.get(name, []):
+            # The copy executes with its destination division; the source map is
+            # carried by its input tensor and validated at the producer.
+            if (node.get_name(), name) in copy_reads:
+                continue
             view, _, representable = per_core_view_scheduled(node, dep, name)
             if not representable:
                 culprit = f"{node.get_name()} view unrepresentable"
                 break
+            if expected is not None:
+                if view != expected:
+                    culprit = f"{node.get_name()} view {view} != {expected}"
+                    break
+                if not _ownership_projectable(node, dep, name, expected):
+                    culprit = f"{node.get_name()} ownership unprojectable"
+                    break
+                continue
             if ref is None:
                 ref = view
             elif view != ref:
@@ -465,12 +590,192 @@ def demote_incoherent_lx_buffers(
                 break
         if culprit is None:
             continue
-        buf = V.graph.try_get_buffer(name)
-        layout = getattr(buf, "layout", None)
-        allocation = getattr(layout, "allocation", None)
-        if allocation is not None:
-            allocation.pop("lx", None)
-        logger.info("demoted %s out of LX: %s", name, culprit)
+        demote(source_by_copy.get(name, name), culprit)
+
+    return nodes
+
+
+def verify_carried_reduction_ownership(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Verify the final physical contract of every loop-carried reduction.
+
+    This runs after fusion, LX demotion, and HBM-pool planning.  Earlier split
+    metadata is only an input request; the scheduled per-core views checked
+    here are the ownership codegen will actually emit.
+    """
+
+    def all_scheduler_nodes(
+        items: Sequence[BaseSchedulerNode],
+    ) -> Iterator[SchedulerNode]:
+        for item in items:
+            if isinstance(item, FusedSchedulerNode):
+                yield from all_scheduler_nodes(item.get_nodes())
+            elif isinstance(item, SchedulerNode):
+                yield item
+
+    grouped: dict[object, dict[str, SchedulerNode]] = {}
+    for node in all_scheduler_nodes(nodes):
+        record = getattr(node.node, "_carried_reduction_record", None)
+        if record is not None:
+            grouped.setdefault(record, {})[node.get_name()] = node
+
+    for record, by_name in grouped.items():
+        expected_names = {
+            record.fill_name,
+            record.combine_name,
+            record.drain_name,
+        }
+        missing = expected_names - by_name.keys()
+        if missing:
+            raise Unsupported(
+                "carried reduction lost physical stages after fusion: "
+                f"accumulator={record.accumulator_name}, missing={sorted(missing)}"
+            )
+
+        accumulator = V.graph.try_get_buffer(record.accumulator_name)
+        if accumulator is None:
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} is missing"
+            )
+        layout = accumulator.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} has "
+                f"non-device layout {type(layout).__name__}"
+            )
+        if "lx" not in layout.allocation:
+            logger.info(
+                "carried reduction %s remained in HBM; execution is correct but "
+                "the persistent-LX performance contract was not realized",
+                record.accumulator_name,
+            )
+            continue
+
+        checks = (
+            (record.fill_name, "write"),
+            (record.combine_name, "read"),
+            (record.combine_name, "write"),
+            (record.drain_name, "read"),
+        )
+        expected_view = layout.lx_view
+        for op_name, access in checks:
+            node = by_name[op_name]
+            deps = (
+                node.read_writes.reads if access == "read" else node.read_writes.writes
+            )
+            dep = next(
+                (
+                    candidate
+                    for candidate in deps
+                    if isinstance(candidate, MemoryDep)
+                    and candidate.name == record.accumulator_name
+                ),
+                None,
+            )
+            if dep is None and access == "write" and op_name == record.combine_name:
+                # MutationLayout's scheduled write is named after the combine
+                # op, while its storage target is the carried accumulator.
+                memory_deps = [
+                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
+                ]
+                dep = memory_deps[0] if len(memory_deps) == 1 else None
+            if dep is None and access == "read" and op_name == record.drain_name:
+                # Mutation propagation names this dependency after the latest
+                # in-place writer, but it still reads the accumulator storage.
+                memory_deps = [
+                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
+                ]
+                dep = memory_deps[0] if len(memory_deps) == 1 else None
+            if dep is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} lost its {access} of "
+                    f"{record.accumulator_name}; deps="
+                    f"{[(type(candidate).__name__, candidate.name) for candidate in deps]}"
+                )
+            view, _, representable = per_core_view_scheduled(
+                node, dep, record.accumulator_name
+            )
+            if not representable:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} ownership is not "
+                    "representable"
+                )
+            if expected_view is None:
+                expected_view = view
+            elif view != expected_view:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} ownership {view} "
+                    f"does not match accumulator ownership {expected_view}"
+                )
+
+            # Equal physical views are necessary but not sufficient.  A
+            # 32-way split over H and a 32-way split over T can have the same
+            # total core count while assigning different logical rows to a
+            # core.  Project the final physical view back into this stage's
+            # scheduled loop symbols, then require the one split to be the
+            # row dimension named by the immutable carried-reduction record.
+            coordinates = try_device_coordinates(layout.device_layout, dep, None)
+            if coordinates is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} cannot map final "
+                    "accumulator coordinates back to operation loops"
+                )
+            try:
+                realized_division = work_division_from_view(
+                    view,
+                    coordinates,
+                    tuple(iteration_space(node)),
+                )
+            except ValueError as exc:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} cannot project final "
+                    f"ownership into operation loops: {exc}"
+                ) from exc
+            if realized_division is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} has no final work division"
+                )
+
+            # Scheduler dependency extraction alpha-renames operation symbols
+            # (for example, d0 -> c0) without changing dimension order.  The
+            # carried-reduction rewrite is explicitly limited to
+            # order-preserving pointwise stages, so translate the names across
+            # that rename here.  This is not a general positional-remapping
+            # facility: a rank change fails closed, and no other rewrite uses
+            # this path.
+            operation_symbols = tuple(iteration_space_from_op(node.node))
+            scheduled_symbols = tuple(iteration_space(node))
+            if len(operation_symbols) != len(scheduled_symbols):
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} changed iteration rank "
+                    "before final ownership verification"
+                )
+            operation_named_dims = getattr(node.node, "work_div_loop_info", {})
+            named_dims = {
+                scheduled_symbol: operation_named_dims.get(operation_symbol, [])
+                for operation_symbol, scheduled_symbol in zip(
+                    operation_symbols, scheduled_symbols
+                )
+            }
+            row_symbols = [
+                symbol
+                for symbol in realized_division.work_slices
+                if record.row_dim_name in named_dims.get(symbol, [])
+            ]
+            expected_splits = (
+                {row_symbols[0]: record.required_row_split}
+                if len(row_symbols) == 1
+                else None
+            )
+            if realized_division.work_slices != expected_splits:
+                raise Unsupported(
+                    f"carried reduction {op_name} {access} expected only "
+                    f"{record.row_dim_name} split={record.required_row_split}, but "
+                    f"final logical splits are {realized_division.work_slices}"
+                )
+
+        assert expected_view is not None
 
     return nodes
 
@@ -575,7 +880,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
@@ -610,7 +916,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
@@ -712,13 +1019,17 @@ class SuperDSCScheduling(BaseScheduling):
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
+            method = "ktir" if _spyre_config.ktir_emitter else "sdsc"
+            kernel_name = "_".join([method, fused_name, wrapper.next_kernel_suffix()])
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
-            buf.writeline(f"async_compile.sdsc('{kernel_name}',")
+            buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
-            buf.writeline(")")
+            if method == "sdsc" and kernel._kernel_uses_hbm_pool():
+                buf.writeline(f", pool_size={kernel.pool_size})")
+            else:
+                buf.writeline(")")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
             metadata_comment = f"{origins}\n{detailed_origins}"
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
