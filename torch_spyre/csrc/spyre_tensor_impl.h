@@ -30,7 +30,14 @@
 namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
-std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
+// Default host dim_order for a tensor of the given host_size: dims are kept
+// in their original relative order except that any dimension other than the
+// last (which is always the stick dimension) whose host size is 1 is moved
+// to the end, after all non-size-1 dims, in stable (original relative)
+// order. A dimension of size 1 can never be usefully tiled, so this keeps
+// size-1 dims from occupying the outer tiling position by default.
+std::vector<int32_t> generic_stick_dim_order(
+    const std::vector<int64_t>& host_size);
 
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device

@@ -65,6 +65,27 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [8, 4, 512, 64])
         self.assertEqual(stl.stride_map, [256, 64, 2048, 1])
 
+    def test_default_layout_size_one_dims(self):
+        # A non-last dim of size 1 is moved to the end of the default dim
+        # order (effectively dim_order=[1, 0]) instead of occupying the
+        # outer tiling position.
+        stl = SpyreTensorLayout([1, 512], torch.float16)
+        self.assertEqual(stl.device_size, [1, 512, 64])
+        self.assertEqual(stl.stride_map, [-1, 1, -1])
+
+        # Multiple non-last size-1 dims (dims 0 and 2) are both moved to the
+        # end, preserving their relative order, after the non-size-1 dims
+        # (dim 1, then the stick dim 3): effective dim_order=[1, 3, 0, 2].
+        stl = SpyreTensorLayout([1, 512, 1, 256], torch.float16)
+        self.assertEqual(stl.device_size, [256, 1, 1, 512, 64])
+        self.assertEqual(stl.stride_map, [1, -1, -1, 256, -1])
+
+        # A size-1 *last* dim is the stick dimension and must not be moved:
+        # this must match plain identity-order behavior.
+        stl = SpyreTensorLayout([512, 1], torch.float16)
+        self.assertEqual(stl.device_size, [1, 512, 64])
+        self.assertEqual(stl.stride_map, [-1, 1, -1])
+
     def test_dim_order(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(stl.device_size, [8, 256, 64])

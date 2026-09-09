@@ -87,10 +87,27 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
   return dim_map;
 }
 
-std::vector<int32_t> generic_stick_dim_order(int32_t num_dims) {
+std::vector<int32_t> generic_stick_dim_order(
+    const std::vector<int64_t>& host_size) {
+  const int32_t num_dims = static_cast<int32_t>(host_size.size());
   std::vector<int32_t> dim_order;
+  dim_order.reserve(num_dims);
+  if (num_dims == 0) {
+    return dim_order;
+  }
+  const int32_t last_dim = num_dims - 1;  // always the stick dimension
+  // Stable partition: non-size-1 dims first (original relative order), then
+  // size-1 dims (original relative order). last_dim is always kept in the
+  // first group regardless of its own size, since it must remain last.
   for (int32_t i = 0; i < num_dims; i++) {
-    dim_order.push_back(i);
+    if (i == last_dim || host_size[i] != 1) {
+      dim_order.push_back(i);
+    }
+  }
+  for (int32_t i = 0; i < last_dim; i++) {
+    if (host_size[i] == 1) {
+      dim_order.push_back(i);
+    }
   }
   return dim_order;
 }
@@ -131,9 +148,8 @@ static std::vector<int64_t> dim_map_to_stride_map(
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
-  int host_dims = static_cast<int32_t>(host_size.size());
   auto host_strides = compute_host_stride(host_size);
-  auto dim_order = generic_stick_dim_order(host_dims);
+  auto dim_order = generic_stick_dim_order(host_size);
   init(host_size, host_strides, dtype, dim_order);
 }
 
