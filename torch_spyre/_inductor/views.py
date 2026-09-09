@@ -849,7 +849,7 @@ def align_tensors_pure(
     stick_size: list = []  # stick size for each tensor
     index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    # First pass: collect all indirect symbols present in any tensor's coordinates
+    # First pass: normalize all tensor coordinates to collect all indirect symbols
     all_indirect_symbols: set = set()
     if indirect_sizes:
         all_indirect_symbols = set(indirect_sizes.keys())
@@ -864,18 +864,20 @@ def align_tensors_pure(
             indirect_sizes,
             _concrete_alignment_value,
         )
-        # Index tensors do not contain any indirect symbols in their coordinates.
-        # Value tensors (those being indirectly accessed) do contain them.
-        # If indirect access exists and this tensor has no indirect symbols,
-        # it's the index tensor.
+        all_terms.append(terms)
+
+    # Second pass: identify index tensors (those with no indirect symbols when
+    # at least one other tensor has them)
+    any_tensor_has_indirect = any(
+        term.var in all_indirect_symbols
+        for terms in all_terms
+        for term in terms
+        if term.var is not None
+    )
+
+    for tensor_idx, terms in enumerate(all_terms):
         has_indirect_symbol = any(
             term.var in all_indirect_symbols for term in terms if term.var is not None
-        )
-        any_tensor_has_indirect = any(
-            term.var in all_indirect_symbols
-            for t in all_terms
-            for term in t
-            if term.var is not None
         )
         is_index_tensor = (
             all_indirect_symbols and not has_indirect_symbol and any_tensor_has_indirect
@@ -887,7 +889,6 @@ def align_tensors_pure(
         else:
             stick_dim.append(terms[-1].var)
             stick_size.append(terms[-1].dim_size)
-        all_terms.append(terms)
 
     _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
 
