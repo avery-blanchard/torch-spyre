@@ -802,49 +802,6 @@ def _concrete_alignment_value(expr: sympy.Expr) -> int | float:
     return int(expr)
 
 
-def _is_index_tensor(
-    tensor: dict, tensors: list[dict], indirect_sizes: dict | None
-) -> bool:
-    """Identify index tensor when indirect access is present.
-
-    Index tensor does NOT have IndirectAccess in its coordinates,
-    while other tensors do. Index tensor also has fewer dimensions.
-    """
-    if not indirect_sizes or not tensor["coordinates"]:
-        return False
-
-    def has_indirect_access(coords):
-        """Check if any coordinate contains IndirectAccess."""
-        for coord in coords:
-            # Check if coord is or contains an IndirectAccess object
-            if hasattr(coord, "__class__") and "IndirectAccess" in str(
-                coord.__class__.__name__
-            ):
-                return True
-        return False
-
-    # Index tensor must NOT have IndirectAccess in its coordinates
-    if has_indirect_access(tensor["coordinates"]):
-        return False
-
-    # At least one other tensor must have IndirectAccess
-    has_indirect_tensor = any(
-        has_indirect_access(other["coordinates"])
-        for other in tensors
-        if other is not tensor
-    )
-    if not has_indirect_tensor:
-        return False
-
-    # Index tensor typically has fewer coordinates
-    tensor_coord_len = len(tensor["coordinates"])
-    for other in tensors:
-        if other is not tensor and len(other["coordinates"]) > tensor_coord_len:
-            return True
-
-    return False
-
-
 def align_tensors_pure(
     inputs: AlignmentInputs,
 ) -> tuple[
@@ -892,6 +849,11 @@ def align_tensors_pure(
     stick_size: list = []  # stick size for each tensor
     index_tensor_indices: set[int] = set()  # indices of index tensors
 
+    # First pass: collect all indirect symbols present in any tensor's coordinates
+    all_indirect_symbols: set = set()
+    if indirect_sizes:
+        all_indirect_symbols = set(indirect_sizes.keys())
+
     for tensor_idx, tensor in enumerate(tensors):
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
         terms = normalize_coordinates(
@@ -902,9 +864,22 @@ def align_tensors_pure(
             indirect_sizes,
             _concrete_alignment_value,
         )
-        # Index tensors have fewer coordinate dimensions than value tensors.
-        # Their entry dimension doesn't follow stick-alignment constraints.
-        is_index_tensor = _is_index_tensor(tensor, tensors, indirect_sizes)
+        # Index tensors do not contain any indirect symbols in their coordinates.
+        # Value tensors (those being indirectly accessed) do contain them.
+        # If indirect access exists and this tensor has no indirect symbols,
+        # it's the index tensor.
+        has_indirect_symbol = any(
+            term.var in all_indirect_symbols for term in terms if term.var is not None
+        )
+        any_tensor_has_indirect = any(
+            term.var in all_indirect_symbols
+            for t in all_terms
+            for term in t
+            if term.var is not None
+        )
+        is_index_tensor = (
+            all_indirect_symbols and not has_indirect_symbol and any_tensor_has_indirect
+        )
         if is_index_tensor:
             stick_dim.append(None)
             stick_size.append(1)
