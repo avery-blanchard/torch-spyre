@@ -8490,6 +8490,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         w = cached_xavier((6144, 4096))
         self.compare_with_cpu(fn, x, w, atol=0.5, rtol=0.1)
 
+    def test_dtype_conversion_padding_unpadded_size_int32_to_fp32_rsqrt(self):
+        """Regression: dtype-conversion padding on unpadded size (44 elements)."""
+
+        def fn(x):
+            return torch.rsqrt(x.to(torch.float32))
+
+        x = torch.randint(1, 1000, (44,), dtype=torch.int32)
+        result = torch.compile(fn, dynamic=False)(x.to("spyre"))
+        expected = fn(x)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-2)
+
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
