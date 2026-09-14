@@ -1355,12 +1355,24 @@ def _create_sdsc_tensors(
             else:
                 physical_axis = None
 
+            # For indirect value tensors, dims with bounded size (> -1) must not
+            # advance the address (scale=-1), even if they're part of the
+            # tensor's own coordinates. Only the index tensor's entry dim and the
+            # value tensor's runtime-resolved row dim (with size=-1) should have
+            # scale=1.
+            dim_max_size = max_dim_sizes.get(dim, -1)
+            value_tensor_bounded_dim = (
+                is_indirect_value_tensor(arg) and dim_max_size > -1
+            )
             if (
                 has_indirect_access
                 and (i in index_tensor_indices or is_indirect_value_tensor(arg))
                 and dim not in reduced_dims
+                and not value_tensor_bounded_dim
             ):
                 scales[dim] = 1
+            elif value_tensor_bounded_dim:
+                scales[dim] = -1
             elif dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
