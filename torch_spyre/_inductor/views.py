@@ -23,6 +23,7 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 from torch._inductor.virtualized import V
 
 from .errors import Unsupported
+from .op_spec import IndirectAccess
 
 
 def _mixed_radix_digits(expr, var, var_range, mods):
@@ -549,6 +550,7 @@ def normalize_coordinates(
     synthetic_var_fn: Callable[[], sympy.Symbol],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     compare_value: Callable[[sympy.Expr], int | float] = _concretize_for_cmp,
+    is_index_tensor: bool = False,
 ) -> list[Term]:
     """
     Normalize coordinate expressions obtained from compute_coordinates.
@@ -576,7 +578,12 @@ def normalize_coordinates(
         offset = expr.xreplace({var: sympy.S.Zero for var in vars})
 
         if len(vars) == 0:
-            if dim_size > 1 and dim_idx != len(size) - 1:
+            # For index tensors, no synthetic vars are created (all dims treated like stick).
+            # For normal tensors, only the stick dim (last dim) skips synthetic var creation.
+            is_stick_dim = dim_idx == len(size) - 1
+            should_skip_synthetic = is_index_tensor or is_stick_dim
+
+            if dim_size > 1 and not should_skip_synthetic:
                 # A non-stick dimension with no variables but size > 1 indicates an elided
                 # dimension with offset/gap. Create a new variable to restore this dimension.
                 var = synthetic_var_fn()
@@ -850,13 +857,29 @@ def align_tensors_pure(
     stick_size: list = []  # stick size for each tensor
     index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    # First pass: normalize all tensor coordinates to collect all indirect symbols
-    all_indirect_symbols: set = set()
-    if indirect_sizes:
-        all_indirect_symbols = set(indirect_sizes.keys())
+    # First pass: identify index tensors from raw coordinates (before normalization).
+    # Check raw coordinates for IndirectAccess nodes, which only appear in value tensors.
+    def raw_coords_have_indirect_access(coordinates: Sequence) -> bool:
+        """Check if raw coordinate expressions contain IndirectAccess."""
+        for coord in coordinates:
+            if coord.has(IndirectAccess):
+                return True
+        return False
 
+    any_tensor_has_indirect = any(
+        raw_coords_have_indirect_access(tensor["coordinates"]) for tensor in tensors
+    )
+
+    index_tensor_indices_pre_norm = {}  # tensor_idx -> is_index_tensor
+    for tensor_idx, tensor in enumerate(tensors):
+        has_indirect = raw_coords_have_indirect_access(tensor["coordinates"])
+        is_index_tensor = any_tensor_has_indirect and not has_indirect
+        index_tensor_indices_pre_norm[tensor_idx] = is_index_tensor
+
+    # Second pass: normalize coordinates, passing index-tensor info to prevent synthetic-var injection
     for tensor_idx, tensor in enumerate(tensors):
         _synthetic_var_idx = 0  # reuse synthetic_var across tensors
+        is_index_tensor = index_tensor_indices_pre_norm[tensor_idx]
         terms = normalize_coordinates(
             var_ranges,
             tensor["size"],
@@ -864,25 +887,11 @@ def align_tensors_pure(
             synthetic_var,
             indirect_sizes,
             _concrete_alignment_value,
+            is_index_tensor=is_index_tensor,
         )
         all_terms.append(terms)
 
-    # Second pass: identify index tensors (those with no indirect symbols when
-    # at least one other tensor has them)
-    any_tensor_has_indirect = any(
-        term.var in all_indirect_symbols
-        for terms in all_terms
-        for term in terms
-        if term.var is not None
-    )
-
-    for tensor_idx, terms in enumerate(all_terms):
-        has_indirect_symbol = any(
-            term.var in all_indirect_symbols for term in terms if term.var is not None
-        )
-        is_index_tensor = (
-            all_indirect_symbols and not has_indirect_symbol and any_tensor_has_indirect
-        )
+        # Set stick_dim and stick_size based on whether this is an index tensor
         if is_index_tensor:
             stick_dim.append(None)
             stick_size.append(1)
@@ -990,11 +999,15 @@ def align_tensors_pure(
                 # Re-intersect the committed split against the basis work division.
                 # Skip stick-count logic if v is the stick var of an index tensor.
                 is_index_tensor_stick_var = False
+                is_stick_var = False
                 if v == var and v in stick_dim:
                     stick_idx = stick_dim.index(v)
-                    is_index_tensor_stick_var = stick_idx in index_tensor_indices
+                    # Ensure this is actually a stick var (not None) and not an index tensor
+                    if stick_dim[stick_idx] is not None:
+                        is_stick_var = True
+                        is_index_tensor_stick_var = stick_idx in index_tensor_indices
 
-                if v == var and v in stick_dim and not is_index_tensor_stick_var:
+                if v == var and is_stick_var and not is_index_tensor_stick_var:
                     # Stick var of normal tensor: use stick count.
                     eps = int(stick_size[stick_dim.index(v)])
                     basis = (int(new_var_ranges[v]) + eps - 1) // eps

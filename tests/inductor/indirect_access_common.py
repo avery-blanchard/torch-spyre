@@ -457,7 +457,7 @@ def run_e2e(
     except (BackendCompilerFailed, CalledProcessError) as exc:
         if expect_close:
             raise  # a must-work op failing to compile/run is a real regression
-        pytest.xfail(
+        pytest.skip(
             "e2e backend compile/run failed "
             f"({type(getattr(exc, '__cause__', None) or exc).__name__}); the "
             "Spyre backend does not yet support this indirect-access pattern. "
@@ -481,7 +481,7 @@ def run_e2e(
     elif expect_close is False:
         test.assertFalse(close, "e2e result unexpectedly matched the CPU reference")
     elif not close:
-        pytest.xfail(
+        pytest.skip(
             "e2e result diverges from the CPU reference "
             f"(max abs diff {diff:.4g}); the Spyre backend does not yet "
             "implement indirect access correctly. The pipeline compiled and "
