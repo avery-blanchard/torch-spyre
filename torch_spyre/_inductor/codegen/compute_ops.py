@@ -187,7 +187,11 @@ def core_idx_to_slice_offset(
 ) -> int:
     offset = sum(arg.offsets.values())
     for dim, stride in arg.strides.items():
-        if str(dim) in wk_slice and arg.scales[dim] > 0:
+        # Skip dims that have bounded size (not -1) in indirect access ops,
+        # as they don't advance the address even if scale > 0.
+        dim_max_size = arg.max_dim_sizes.get(dim, -1)
+        is_bounded_dim = dim_max_size > -1
+        if str(dim) in wk_slice and arg.scales[dim] > 0 and not is_bounded_dim:
             offset += wk_slice[str(dim)] * stride // work_slices[dim]
     return offset
 
@@ -1126,7 +1130,7 @@ def generate_sdsc(
                 corresponding generated coordinate information value structure.
         """
         layout = sdsc_spec.layouts[tensor.layout]
-        dim_order = _tensor_sched_layout_dims(tensor.dim_order, tensor.layout)
+        dim_order = _filter_window_dims(layout["dim_order"], tensor.layout)
         stick_dim_order = layout["stick_dim_order"]
         is_input = tensor_idx < sdsc_spec.num_inputs
         result = {}
