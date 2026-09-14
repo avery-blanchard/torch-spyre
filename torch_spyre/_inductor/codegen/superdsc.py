@@ -1299,8 +1299,10 @@ def _create_sdsc_tensors(
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
 
-            if has_indirect_access and (
-                i in index_tensor_indices or is_indirect_value_tensor(arg)
+            if (
+                has_indirect_access
+                and (i in index_tensor_indices or is_indirect_value_tensor(arg))
+                and dim not in reduced_dims
             ):
                 scales[dim] = 1
             elif dim in reduced_dims and op_spec.op != "layernormscale":

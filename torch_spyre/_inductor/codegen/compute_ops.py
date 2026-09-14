@@ -1173,7 +1173,7 @@ def generate_sdsc(
                 corresponding generated coordinate information value structure.
         """
         layout = sdsc_spec.layouts[tensor.layout]
-        dim_order = _filter_window_dims(layout["dim_order"], tensor.layout)
+        dim_order = _tensor_sched_layout_dims(tensor.dim_order, tensor.layout)
         stick_dim_order = layout["stick_dim_order"]
         is_input = tensor_idx < sdsc_spec.num_inputs
         result = {}

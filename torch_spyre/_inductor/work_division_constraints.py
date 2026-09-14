@@ -49,7 +49,6 @@ from .constants import (
 from .errors import Unsupported
 from .pass_utils import (
     concretize_expr,
-    indirect_forbidden_split_syms,
     is_restickify_coords,
     op_read_writes,
 )
@@ -118,7 +117,6 @@ def collect_work_division_constraints(
         topk_split_domains,
         keep_by_index_k_split_constraint,
         keep_by_index_pinned_search_space_vars,
-        indirect_access_split_domains,
     ):
         result = constraint(ctx)
 
@@ -750,21 +748,4 @@ def keep_by_index_pinned_search_space_vars(
         ConstraintResult(allowed_splits={search_axis: frozenset({1})})
         if search_axis is not None
         else ConstraintResult()
-    )
-
-
-def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Keep indirect shared-data dims unsplit.
-
-    A gather value table and scatter destination have one shared base on every
-    core. Their data dims must therefore stay at split=1. The index tensor's
-    entry-dim size is a runtime row count, not a stick-shaped data layout, so it
-    may split at any granularity — including counts that are not a multiple of
-    the index elems_per_stick — since each core's index sub-tensor is
-    independently addressed with no shared base to keep aligned.
-    """
-    return ConstraintResult(
-        allowed_splits={
-            sym: frozenset({1}) for sym in indirect_forbidden_split_syms(ctx.op)
-        }
     )
