@@ -2561,6 +2561,10 @@ def propagate_spyre_tensor_layouts(
                         and tuple(real_input.stride())
                         == tuple(real_input._base.stride())
                         and tuple(real_input.size()) != tuple(real_input._base.size())
+                        and all(
+                            real_input.size(d) <= real_input._base.size(d)
+                            for d in range(real_input.dim())
+                        )
                     )
                     if is_sub_region:
                         slice_stl = SpyreTensorLayout(
