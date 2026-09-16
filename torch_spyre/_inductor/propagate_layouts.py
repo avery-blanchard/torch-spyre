@@ -96,6 +96,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    mutation_op_layout,
     rescale_stl_for_dtype,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -124,6 +125,25 @@ class PropArg(NamedTuple):
     dep: MemoryDep
     layout: FixedLayout
     layouts: list[SpyreTensorLayout]
+
+
+def _mutation_target_buffer_and_view(target: Operation) -> tuple:
+    """Unwrap a MutationLayoutSHOULDREMOVE target to extract buffer and view.
+
+    Returns (buffer, view_or_none) where view_or_none is the intervening view
+    if target is a view, or None otherwise.
+    """
+    view = None
+    while isinstance(target, ReinterpretView):
+        view = target
+        target = target.data
+    return target, view
+
+
+def _mutation_target_view(target: Operation):
+    """Wrapper providing backward compatibility returning just the view component."""
+    _, view = _mutation_target_buffer_and_view(target)
+    return view
 
 
 def _get_prop_args(reads, strict: bool = True) -> list[PropArg]:
@@ -2570,14 +2590,30 @@ def propagate_spyre_tensor_layouts(
                 continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
-                while isinstance(target, ReinterpretView):
-                    target = target.data
-                target_name = target.get_name() if hasattr(target, "get_name") else ""
+                target_buf, target_view = _mutation_target_buffer_and_view(target)
+                target_name = (
+                    target_buf.get_name() if hasattr(target_buf, "get_name") else ""
+                )
                 # Look up the actual buffer node (unwraps TensorBox/StorageBox
                 # wrappers that coarse_tile.py places around SpyreEmptyFallback).
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
                 graph_input = V.graph.graph_inputs.get(target_name)
-                target_stl = _target_device_layout(target, target_name)
+                target_stl = _target_device_layout(target_buf, target_name)
+                # When the mutation target is a view, assign a rank-correct layout
+                # to prevent rank mismatches between the op's iteration space
+                # (which matches the view's shape) and the unwrapped buffer's shape.
+                if target_view is not None and target_stl is not None:
+                    view_layout = target_view.get_layout()
+                    view_stl = FixedTiledLayout(
+                        view_layout.device,
+                        view_layout.dtype,
+                        view_layout.size,
+                        view_layout.stride,
+                        target_stl,
+                        offset=view_layout.offset,
+                    )
+                    if hasattr(op.layout, "view_layout"):
+                        op.layout.view_layout = view_stl
                 if (
                     target_stl is None
                     and graph_input is None
@@ -2772,7 +2808,7 @@ def propagate_spyre_tensor_layouts(
                 # An unsupported write stick expression (an offset like v+32, or
                 # an offset-free sub-stick write) needs the stick dim relocated
                 # onto an alt layout, chosen differently per target kind.
-                target_layout = target.get_layout()
+                target_layout = target_buf.get_layout() if target_buf else None
                 # The up-front scan is exhaustive, so a miss here means no alt is
                 # needed rather than none being available.
                 alt_stl = (
@@ -3054,12 +3090,15 @@ def propagate_mutation_layouts(
                     layouts = [_generic_layout_for(output)]
                 else:
                     layouts = list(compute_layouts(n.node, output, output_dep, args))
+                device_layout = mutation_op_layout(
+                    n.node.layout, n.node.data, layouts[0]
+                )
                 n.node.layout = FixedTiledLayout(
                     output.device,
                     output.dtype,
                     output.size,
                     output.stride,
-                    layouts[0],
+                    device_layout,
                     offset=output.offset,
                 )
         else:
