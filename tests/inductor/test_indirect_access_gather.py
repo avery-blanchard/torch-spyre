@@ -1055,6 +1055,176 @@ class _GatherScenarios:
 
         self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
 
+    # -- hybrid direct/indirect access on different dimensions ---------------
+    def test_hybrid_direct_slice_indirect_gather(self):
+        """x[direct_idx][indirect_idx]: direct slice on dim 0, indirect gather on dim 1.
+
+        Slices dim 0 directly (e.g., x[2:6]), then gathers from dim 1 of the
+        sliced result using an index tensor. Tests that direct slicing and
+        indirect access can coexist when applied to different dimensions.
+        """
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        idx = torch.randint(0, N, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, i):
+            direct_slice = x[2:6]
+            return direct_slice[:, i]
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC)
+
+    def test_hybrid_direct_single_elem_indirect_gather_2d(self):
+        """x[direct_int][indirect_idx]: direct integer index on dim 0, gather on dim 1.
+
+        Selects a single row directly (e.g., x[3]), then gathers columns from
+        that row using an index tensor. Tests the simplest hybrid pattern.
+        """
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        idx = torch.randint(0, N, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, i):
+            single_row = x[3]
+            return single_row[i]
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC)
+
+    def test_hybrid_direct_slice_indirect_gather_3d(self):
+        """x[direct_slice][indirect_idx] on a 3-D tensor [A,B,C].
+
+        Slices the first dim directly, then gathers from the second dim of the
+        slice. Tests hybrid access on higher-rank tensors.
+        """
+        A, B, C, P = 64, 8, 64, 16
+        x = self.to_spyre(torch.rand(A, B, C, dtype=torch.float16))
+        idx = torch.randint(0, B, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"A": A, "B": B, "C": C})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, i):
+            sliced = x[4:12]
+            return sliced[:, i, :]
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC)
+
+    def test_hybrid_direct_slice_indirect_gather_3d_with_unary(self):
+        """x[direct_slice][indirect_idx].exp() on a 3-D tensor.
+
+        Verifies that hybrid direct/indirect patterns work when fused with
+        unary operations, just as pure gathers do.
+        """
+        A, B, C, P = 64, 8, 64, 16
+        x = self.to_spyre(torch.rand(A, B, C, dtype=torch.float16))
+        idx = torch.randint(0, B, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"A": A, "B": B, "C": C})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, i):
+            sliced = x[4:12]
+            return sliced[:, i, :].exp()
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC, op="exp")
+
+    def test_hybrid_indirect_gather_direct_slice(self):
+        """x[indirect_idx][:direct_slice]: indirect gather on dim 0, then direct slice.
+
+        Gathers rows indirectly, then slices the result directly on dim 1.
+        Tests the reverse order compared to test_hybrid_direct_slice_indirect_gather.
+        """
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, i):
+            gathered = x[i]
+            return gathered[:, 10:50]
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC)
+
+    def test_hybrid_indirect_gather_direct_slice_with_unary(self):
+        """x[indirect_idx][:direct_slice].abs(): hybrid with post-slice unary.
+
+        Verifies that slicing after a gather, then fusing with a unary,
+        produces a coherent indirect-access op spec.
+        """
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(x, i):
+            gathered = x[i]
+            sliced = gathered[:, 10:50]
+            return sliced.abs()
+
+        self._stage_and_e2e(kernel, x, idx, expect=GATHER_OP_SPEC, op="abs")
+
+    def test_hybrid_two_gathers_different_dims_3d(self):
+        """x[idx_a][:, idx_b, :]: two indirect gathers on different dims of a 3-D tensor.
+
+        Applies indirect indexing to dim 0 and dim 1 independently on the
+        same value tensor, testing that multiple indirect dims on the same
+        op are handled correctly.
+        """
+        A, B, C, P = 64, 8, 64, 16
+        x = self.to_spyre(torch.rand(A, B, C, dtype=torch.float16))
+        idx_a = torch.randint(0, A, (P,), dtype=torch.int32).to("spyre")
+        idx_b = torch.randint(0, B, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"A": A, "B": B, "C": C})
+        self.name_dims(idx_a, {"P": P})
+        self.name_dims(idx_b, {"Q": P})
+
+        def kernel(x, ia, ib):
+            a_gath = x[ia]
+            return a_gath[:, ib, :]
+
+        self._stage_and_e2e(kernel, x, idx_a, idx_b, expect=GATHER_OP_SPEC)
+
+    def test_hybrid_embedding_lookup_with_direct_slice(self):
+        """Embedding table lookup with a direct-sliced segment before gathering.
+
+        Slice the embedding table directly (e.g., vocab subset), then gather
+        token embeddings from the slice. Tests hybrid access in an LLM-like
+        embedding scenario.
+        """
+        V, D, P = 32000, 512, 128
+        table = self.to_spyre(torch.rand(V, D, dtype=torch.float16))
+        token_ids = torch.randint(0, V // 4, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(table, {"V": V, "D": D})
+        self.name_dims(token_ids, {"B": P})
+
+        def kernel(table, ids):
+            subset = table[: V // 4]
+            return subset[ids]
+
+        self._stage_and_e2e(kernel, table, token_ids, expect=GATHER_OP_SPEC)
+
+    def test_hybrid_gather_sliced_table_3d(self):
+        """3-D table gather with a direct slice on one inner dim.
+
+        Gather from a 3-D table [V,H,Dh] where the first dim is sliced
+        directly before the gather, testing hybrid access with structure
+        mirroring paged KV-cache patterns.
+        """
+        V, H, Dh, B, Lk = 32768, 8, 128, 2, 256
+        cache = self.to_spyre(torch.rand(V, H, Dh, dtype=torch.float16))
+        slot_idxs = torch.randint(0, V // 2, (B, Lk), dtype=torch.int64).to("spyre")
+        self.name_dims(cache, {"V": V, "H": H, "Dh": Dh})
+        self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
+
+        def kernel(cache, indices):
+            sliced_cache = cache[: V // 2]
+            return sliced_cache[indices]
+
+        self._stage_and_e2e(kernel, cache, slot_idxs, expect=GATHER_OP_SPEC)
+
 
 # Op-behaviour scenarios run once at the default 32 cores. They classify / lower
 # / run each op and do not depend on the core count, so sweeping all ~90 of them
