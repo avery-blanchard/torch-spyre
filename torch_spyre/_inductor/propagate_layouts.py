@@ -2568,7 +2568,7 @@ def propagate_spyre_tensor_layouts(
                     )
                     if is_sub_region:
                         slice_stl = SpyreTensorLayout(
-                            [concretize_expr(s) for s in new_layout.size],
+                            list(real_input.size()),
                             new_layout.dtype,
                         )
                         tb.layouts = [slice_stl]
