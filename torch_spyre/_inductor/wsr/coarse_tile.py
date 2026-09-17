@@ -4806,38 +4806,6 @@ def _insert_one_read_copy(
     if isinstance(full_buf, StorageBox):
         full_buf = full_buf.data
 
-    # A spliced for_each_tile loop body includes splice loop vars (e.g. u0) in
-    # the index of reads from graph inputs. These vars represent per-iteration
-    # offset, not iteration variables of the copy. When get_read_writes() traces
-    # the copy's inner_fn, it will include these splice vars in the MemoryDep.
-    # If the copy's ranges don't include the splice var's extent, the MemoryDep
-    # will have mismatched dimensionality, causing insert_restickify_padding to
-    # crash with "interleaved index" error. Filter out splice vars from dep.
-    splice_loop_vars = _splice_loop_vars(sizing_op)
-    splice_var_pos_to_drop = [
-        i for i, v in enumerate(dep.var_names) if v in splice_loop_vars
-    ]
-    if splice_var_pos_to_drop:
-        # Remove splice vars from dep's var_names and size, substitute to 0 in index
-        filtered_var_names = [
-            v for i, v in enumerate(dep.var_names) if i not in splice_var_pos_to_drop
-        ]
-        filtered_size = [
-            s for i, s in enumerate(dep.size) if i not in splice_var_pos_to_drop
-        ]
-        filtered_index = sympy_subs(
-            dep.index,
-            {dep.var_names[i]: sympy.Integer(0) for i in splice_var_pos_to_drop},
-        )
-        dep = MemoryDep(
-            name=dep.name,
-            index=filtered_index,
-            size=tuple(filtered_size),
-            var_names=filtered_var_names,
-            dtype=dep.dtype,
-            is_write=dep.is_write,
-        )
-
     # Keep track of the offset already represented by dep.index.  Graph-input
     # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
     # after this pre-stickify pass has created the copy.  Unlike an ordinary
@@ -4953,6 +4921,12 @@ def _insert_one_read_copy(
             full_idx = idx
         subs = dict(zip(_dep.var_names, full_idx))
         subs.update(_loop_var_zeros)
+        # If idx has fewer elements than dep.var_names (e.g., tile_ranges is shorter
+        # than dep's iteration space), substitute missing vars to 0 to avoid them
+        # appearing as free symbols in the final index.
+        for v in _dep.var_names:
+            if v not in subs:
+                subs[v] = sympy.Integer(0)
         flat_index = sympy_subs(_dep.index, subs)
         flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
@@ -5842,6 +5816,17 @@ def _plan_read_copies(
                 # state, not a tiled dim any group member's loop divides.
                 continue
             for dep in _full_buffer_read_deps(op):
+                # Skip read copies if dep has splice loop vars in var_names. When
+                # the copy is created with ranges matching dep.size, but those
+                # ranges don't include the splice var's extent, get_read_writes()
+                # will extract a MemoryDep with dimensionality mismatch, crashing
+                # insert_restickify_padding. Pointwise consumers can't elide anyway,
+                # so the copy won't help with optimizations for them.
+                if isinstance(op.data, Pointwise) and any(
+                    v in _splice_loop_vars(op) for v in dep.var_names
+                ):
+                    continue
+
                 # dep.index.coeff(v) is a *linear* coefficient: it is blind
                 # to any constant offset in the index (e.g. 64*d0 + d1 and
                 # 64*d0 + d1 + 5 have identical coeffs). Two reads that
