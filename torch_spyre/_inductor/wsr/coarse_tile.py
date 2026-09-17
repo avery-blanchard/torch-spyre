@@ -4935,7 +4935,16 @@ def _insert_one_read_copy(
         subs.update(_loop_var_zeros)
         flat_index = sympy_subs(_dep.index, subs)
         flat_index += _full_buf.layout.offset - _initial_source_offset
-        return V.ops.load(_full_name, flat_index)
+        # Use _LoopVarRebaseHandler to pin loop vars (matching the direct-read path),
+        # so layout propagation sees a consistent 3-dimensional access pattern.
+        current_offset = (
+            _full_buf.layout.offset if hasattr(_full_buf.layout, "offset") else 0
+        )
+        offset_delta = current_offset - _initial_source_offset
+        with V.set_ops_handler(
+            _LoopVarRebaseHandler(V.ops, _full_name, _loop_var_zeros, offset_delta)
+        ):
+            return V.ops.load(_full_name, flat_index)
 
     # Construct under sizing_op's origins so data.origins is non-empty —
     # _single_arg_op_layout (propagate_layouts.py) unconditionally
