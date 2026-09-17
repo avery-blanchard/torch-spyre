@@ -5115,6 +5115,9 @@ def _insert_one_read_copy(
     copy_buf.origins = sizing_op.origins
     copy_buf.operation_name = copy_name
     copy_op_metadata(sizing_op, copy_buf)
+    # Store the source buffer's initial offset for later direct-read elision,
+    # so the direct_inner_fn can apply the same offset adjustment as the copy does.
+    copy_buf._initial_source_offset = initial_source_offset  # type: ignore[attr-defined]
     _propagate_read_copy_named_dims(copy_buf, dep)
     # This is a new operation with its own iteration space.  The source
     # operation's d0/d1/... names have no positional meaning for the copy, so
@@ -5683,6 +5686,8 @@ def _patch_consumer_to_read_copy(
             and original_dep_idx < len(original_loop_info.squeezed_advance_per_read)
             else []
         )
+        # Retrieve the source buffer's offset at copy-creation time from the copy buffer.
+        initial_offset = getattr(copy_buf, "_initial_source_offset", 0)
         new_op._read_copy_elision_record = ReadCopyElisionRecord(  # type: ignore[attr-defined]
             consumer_name=new_op.get_name(),
             copy_name=copy_name,
@@ -5695,6 +5700,7 @@ def _patch_consumer_to_read_copy(
                 tuple(tuple(pair) for pair in level)
                 for level in direct_squeezed_advance
             ),
+            source_layout_offset_at_record_time=initial_offset,
         )
 
     # new_op.loop_info (copied from consumer by copy_op_metadata inside

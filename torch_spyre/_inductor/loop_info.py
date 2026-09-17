@@ -281,6 +281,7 @@ class ReadCopyElisionRecord:
     direct_squeezed_advance_per_level: (
         tuple[tuple[tuple[sympy.Expr, sympy.Expr], ...], ...] | None
     ) = None
+    source_layout_offset_at_record_time: int = 0
 
 
 @dataclass

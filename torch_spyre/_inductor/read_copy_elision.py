@@ -268,9 +268,49 @@ def _clone_direct_consumer(
         for origin in consumer.data.origins
         if origin.target != torch.ops.aten.clone.default
     )
+
+    # Wrap direct_inner_fn to apply layout-offset adjustment (matching the
+    # copy's own offset handling). The offset may have changed since
+    # record_time, so we apply: current_offset - recorded_offset.
+    direct_inner_fn = record.direct_inner_fn
+    initial_offset = record.source_layout_offset_at_record_time
+    if initial_offset != 0:
+        source_buf = _unwrap_buffer(V.graph.get_buffer(record.source_name))
+        current_offset = (
+            source_buf.layout.offset if hasattr(source_buf.layout, "offset") else 0
+        )
+        offset_delta = current_offset - initial_offset
+        if offset_delta != 0:
+            # Wrap with an ops_handler that adjusts load addresses for the source.
+            from torch._inductor.ops_handler import WrapperHandler
+
+            class OffsetAdjustmentHandler(WrapperHandler):
+                def __init__(self, inner, source_name: str, delta: int):
+                    super().__init__(inner)
+                    self._source_name = source_name
+                    self._delta = delta
+
+                def load(self, name, index):
+                    if name == self._source_name and self._delta != 0:
+                        index = index + self._delta
+                    return super().load(name, index)
+
+            original_direct_inner_fn = direct_inner_fn
+
+            def offset_adjusted_inner(
+                *args,
+                _orig=original_direct_inner_fn,
+                _source=record.source_name,
+                _delta=offset_delta,
+            ):
+                with V.set_ops_handler(OffsetAdjustmentHandler(V.ops, _source, _delta)):
+                    return _orig(*args)
+
+            direct_inner_fn = offset_adjusted_inner
+
     direct_data = dataclasses.replace(
         consumer.data,
-        inner_fn=record.direct_inner_fn,
+        inner_fn=direct_inner_fn,
         origins=filtered_origins,
     )
     direct_op = ComputedBuffer(
