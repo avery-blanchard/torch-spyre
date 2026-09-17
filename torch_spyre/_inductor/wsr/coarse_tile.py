@@ -4806,55 +4806,6 @@ def _insert_one_read_copy(
     if isinstance(full_buf, StorageBox):
         full_buf = full_buf.data
 
-    # A spliced for_each_tile loop body may include a splice loop var (e.g. u0)
-    # in the consumer's read index from a graph input. That var represents
-    # per-iteration offset within the spliced loop, not an iteration variable
-    # of the copy itself. Filter it out: the copy's own loop_info handles
-    # device_tile_advance_expr separately, and duplicating the offset here
-    # would leak an unbacked symbol into device coordinates (see comment at
-    # line 4890-4901 below).
-    splice_loop_vars = _splice_loop_vars(sizing_op)
-    splice_var_indices = [
-        i for i, v in enumerate(dep.var_names) if v in splice_loop_vars
-    ]
-    filtered_loop_count_indices: list[int] = []  # Indices to keep in loop_count
-    if splice_var_indices:
-        # Create a filtered dep with splice vars removed from var_names/size
-        filtered_var_names = [
-            v for i, v in enumerate(dep.var_names) if i not in splice_var_indices
-        ]
-        filtered_size = [
-            s for i, s in enumerate(dep.size) if i not in splice_var_indices
-        ]
-        filtered_index = sympy_subs(
-            dep.index,
-            {
-                v: sympy.Integer(0)
-                for v in [dep.var_names[i] for i in splice_var_indices]
-            },
-        )
-        # Build a modified MemoryDep with splice vars removed
-        dep = MemoryDep(
-            name=dep.name,
-            index=filtered_index,
-            size=tuple(filtered_size),
-            var_names=filtered_var_names,
-            dtype=dep.dtype,
-            is_write=dep.is_write,
-        )
-        # The copy's loop_info must also exclude the splice loop var's extent.
-        # Track which indices to keep so loop_count can be filtered later.
-        sizing_op_info = sizing_op.loop_info  # type: ignore[attr-defined]
-        num_loop_levels = len(sizing_op_info.loop_count)
-        # Map from dep.var_names position to loop_count index. Each var_names
-        # element corresponds to a loop level (the outermost-to-innermost tiling
-        # of that dimension). splice_var_indices are positions to drop.
-        filtered_loop_count_indices = [
-            i for i in range(num_loop_levels) if i not in splice_var_indices
-        ]
-    else:
-        sizing_op_info = sizing_op.loop_info  # type: ignore[attr-defined]
-
     # Keep track of the offset already represented by dep.index.  Graph-input
     # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
     # after this pre-stickify pass has created the copy.  Unlike an ordinary
@@ -4952,7 +4903,7 @@ def _insert_one_read_copy(
     # that is what "invariant" means -- so this substitution is a no-op.)
     loop_var_zeros = {sym: sympy.Integer(0) for sym in _splice_loop_vars(sizing_op)}
 
-    def _copy_inner_fn(
+    def _copy_inner_fn_impl(
         idx,
         _dep=dep,
         _full_name=full_buf.get_name(),
@@ -4973,6 +4924,21 @@ def _insert_one_read_copy(
         flat_index = sympy_subs(_dep.index, subs)
         flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
+
+    # Wrap the copy's inner_fn with _LoopVarRebaseHandler to pin splice loop
+    # vars to 0 during MemoryDep extraction. Without this, get_read_writes()
+    # would trace the load with splice vars still in the index, creating a
+    # MemoryDep with wrong dimensionality.
+    def _copy_inner_fn(
+        *args,
+        _orig_inner=_copy_inner_fn_impl,
+        _source_name=full_buf.get_name(),
+        _loop_var_zeros=loop_var_zeros,
+    ):
+        with V.set_ops_handler(
+            _LoopVarRebaseHandler(V.ops, _source_name, _loop_var_zeros)
+        ):
+            return _orig_inner(*args)
 
     # Construct under sizing_op's origins so data.origins is non-empty —
     # _single_arg_op_layout (propagate_layouts.py) unconditionally
@@ -5492,14 +5458,9 @@ def _insert_one_read_copy(
     # domains relies on this: it only indexes reduction_ranges when
     # ctx.op.data exposes it, so an empty list here is correct, not a
     # placeholder to fill in later.
-    # If splice loop vars were filtered from the copy's ranges, also filter
-    # loop_count and create empty lists for the remaining levels.
-    filtered_loop_count = (
-        tuple(sizing_op_info.loop_count[i] for i in filtered_loop_count_indices)
-        if filtered_loop_count_indices
-        else sizing_op_info.loop_count
-    )
-    copy_loop_tiled_reduction_dims: list[list[int]] = [[] for _ in filtered_loop_count]
+    copy_loop_tiled_reduction_dims: list[list[int]] = [
+        [] for _ in sizing_op_info.loop_count
+    ]
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         sizing_op_info,
         loop_tiled_dims=copy_loop_tiled_dims,
@@ -5516,7 +5477,6 @@ def _insert_one_read_copy(
         # marking this LX write as advancing.
         squeezed_advance_output=[],
         propagation=PropagationPlan(kind="loop_internal"),
-        loop_count=filtered_loop_count,
     )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
