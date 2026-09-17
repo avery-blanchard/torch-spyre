@@ -4843,6 +4843,33 @@ def _insert_one_read_copy(
     # loop dimension would materialize the expanded [E, ...] view in HBM.
     # A fully-broadcast scalar has no real dimensions to compact.
     compact_invariant = loop_invariant and bool(active_idx)
+
+    # Filter dep to only include active dimensions. Zero-coefficient vars don't
+    # appear in the copy's loop iteration, so including them causes get_read_writes()
+    # to extract a MemoryDep with unsubstituted free symbols, breaking padding.
+    if not compact_invariant and active_idx and len(active_idx) < len(dep.var_names):
+        filtered_var_names = [dep.var_names[i] for i in active_idx]
+        filtered_size = [dep.size[i] for i in active_idx]
+        filtered_index = sympy_subs(
+            dep.index,
+            {
+                dep.var_names[i]: sympy.Integer(0)
+                for i in range(len(dep.var_names))
+                if i not in active_idx
+            },
+        )
+        dep = MemoryDep(
+            name=dep.name,
+            index=filtered_index,
+            size=tuple(filtered_size),
+            var_names=filtered_var_names,
+            dtype=dep.dtype,
+            is_write=dep.is_write,
+        )
+        # Recompute active_idx and full_coeff after filtering
+        full_coeff = [dep.index.coeff(v) for v in dep.var_names]
+        active_idx = list(range(len(dep.var_names)))  # All are now active
+
     tile_ranges = (
         [dep.size[i] for i in active_idx] if compact_invariant else list(dep.size)
     )
@@ -4921,12 +4948,6 @@ def _insert_one_read_copy(
             full_idx = idx
         subs = dict(zip(_dep.var_names, full_idx))
         subs.update(_loop_var_zeros)
-        # If idx has fewer elements than dep.var_names (e.g., tile_ranges is shorter
-        # than dep's iteration space), substitute missing vars to 0 to avoid them
-        # appearing as free symbols in the final index.
-        for v in _dep.var_names:
-            if v not in subs:
-                subs[v] = sympy.Integer(0)
         flat_index = sympy_subs(_dep.index, subs)
         flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
