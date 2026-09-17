@@ -4861,10 +4861,8 @@ def _insert_one_read_copy(
         dep = MemoryDep(
             name=dep.name,
             index=filtered_index,
+            var_names=tuple(filtered_var_names),
             size=tuple(filtered_size),
-            var_names=filtered_var_names,
-            dtype=dep.dtype,
-            is_write=dep.is_write,
         )
         # Recompute active_idx and full_coeff after filtering
         full_coeff = [dep.index.coeff(v) for v in dep.var_names]
