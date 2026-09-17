@@ -4806,6 +4806,42 @@ def _insert_one_read_copy(
     if isinstance(full_buf, StorageBox):
         full_buf = full_buf.data
 
+    # A spliced for_each_tile loop body may include a splice loop var (e.g. u0)
+    # in the consumer's read index from a graph input. That var represents
+    # per-iteration offset within the spliced loop, not an iteration variable
+    # of the copy itself. Filter it out: the copy's own loop_info handles
+    # device_tile_advance_expr separately, and duplicating the offset here
+    # would leak an unbacked symbol into device coordinates (see comment at
+    # line 4890-4901 below).
+    splice_loop_vars = _splice_loop_vars(sizing_op)
+    splice_var_indices = [
+        i for i, v in enumerate(dep.var_names) if v in splice_loop_vars
+    ]
+    if splice_var_indices:
+        # Create a filtered dep with splice vars removed from var_names/size
+        filtered_var_names = [
+            v for i, v in enumerate(dep.var_names) if i not in splice_var_indices
+        ]
+        filtered_size = [
+            s for i, s in enumerate(dep.size) if i not in splice_var_indices
+        ]
+        filtered_index = sympy_subs(
+            dep.index,
+            {
+                v: sympy.Integer(0)
+                for v in [dep.var_names[i] for i in splice_var_indices]
+            },
+        )
+        # Build a modified MemoryDep with splice vars removed
+        dep = MemoryDep(
+            name=dep.name,
+            index=filtered_index,
+            size=tuple(filtered_size),
+            var_names=filtered_var_names,
+            dtype=dep.dtype,
+            is_write=dep.is_write,
+        )
+
     # Keep track of the offset already represented by dep.index.  Graph-input
     # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
     # after this pre-stickify pass has created the copy.  Unlike an ordinary
