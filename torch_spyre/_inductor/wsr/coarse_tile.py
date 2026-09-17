@@ -4817,6 +4817,7 @@ def _insert_one_read_copy(
     splice_var_indices = [
         i for i, v in enumerate(dep.var_names) if v in splice_loop_vars
     ]
+    filtered_loop_count_indices: list[int] = []  # Indices to keep in loop_count
     if splice_var_indices:
         # Create a filtered dep with splice vars removed from var_names/size
         filtered_var_names = [
@@ -4841,6 +4842,18 @@ def _insert_one_read_copy(
             dtype=dep.dtype,
             is_write=dep.is_write,
         )
+        # The copy's loop_info must also exclude the splice loop var's extent.
+        # Track which indices to keep so loop_count can be filtered later.
+        sizing_op_info = sizing_op.loop_info  # type: ignore[attr-defined]
+        num_loop_levels = len(sizing_op_info.loop_count)
+        # Map from dep.var_names position to loop_count index. Each var_names
+        # element corresponds to a loop level (the outermost-to-innermost tiling
+        # of that dimension). splice_var_indices are positions to drop.
+        filtered_loop_count_indices = [
+            i for i in range(num_loop_levels) if i not in splice_var_indices
+        ]
+    else:
+        sizing_op_info = sizing_op.loop_info  # type: ignore[attr-defined]
 
     # Keep track of the offset already represented by dep.index.  Graph-input
     # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
@@ -5479,9 +5492,14 @@ def _insert_one_read_copy(
     # domains relies on this: it only indexes reduction_ranges when
     # ctx.op.data exposes it, so an empty list here is correct, not a
     # placeholder to fill in later.
-    copy_loop_tiled_reduction_dims: list[list[int]] = [
-        [] for _ in sizing_op_info.loop_count
-    ]
+    # If splice loop vars were filtered from the copy's ranges, also filter
+    # loop_count and create empty lists for the remaining levels.
+    filtered_loop_count = (
+        tuple(sizing_op_info.loop_count[i] for i in filtered_loop_count_indices)
+        if filtered_loop_count_indices
+        else sizing_op_info.loop_count
+    )
+    copy_loop_tiled_reduction_dims: list[list[int]] = [[] for _ in filtered_loop_count]
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         sizing_op_info,
         loop_tiled_dims=copy_loop_tiled_dims,
@@ -5498,6 +5516,7 @@ def _insert_one_read_copy(
         # marking this LX write as advancing.
         squeezed_advance_output=[],
         propagation=PropagationPlan(kind="loop_internal"),
+        loop_count=filtered_loop_count,
     )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
