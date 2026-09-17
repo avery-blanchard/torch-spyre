@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 
 import sympy
+import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -31,6 +32,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
 from . import config
 from .constants import MATMUL_REDUCTION_OPS
@@ -252,7 +254,25 @@ def _direct_source_ownership_matches(
 def _clone_direct_consumer(
     consumer: ComputedBuffer, record: ReadCopyElisionRecord
 ) -> ComputedBuffer:
-    direct_data = dataclasses.replace(consumer.data, inner_fn=record.direct_inner_fn)
+    # `inner_fn` no longer performs whatever op `consumer` used to (e.g. a
+    # clone/contiguous passthrough of a single arg's coordinate); it now
+    # reads `record.source_name` directly via a rebased, loop-advancing
+    # address. Origins describing that old, no-longer-accurate computation
+    # must not survive the swap -- layout propagation keys off `origins` to
+    # decide an op's shape semantics (see `_clone_layout` in
+    # propagate_layouts.py), and a stale `aten.clone.default` tag would make
+    # it misread this buffer's device coordinates as a simple 1:1 passthrough
+    # of its (no longer sole, no longer representative) first arg.
+    filtered_origins = OrderedSet(
+        origin
+        for origin in consumer.data.origins
+        if origin.target != torch.ops.aten.clone.default
+    )
+    direct_data = dataclasses.replace(
+        consumer.data,
+        inner_fn=record.direct_inner_fn,
+        origins=filtered_origins,
+    )
     direct_op = ComputedBuffer(
         name=consumer.get_name(),
         layout=consumer.layout,
