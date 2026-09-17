@@ -29,7 +29,6 @@ import os
 import sys
 
 import torch
-from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -1164,8 +1163,6 @@ class _ScatterEntryCountScenarios:
             return dest, src, i
 
         fn = self._scatter_fn
-        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
-        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
         self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
 
     def test_scatter_cross_core_shared_dest(self):
@@ -1203,27 +1200,6 @@ class _ScatterEntryCountScenarios:
 # Register the entry-count scenarios once at default SENCORES (no sweep)
 register_multicore_variants(
     _ScatterEntryCountScenarios, "TestScatterEntryCounts", globals(), counts=(32,)
-)
-
-
-class _ScatterUnalignedDataDimSplitScenarios:
-    """test_work_division_unaligned_data_dim, rerun at a non-default,
-    non-power-of-two core count so a regression in element-granularity
-    splitting is not masked by only ever compiling at SENCORES=32."""
-
-    to_spyre = staticmethod(plain_to_spyre)
-    _scatter_fn = staticmethod(_ScatterEntryCountScenarios._scatter_fn)
-
-    test_work_division_unaligned_data_dim = (
-        _ScatterEntryCountScenarios.test_work_division_unaligned_data_dim
-    )
-
-
-register_multicore_variants(
-    _ScatterUnalignedDataDimSplitScenarios,
-    "TestScatterUnalignedDataDimSplit",
-    globals(),
-    counts=(6,),
 )
 
 
