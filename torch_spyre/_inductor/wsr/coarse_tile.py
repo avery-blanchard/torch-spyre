@@ -4806,6 +4806,38 @@ def _insert_one_read_copy(
     if isinstance(full_buf, StorageBox):
         full_buf = full_buf.data
 
+    # A spliced for_each_tile loop body includes splice loop vars (e.g. u0) in
+    # the index of reads from graph inputs. These vars represent per-iteration
+    # offset, not iteration variables of the copy. When get_read_writes() traces
+    # the copy's inner_fn, it will include these splice vars in the MemoryDep.
+    # If the copy's ranges don't include the splice var's extent, the MemoryDep
+    # will have mismatched dimensionality, causing insert_restickify_padding to
+    # crash with "interleaved index" error. Filter out splice vars from dep.
+    splice_loop_vars = _splice_loop_vars(sizing_op)
+    splice_var_pos_to_drop = [
+        i for i, v in enumerate(dep.var_names) if v in splice_loop_vars
+    ]
+    if splice_var_pos_to_drop:
+        # Remove splice vars from dep's var_names and size, substitute to 0 in index
+        filtered_var_names = [
+            v for i, v in enumerate(dep.var_names) if i not in splice_var_pos_to_drop
+        ]
+        filtered_size = [
+            s for i, s in enumerate(dep.size) if i not in splice_var_pos_to_drop
+        ]
+        filtered_index = sympy_subs(
+            dep.index,
+            {dep.var_names[i]: sympy.Integer(0) for i in splice_var_pos_to_drop},
+        )
+        dep = MemoryDep(
+            name=dep.name,
+            index=filtered_index,
+            size=tuple(filtered_size),
+            var_names=filtered_var_names,
+            dtype=dep.dtype,
+            is_write=dep.is_write,
+        )
+
     # Keep track of the offset already represented by dep.index.  Graph-input
     # storage offsets are repaired later by propagate_spyre_tensor_layouts(),
     # after this pre-stickify pass has created the copy.  Unlike an ordinary
@@ -4903,7 +4935,7 @@ def _insert_one_read_copy(
     # that is what "invariant" means -- so this substitution is a no-op.)
     loop_var_zeros = {sym: sympy.Integer(0) for sym in _splice_loop_vars(sizing_op)}
 
-    def _copy_inner_fn_impl(
+    def _copy_inner_fn(
         idx,
         _dep=dep,
         _full_name=full_buf.get_name(),
@@ -4924,21 +4956,6 @@ def _insert_one_read_copy(
         flat_index = sympy_subs(_dep.index, subs)
         flat_index += _full_buf.layout.offset - _initial_source_offset
         return V.ops.load(_full_name, flat_index)
-
-    # Wrap the copy's inner_fn with _LoopVarRebaseHandler to pin splice loop
-    # vars to 0 during MemoryDep extraction. Without this, get_read_writes()
-    # would trace the load with splice vars still in the index, creating a
-    # MemoryDep with wrong dimensionality.
-    def _copy_inner_fn(
-        *args,
-        _orig_inner=_copy_inner_fn_impl,
-        _source_name=full_buf.get_name(),
-        _loop_var_zeros=loop_var_zeros,
-    ):
-        with V.set_ops_handler(
-            _LoopVarRebaseHandler(V.ops, _source_name, _loop_var_zeros)
-        ):
-            return _orig_inner(*args)
 
     # Construct under sizing_op's origins so data.origins is non-empty —
     # _single_arg_op_layout (propagate_layouts.py) unconditionally
