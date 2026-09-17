@@ -4467,16 +4467,28 @@ class _LoopVarRebaseHandler(WrapperHandler):
     read restored after planning must use the same single representation;
     otherwise the offset is applied twice and the raw unbacked symbol leaks
     into the OpSpec coordinates.
+
+    Also applies layout offset adjustment (matching the copy's pattern) when
+    the source buffer has a nonzero offset.
     """
 
-    def __init__(self, inner, source_name: str, loop_var_zeros: dict[Expr, Expr]):
+    def __init__(
+        self,
+        inner,
+        source_name: str,
+        loop_var_zeros: dict[Expr, Expr],
+        layout_offset_delta: int = 0,
+    ):
         super().__init__(inner)
         self._source_name = source_name
         self._loop_var_zeros = loop_var_zeros
+        self._layout_offset_delta = layout_offset_delta
 
     def load(self, name, index):
         if name == self._source_name:
             index = sympy_subs(index, self._loop_var_zeros)
+            if self._layout_offset_delta != 0:
+                index = index + self._layout_offset_delta
         return super().load(name, index)
 
 
@@ -5662,15 +5674,36 @@ def _patch_consumer_to_read_copy(
         )
     if direct_read_candidate:
         loop_var_zeros = {sym: sympy.Integer(0) for sym in _splice_loop_vars(consumer)}
+        # Capture the source buffer and its initial offset for offset-adjustment handling
+        full_buf_for_direct = V.graph.get_buffer(dep.name)
+        if isinstance(full_buf_for_direct, TensorBox):
+            full_buf_for_direct = full_buf_for_direct.data
+        if isinstance(full_buf_for_direct, StorageBox):
+            full_buf_for_direct = full_buf_for_direct.data
+        initial_offset_for_direct = (
+            full_buf_for_direct.layout.offset
+            if hasattr(full_buf_for_direct.layout, "offset")
+            else 0
+        )
 
         def rebased_direct_inner(
             *args,
             _orig_inner=orig_inner,
             _source_name=dep.name,
             _loop_var_zeros=loop_var_zeros,
+            _full_buf=full_buf_for_direct,
+            _initial_offset=initial_offset_for_direct,
         ):
+            # Apply offset adjustment matching the copy's pattern:
+            # flat_index += current_offset - initial_offset
+            current_offset = (
+                _full_buf.layout.offset if hasattr(_full_buf.layout, "offset") else 0
+            )
+            offset_delta = current_offset - _initial_offset
             with V.set_ops_handler(
-                _LoopVarRebaseHandler(V.ops, _source_name, _loop_var_zeros)
+                _LoopVarRebaseHandler(
+                    V.ops, _source_name, _loop_var_zeros, offset_delta
+                )
             ):
                 return _orig_inner(*args)
 
