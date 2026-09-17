@@ -179,6 +179,11 @@ def _patch_tensor_for_spyre():
                 _add_ea(self, res)
             return res
         else:
+            # These pybind bindings allocate directly, bypassing the
+            # PrivateUse1 kernel path that would otherwise trigger
+            # startRuntime().
+            torch.spyre._impl._lazy_init()
+
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
             device = kwargs.get("device")
@@ -286,6 +291,11 @@ def _patch_tensor_for_spyre():
                 kwargs["device"] = device
             return orig_empty(*args, **kwargs)
         else:
+            # empty_with_layout allocates directly, bypassing the
+            # PrivateUse1 kernel path that would otherwise trigger
+            # startRuntime().
+            torch.spyre._impl._lazy_init()
+
             # layout_opt is omitted; c10::Layout has no pybind11 type caster,
             # so py_empty_with_layout drops that parameter and always uses
             # the default (Strided).
