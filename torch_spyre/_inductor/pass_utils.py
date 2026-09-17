@@ -92,6 +92,7 @@ class AlignmentAccess:
 
     device_layout: Any
     index: sympy.Expr
+    name: str | None = None
 
 
 def input_layout_for_operation(op: Operation, name: str, default: Any) -> Any:
@@ -1417,6 +1418,7 @@ def build_operation_alignment_inputs(
                 resolved_indirect_sizes,
                 repeat_info_out=repeat_snapshot,
             ),
+            "name": access.name,
         }
         for access in accesses
     ]

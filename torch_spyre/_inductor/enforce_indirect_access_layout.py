@@ -323,9 +323,13 @@ def _scatter_alignment_inputs(
         if not isinstance(layout, FixedTiledLayout):
             return None
         accesses.append(
-            AlignmentAccess(overrides.get(dep.name, layout.device_layout), dep.index)
+            AlignmentAccess(
+                overrides.get(dep.name, layout.device_layout), dep.index, dep.name
+            )
         )
-    accesses.append(AlignmentAccess(output_layout.device_layout, write_dep.index))
+    accesses.append(
+        AlignmentAccess(output_layout.device_layout, write_dep.index, write_dep.name)
+    )
     space = iteration_space_from_op(op)
     return build_operation_alignment_inputs(
         space,

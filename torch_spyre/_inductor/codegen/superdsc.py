@@ -87,7 +87,7 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
-    index_tensor_dim_order: list[Symbol] | None = None
+    is_indirect_value_tensor: bool = False
     device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
@@ -1615,22 +1615,15 @@ def _create_sdsc_tensors(
             get_value_tensor_idx_for_index(op_spec, i) if is_idx_tensor else -1
         )
 
-        # For value tensors, store the index tensor's dim_order so per-core
-        # addressing only includes dims that are actually indexed
-        index_dim_order_for_value = None
+        is_value_tensor_for_index = False
         if (
             has_indirect_access
             and related_val_idx < 0
             and i not in index_tensor_indices
         ):
-            # This might be a value tensor; find which index tensor uses it
             for idx_i in index_tensor_indices:
                 if get_value_tensor_idx_for_index(op_spec, idx_i) == i:
-                    # Found the index tensor; store its dim_order
-                    index_tensor_arg = op_spec.args[idx_i]
-                    index_dim_order_for_value, _ = _get_device_dim_order(
-                        index_tensor_arg, symbol_mapping, op_spec, tensor_position=idx_i
-                    )
+                    is_value_tensor_for_index = True
                     break
 
         sdsc_arg = SDSCArgs(
@@ -1647,7 +1640,7 @@ def _create_sdsc_tensors(
             arg_index=arg.arg_index,
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
-            index_tensor_dim_order=index_dim_order_for_value,
+            is_indirect_value_tensor=is_value_tensor_for_index,
             device_tile_advance_expr=arg.device_tile_advance_expr,
         )
         if arg.work_division is not None:

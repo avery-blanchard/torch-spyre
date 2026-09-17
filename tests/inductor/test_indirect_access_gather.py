@@ -48,6 +48,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -1106,6 +1107,12 @@ class _GatherMulticoreScenarios:
     # scenarios only check classification and end-to-end correctness through
     # _stage_and_e2e; test_work_division_unaligned_data_dim below additionally
     # asserts the exact split map via assert_indexed_dim_split.
+    #
+    # test_work_division_unaligned_data_dim is also registered separately at a
+    # non-default core count (see _GatherUnalignedDataDimSplitScenarios below),
+    # since the entry dim now splits at element granularity: a regression that
+    # only manifests for a non-power-of-two SENCORES would not be caught by the
+    # SENCORES=32 sweep alone.
 
     @staticmethod
     def _gather_fn(table, idx):
@@ -1147,6 +1154,8 @@ class _GatherMulticoreScenarios:
             return x, i
 
         fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     # -- shared value table: cross-core read correctness ------------------
@@ -1182,6 +1191,27 @@ class _GatherMulticoreScenarios:
 
 register_multicore_variants(
     _GatherMulticoreScenarios, "TestGatherMulticore", globals(), counts=(32,)
+)
+
+
+class _GatherUnalignedDataDimSplitScenarios:
+    """test_work_division_unaligned_data_dim, rerun at a non-default,
+    non-power-of-two core count so a regression in element-granularity
+    splitting is not masked by only ever compiling at SENCORES=32."""
+
+    to_spyre = staticmethod(plain_to_spyre)
+    _gather_fn = staticmethod(_GatherMulticoreScenarios._gather_fn)
+
+    test_work_division_unaligned_data_dim = (
+        _GatherMulticoreScenarios.test_work_division_unaligned_data_dim
+    )
+
+
+register_multicore_variants(
+    _GatherUnalignedDataDimSplitScenarios,
+    "TestGatherUnalignedDataDimSplit",
+    globals(),
+    counts=(6,),
 )
 
 

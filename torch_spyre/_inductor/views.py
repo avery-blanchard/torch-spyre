@@ -17,7 +17,7 @@
 from dataclasses import dataclass, astuple
 import math
 import sympy
-from typing import Callable, Dict, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, cast
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
@@ -730,7 +730,7 @@ class AlignmentInputs:
     """Everything tensor alignment needs, captured without hidden graph state."""
 
     iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]]
-    tensors: list[dict[str, list[sympy.Expr]]]
+    tensors: list[dict[str, Any]]
     indirect_sizes: dict[sympy.Symbol, int] | None
     repeat_info: dict[sympy.Symbol, dict]
     concrete_ranges: dict[sympy.Symbol, int | float]
@@ -760,7 +760,7 @@ class UnalignedStickSplit(Unsupported):
 
 def build_alignment_inputs(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
-    tensors: list[Dict[str, list[sympy.Expr]]],
+    tensors: list[Dict[str, Any]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     repeat_info: "dict[sympy.Symbol, dict] | None" = None,
 ) -> AlignmentInputs:
@@ -788,6 +788,7 @@ def build_alignment_inputs(
             {
                 "size": list(tensor["size"]),
                 "coordinates": list(tensor["coordinates"]),
+                "name": tensor.get("name"),
             }
             for tensor in tensors
         ],
@@ -857,28 +858,28 @@ def align_tensors_pure(
     stick_size: list = []  # stick size for each tensor
     index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    # First pass: identify index tensors from raw coordinates (before normalization).
-    # Check raw coordinates for IndirectAccess nodes, which only appear in value tensors.
-    def raw_coords_have_indirect_access(coordinates: Sequence) -> bool:
-        """Check if raw coordinate expressions contain IndirectAccess."""
+    # Identify index tensors: the arg whose name is referenced via IndirectAccess in other args.
+    def referenced_indirect_names(coordinates: Sequence) -> set[str]:
+        """Names referenced via IndirectAccess(name) in these coordinates."""
+        names: set[str] = set()
         for coord in coordinates:
-            if coord.has(IndirectAccess):
-                return True
-        return False
+            if isinstance(coord, sympy.Expr):
+                for node in sympy.preorder_traversal(coord):
+                    if isinstance(node, IndirectAccess):
+                        names.add(str(node.args[0]))
+        return names
 
-    any_tensor_has_indirect = any(
-        raw_coords_have_indirect_access(tensor["coordinates"]) for tensor in tensors
-    )
+    all_referenced_names: set[str] = set()
+    for tensor in tensors:
+        all_referenced_names |= referenced_indirect_names(tensor["coordinates"])
 
-    index_tensor_indices_pre_norm = {}  # tensor_idx -> is_index_tensor
+    index_tensor_indices_pre_norm = {}
     for tensor_idx, tensor in enumerate(tensors):
-        has_indirect = raw_coords_have_indirect_access(tensor["coordinates"])
-        is_index_tensor = any_tensor_has_indirect and not has_indirect
+        is_index_tensor = tensor.get("name") in all_referenced_names
         index_tensor_indices_pre_norm[tensor_idx] = is_index_tensor
 
-    # Second pass: normalize coordinates, passing index-tensor info to prevent synthetic-var injection
     for tensor_idx, tensor in enumerate(tensors):
-        _synthetic_var_idx = 0  # reuse synthetic_var across tensors
+        _synthetic_var_idx = 0
         is_index_tensor = index_tensor_indices_pre_norm[tensor_idx]
         terms = normalize_coordinates(
             var_ranges,
@@ -1163,7 +1164,7 @@ def align_tensors_pure(
 
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
-    tensors: list[Dict[str, list[sympy.Expr]]],
+    tensors: list[Dict[str, Any]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     repeat_info: "dict[sympy.Symbol, dict] | None" = None,
 ) -> tuple[

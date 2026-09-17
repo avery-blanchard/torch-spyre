@@ -186,8 +186,7 @@ def core_idx_to_slice_offset(
     work_slices: dict,
 ) -> int:
     offset = sum(arg.offsets.values())
-    # Check if this is an indirect value tensor (has index_tensor_dim_order set)
-    is_value_tensor = getattr(arg, "index_tensor_dim_order", None) is not None
+    is_value_tensor = getattr(arg, "is_indirect_value_tensor", False)
 
     # For indirect value tensors, only unbounded dims (non-paged) vary address
     max_dim_sizes = getattr(arg, "max_dim_sizes", None)
