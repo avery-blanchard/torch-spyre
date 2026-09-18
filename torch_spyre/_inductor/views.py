@@ -875,17 +875,14 @@ def align_tensors_pure(
     for tensor in tensors:
         all_indirect_names |= extract_indirect_access_names(tensor["coordinates"])
 
-    # Index tensors: input tensors that are referenced/indexed by other tensors.
-    # By the time we reach here, IndirectAccess may have been substituted with
-    # indirect symbols, so we identify them by: is_input=True AND has a name.
-    # Index tensors are typically small (the indices), inputs always have names set.
+    # Index tensors: those whose names are referenced by IndirectAccess.
+    # Identified by having a non-None name field.
     index_tensor_indices_pre_norm: dict[int, bool] = {}
     for tensor_idx, tensor in enumerate(tensors):
         tensor_name = tensor.get("name")
-        is_input = tensor.get("is_input", False)
 
-        # An input tensor with a non-None name is likely an index tensor
-        is_index_tensor: bool = bool(is_input and tensor_name)
+        # A tensor is an index tensor if it has a non-None name
+        is_index_tensor: bool = bool(tensor_name)
         index_tensor_indices_pre_norm[tensor_idx] = is_index_tensor
 
     for tensor_idx, tensor in enumerate(tensors):
