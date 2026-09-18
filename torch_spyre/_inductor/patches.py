@@ -161,14 +161,12 @@ def enable_spyre_context(example_inputs: list[InputType]):
     }
 
     from torch._inductor.ir import Loops, Pointwise
+    from torch._inductor.dependencies import MemoryDep
     import torch
 
     old_loop = Loops.has_large_inner_fn
 
-    # aten ops whose lowering itself performs the indirect access (calls
-    # ops.indirect_indexing() directly in its own inner_fn, not inherited via
-    # inlining a producer). Bare gather/index_select lower straight to a
-    # Pointwise whose origin_node.target is one of these.
+    # Gather/scatter aten ops that directly perform indirect access.
     _INDIRECT_ACCESS_ATEN_OPS = frozenset(
         {
             torch.ops.aten.index.Tensor,
@@ -181,23 +179,30 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One indirect op (gather/scatter) may fuse with exactly one consumer.
-        # Identify "is this op itself the indirect access" via origin_node.target
-        # -- set before inlining, unlike get_reads() which re-executes inner_fn
-        # and so can't distinguish "I am the gather" from "I inherited one by
-        # inlining my producer". Only the gather's own node stays inlineable
-        # (False); every other op realizes (True), which -- because upstream
-        # mutates the producer's TensorBox to ComputedBuffer synchronously,
-        # before the next FX node lowers -- prevents anything from inlining
-        # INTO an already-realized op. Net effect: gather fuses with its one
-        # immediate consumer, then that fused result realizes, so a second
-        # consumer (tanh in x[i].exp().tanh()) cannot chain onto it.
+        # One indirect operation per kernel: x[i] stays inlineable so it can
+        # fuse with its consumer (exp). But exp then realizes to break the chain,
+        # preventing tanh from inlining into it. Net: x[i].exp() is one fused
+        # kernel, tanh is separate.
+        # Exception: the gather itself (origin_node in INDIRECT_OPS) stays
+        # inlineable. Everything else with indirect reads realizes.
+        if not isinstance(self, Pointwise):
+            return old_loop(self, threshold)
+
+        # If this IS the gather/scatter, stay inlineable.
         if (
-            isinstance(self, Pointwise)
-            and self.origin_node is not None
+            self.origin_node is not None
             and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
         ):
             return False
+
+        # If this Pointwise reads indirectly (either it's the gather, or it
+        # inherited an indirect read by inlining), realize it. This check
+        # catches exp(x[i]) and forces it to realize after fusing with x[i],
+        # blocking tanh from chaining onto it.
+        for dep in self.get_reads():
+            if isinstance(dep, MemoryDep) and dep.is_indirect():
+                return True
+
         return old_loop(self, threshold)
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
