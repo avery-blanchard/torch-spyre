@@ -1029,12 +1029,13 @@ def align_tensors_pure(
             # Synthetic vars (z0, z1, …) are introduced by normalize_coordinates
             # for restored size-1 dims and are not in orig_ranges; fall back to
             # the concretized value (always 1) for those.
-            new_var_ranges[var] = inputs.restored_ranges.get(var, var_ranges[var])
             # var can be a loop var or an indirect symbol
             if var in var_ranges:
                 new_var_ranges[var] = var_ranges[var]
             elif indirect_sizes is not None and var in indirect_sizes:
                 new_var_ranges[var] = indirect_sizes[var]
+            elif var in inputs.restored_ranges:
+                new_var_ranges[var] = inputs.restored_ranges[var]
             else:
                 raise Unsupported(
                     f"Variable {var} has no range in var_ranges or indirect_sizes"
