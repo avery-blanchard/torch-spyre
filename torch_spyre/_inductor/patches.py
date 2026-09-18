@@ -166,8 +166,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
     old_loop = Loops.has_large_inner_fn
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One LLIR: one indirect op + one compute op. Indirect ops stay
-        # inlineable; compute ops consuming them realize after fusion.
+        # One LLIR: one indirect op + one compute op. Only indirect ops
+        # (gather/scatter producing indirectly-indexed buffers) stay inlineable.
+        # All compute ops force realize, so they fuse at most once with an
+        # inlined indirect op, preventing chains like exp(x[i]).tanh().
         from torch._inductor.ir import Pointwise
 
         if not isinstance(self, Pointwise):
@@ -186,13 +188,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
                     has_indirect_write = True
                     break
 
+        # Indirect ops stay inlineable; compute ops force realize.
         if has_indirect_read or has_indirect_write:
             return False
-
-        read_count = len(list(self.get_reads()))
-        if read_count > 1:
-            return True
-
         return True
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
