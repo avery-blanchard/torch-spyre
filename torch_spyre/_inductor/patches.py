@@ -166,15 +166,33 @@ def enable_spyre_context(example_inputs: list[InputType]):
     old_loop = Loops.has_large_inner_fn
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # Force all operations to be realized when LoopLevel IR is initially
-        # constructed, except gather-pattern ops (those with an indirect read
-        # dep) -- leave those uninlined so Inductor's own native fusion can
-        # splice them into their consumer's inner_fn. See spyre_kernel.py's
-        # store() for the corresponding one-indirect-value-tensor-per-op guard
-        # that keeps this within the backend's hardware limit.
+        # One LLIR: one indirect op + one compute op. Indirect ops stay
+        # inlineable; compute ops consuming them realize after fusion.
+        from torch._inductor.ir import Pointwise
+
+        if not isinstance(self, Pointwise):
+            return True
+
+        has_indirect_read = False
         for dep in self.get_reads():
             if isinstance(dep, MemoryDep) and dep.is_indirect():
-                return False
+                has_indirect_read = True
+                break
+
+        has_indirect_write = False
+        if hasattr(self, "get_writes"):
+            for dep in self.get_writes():
+                if isinstance(dep, MemoryDep) and dep.is_indirect():
+                    has_indirect_write = True
+                    break
+
+        if has_indirect_read or has_indirect_write:
+            return False
+
+        read_count = len(list(self.get_reads()))
+        if read_count > 1:
+            return True
+
         return True
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
