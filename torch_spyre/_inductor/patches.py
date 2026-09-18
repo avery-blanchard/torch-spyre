@@ -161,6 +161,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
     }
 
     from torch._inductor.ir import Loops, Pointwise
+    from torch._inductor.dependencies import MemoryDep
     import torch
 
     old_loop = Loops.has_large_inner_fn
@@ -178,24 +179,48 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One indirect operation per kernel: gather fuses with one consumer,
-        # then that consumer realizes to block further chaining.
+        # One indirect operation per kernel: gather fuses with one consumer
+        # (e.g., exp), then that fused result realizes to block further
+        # chaining (tanh cannot inline into it).
         #
-        # Only the gather itself stays inlineable (False).
-        # Everything else realizes (True).
+        # The gather stays inlineable (False). When exp is built, its inner_fn
+        # gets the inlined gather code. At that point, exp.get_reads() will
+        # report an indirect MemoryDep. We detect that and realize exp, which
+        # makes it a ComputedBuffer. When tanh is then lowered, it reads from
+        # exp's buffer, not exp's inner_fn, so tanh cannot inline further.
         if not isinstance(self, Pointwise):
             return old_loop(self, threshold)
 
-        # Gather: stay inlineable so it can fuse with its consumer.
+        # Gather: stay inlineable.
         if (
             self.origin_node is not None
             and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
         ):
+            import sys
+
+            print("[SPYRE] Gather: False", file=sys.stderr)
             return False
 
-        # Everything else: realize. This forces consumers of gathers to
-        # materialize as buffers, blocking further chaining.
-        return True
+        # Any op that has an indirect read (because it inlined a gather):
+        # realize it to block further chaining.
+        has_indirect = False
+        for dep in self.get_reads():
+            if isinstance(dep, MemoryDep) and dep.is_indirect():
+                has_indirect = True
+                break
+
+        import sys
+
+        op_name = self.origin_node.target if self.origin_node else "unknown"
+        print(
+            f"[SPYRE] Op {op_name}: has_indirect={has_indirect}, returning {has_indirect or old_loop(self, threshold)}",
+            file=sys.stderr,
+        )
+
+        if has_indirect:
+            return True
+
+        return old_loop(self, threshold)
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
