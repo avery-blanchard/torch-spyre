@@ -858,24 +858,35 @@ def align_tensors_pure(
     stick_size: list = []  # stick size for each tensor
     index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    # Identify index tensors: the arg whose name is referenced via IndirectAccess in other args.
-    def referenced_indirect_names(coordinates: Sequence) -> set[str]:
-        """Names referenced via IndirectAccess(name) in these coordinates."""
+    # Identify index tensors: those referenced by IndirectAccess in other tensors.
+    def extract_indirect_access_names(coordinates: Sequence) -> set[str]:
+        """Extract tensor names referenced via IndirectAccess(...) in coordinates."""
         names: set[str] = set()
         for coord in coordinates:
             if isinstance(coord, sympy.Expr):
                 for node in sympy.preorder_traversal(coord):
                     if isinstance(node, IndirectAccess):
+                        # IndirectAccess(name) has name as first argument
                         names.add(str(node.args[0]))
         return names
 
-    all_referenced_names: set[str] = set()
+    # Collect all tensor names referenced by IndirectAccess anywhere
+    all_indirect_names: set[str] = set()
     for tensor in tensors:
-        all_referenced_names |= referenced_indirect_names(tensor["coordinates"])
+        all_indirect_names |= extract_indirect_access_names(tensor["coordinates"])
 
+    # Index tensors are those REFERENCED by IndirectAccess (the tensors being indexed into),
+    # not those that CONTAIN IndirectAccess. They're always inputs.
     index_tensor_indices_pre_norm = {}
     for tensor_idx, tensor in enumerate(tensors):
-        is_index_tensor = tensor.get("name") in all_referenced_names
+        tensor_name = tensor.get("name")
+        is_input = tensor.get("is_input", False)
+
+        # A tensor is an index tensor if its name is referenced by IndirectAccess
+        # (and it should be an input tensor)
+        is_index_tensor: bool = bool(
+            is_input and tensor_name and tensor_name in all_indirect_names
+        )
         index_tensor_indices_pre_norm[tensor_idx] = is_index_tensor
 
     for tensor_idx, tensor in enumerate(tensors):
