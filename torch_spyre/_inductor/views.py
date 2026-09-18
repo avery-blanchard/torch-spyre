@@ -926,12 +926,11 @@ def align_tensors_pure(
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in all_vars}
 
     for i, terms in enumerate(all_terms):
-        for term_idx, term in enumerate(terms):
-            num, den, var, mod, dim_size, offset = astuple(term)
+        for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                # For index tensors, skip the last term (stick dimension).
-                # Index tensor sticks are data-layout artifacts, not split constraints.
-                if i in index_tensor_indices and term_idx == len(terms) - 1:
+                # Index tensors don't contribute split constraints (their coordinates
+                # describe data layout, not iteration boundaries).
+                if i in index_tensor_indices:
                     continue
 
                 is_stick_var = var == stick_dim[i]
