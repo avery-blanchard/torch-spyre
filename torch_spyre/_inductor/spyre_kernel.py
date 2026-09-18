@@ -1122,6 +1122,33 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         return TensorAccess(name, index, layout)
 
+    def _check_single_indirect_value_tensor(
+        self,
+        value,
+        indirect_syms: "set[sympy.Symbol] | None" = None,
+    ) -> None:
+        """Reject an op that fuses two distinct indirectly-addressed value tensors.
+
+        `x[i] + x[j]` (one value tensor, two index tensors) is fine; `x[i] +
+        y[j]` (two independent value tensors, each behind its own gather) is
+        not -- the Spyre backend supports at most one indirectly-addressed
+        value-tensor buffer per op. Native Inductor fusion decides
+        inline-vs-realize per producer independently, so nothing upstream
+        prevents two such gathers from both landing in the same consumer;
+        this is the guard that catches it before codegen.
+        """
+        if indirect_syms is None:
+            indirect_syms = _indirect_syms_used(value, self.indirect_vars)
+        indirect_value_names = {self.indirect_vars[sym].name for sym in indirect_syms}
+        if len(indirect_value_names) > 1:
+            raise Unsupported(
+                f"{value.op}: {len(indirect_value_names)} distinct "
+                "indirectly-addressed value tensors fused into one op "
+                f"({sorted(indirect_value_names)!r}); the Spyre backend "
+                "supports at most one indirectly-addressed value-tensor "
+                "buffer per op."
+            )
+
     def store(
         self,
         name: str,
@@ -1174,6 +1201,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             args: list[TensorArg] = []
             indirect_syms = _indirect_syms_used(value, self.indirect_vars)
             if indirect_syms:
+                self._check_single_indirect_value_tensor(value, indirect_syms)
                 args += [
                     self.create_tensor_arg(
                         True,
@@ -1301,6 +1329,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (not isinstance(value.arguments[1], TensorAccess))
             ):
                 raise Unsupported(f"invalid {value.op} arguments {value.arguments}")
+            self._check_single_indirect_value_tensor(value)  # x/y may be fused gathers
             x = value.arguments[0]
             y = value.arguments[1]
             args = [
@@ -1318,6 +1347,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 raise Unsupported(
                     f"invalid depthwiseconv2dnative arguments {value.arguments}"
                 )
+            self._check_single_indirect_value_tensor(value)
             x = value.arguments[0]
             w = value.arguments[1]
             args = [

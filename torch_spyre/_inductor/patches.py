@@ -160,11 +160,24 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "fallback_random": True,
     }
 
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import Loops
 
-    # Force all operations to be realized when LoopLevel IR is initially constructed
     old_loop = Loops.has_large_inner_fn
-    Loops.has_large_inner_fn = lambda self, threshold=None: True
+
+    def _spyre_has_large_inner_fn(self, threshold=None):
+        # Force all operations to be realized when LoopLevel IR is initially
+        # constructed, except gather-pattern ops (those with an indirect read
+        # dep) -- leave those uninlined so Inductor's own native fusion can
+        # splice them into their consumer's inner_fn. See spyre_kernel.py's
+        # store() for the corresponding one-indirect-value-tensor-per-op guard
+        # that keeps this within the backend's hardware limit.
+        for dep in self.get_reads():
+            if isinstance(dep, MemoryDep) and dep.is_indirect():
+                return False
+        return True
+
+    Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
     from torch._inductor.fx_passes import joint_graph
 

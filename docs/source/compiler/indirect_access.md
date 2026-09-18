@@ -265,16 +265,18 @@ stick_exprs = {
 
 ## Op spec layout
 
-For an unfused gather the scheduler produces **two** op specs:
+A bare gather with no eligible consumer (or a gather whose only consumer
+can't be fused, e.g. because it would pull in a second, independent
+indirectly-addressed value tensor — see [Fusion](#fusion)) produces **two**
+op specs:
 
 1. **identity** — copies gathered rows from the value tensor into a
    temporary buffer using `IndirectAccess` coordinates.
 2. **exp** (or whichever unary follows) — applies the unary to the temporary
    buffer using direct coordinates.
 
-When fusion is enabled (currently disabled pending backend support — see the
-flag in `patches.py`), the two ops collapse into a single fused op spec with
-the index tensor as a named input.
+When the gather's consumer is eligible for fusion, the two ops collapse into
+a single fused op spec with the index tensor as a named input instead.
 
 The argument ordering rule for op specs that contain an index tensor is:
 
@@ -289,11 +291,26 @@ scanning other args' coordinates for `IndirectAccess` atoms whose name matches.
 
 ## Fusion
 
-Pointwise fusion with the gather is currently **disabled** in `patches.py`
-because `IndirectAccess` coordinate expressions are not yet handled in SuperDSC
-generation. When enabled, the identity op and the downstream pointwise op
-merge into one op spec with a single `IndirectAccess` coordinate expression in
-the input arg.
+Pointwise fusion of a gather with its consumer is enabled via a carve-out in
+`patches.py`'s `Loops.has_large_inner_fn` override: ops with an indirect
+`MemoryDep` read return `False` (stay inlineable) instead of the unconditional
+`True` every other op gets, so Inductor's own native inlining/fusion
+machinery splices the gather's `inner_fn` into its consumer — no bespoke IR
+pass. When it fires, the identity op and the downstream pointwise op merge
+into one op spec with a single `IndirectAccess` coordinate expression in the
+input arg.
+
+The hardware supports at most one indirectly-addressed **value tensor**
+per op. `x[i] + x[j]` (two index tensors, one shared value tensor `x`) is
+fine and fuses into one op. `x[i] + y[j]` (two independent value tensors,
+each behind its own gather) would violate that limit if both gathers fused
+into the same `add` — nothing in Inductor's own per-node fusion decision
+prevents this, since each gather is lowered independently and only sees its
+own single-consumer use count. `SpyreKernel.store` (`spyre_kernel.py`)
+guards against it directly: it counts the distinct value-tensor buffer
+names among an op's indirect symbols and raises `Unsupported` if there is
+more than one, forcing a clean compiler-level rejection instead of letting
+two value tensors reach codegen in one op.
 
 ---
 
@@ -304,5 +321,6 @@ the input arg.
   detected via `_find_scatter_index_buf_names` and excluded from stick
   compatibility checks. However, `IndirectAccess` coordinates on output args
   (the codegen side of scatter) are not yet wired up in SuperDSC generation.
-- The fused (single op spec) path is disabled because `IndirectAccess` coordinates
-  are not yet handled in SuperDSC generation.
+- At most one indirectly-addressed value-tensor buffer is supported per op
+  (see [Fusion](#fusion)); `spyre_kernel.py`'s `SpyreKernel.store` rejects a
+  fused op that would need two.

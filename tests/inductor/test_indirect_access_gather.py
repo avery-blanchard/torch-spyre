@@ -52,6 +52,7 @@ from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
+    CRASHED,
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
     register_multicore_variants,
@@ -542,6 +543,29 @@ class _GatherScenarios:
         self.name_dims(i, {"P": P})
         self.name_dims(j, {"P": P})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
+
+    def test_gather_two_value_tensors_fused_unsupported(self):
+        """x[i] + y[j], fused into one op -- two *distinct* value tensors.
+
+        Unlike test_gather_two_indices_added (shared value tensor x, two
+        index tensors), here x and y are independent value tensors each
+        behind their own gather with a single consumer, so both are eligible
+        for native inlining into the same add. The Spyre backend supports at
+        most one indirectly-addressed value-tensor buffer per op, so
+        SpyreKernel.store must reject this at compile time instead of
+        letting two value tensors reach codegen in one op.
+        """
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        y = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        j = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(y, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self.name_dims(j, {"P": P})
+        r = self.check(lambda x, y, i, j: x[i] + y[j], x, y, i, j, expect=CRASHED)
+        self.assertIn("indirectly-addressed value tensor", str(r.exc))
 
     def test_gather_then_sum_reduction(self):
         """x[i].sum(dim=1) -- a reduction over gathered rows."""
