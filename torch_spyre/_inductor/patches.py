@@ -179,48 +179,21 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One indirect operation per kernel: gather fuses with one consumer
-        # (e.g., exp), then that fused result realizes to block further
-        # chaining (tanh cannot inline into it).
-        #
-        # The gather stays inlineable (False). When exp is built, its inner_fn
-        # gets the inlined gather code. At that point, exp.get_reads() will
-        # report an indirect MemoryDep. We detect that and realize exp, which
-        # makes it a ComputedBuffer. When tanh is then lowered, it reads from
-        # exp's buffer, not exp's inner_fn, so tanh cannot inline further.
+        # One indirect operation per kernel: ops with indirect reads stay
+        # inlineable to fuse with their producer (the gather). Ops without
+        # indirect reads realize to prevent chaining.
         if not isinstance(self, Pointwise):
             return old_loop(self, threshold)
 
-        # Gather: stay inlineable.
-        if (
-            self.origin_node is not None
-            and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
-        ):
-            import sys
-
-            print("[SPYRE] Gather: False", file=sys.stderr)
-            return False
-
-        # Any op that has an indirect read (because it inlined a gather):
-        # realize it to block further chaining.
-        has_indirect = False
+        # Check if this op has an indirect memory dependency.
+        # If it does, it's either the gather itself or an op that will inline
+        # the gather, so it should stay inlineable to allow fusion.
         for dep in self.get_reads():
             if isinstance(dep, MemoryDep) and dep.is_indirect():
-                has_indirect = True
-                break
+                return False
 
-        import sys
-
-        op_name = self.origin_node.target if self.origin_node else "unknown"
-        print(
-            f"[SPYRE] Op {op_name}: has_indirect={has_indirect}, returning {has_indirect or old_loop(self, threshold)}",
-            file=sys.stderr,
-        )
-
-        if has_indirect:
-            return True
-
-        return old_loop(self, threshold)
+        # No indirect dependency: realize to block further chaining.
+        return True
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
