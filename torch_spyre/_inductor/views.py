@@ -858,9 +858,9 @@ def align_tensors_pure(
     stick_size: list = []  # stick size for each tensor
     index_tensor_indices: set[int] = set()  # indices of index tensors
 
-    # Identify index tensors: the arg whose name is referenced via IndirectAccess in other args.
-    def referenced_indirect_names(coordinates: Sequence) -> set[str]:
-        """Names referenced via IndirectAccess(name) in these coordinates."""
+    # Identify index tensors: those referenced by IndirectAccess in other tensors.
+    def extract_indirect_access_names(coordinates: Sequence) -> set[str]:
+        """Extract tensor names referenced via IndirectAccess(...) in coordinates."""
         names: set[str] = set()
         for coord in coordinates:
             if isinstance(coord, sympy.Expr):
@@ -869,13 +869,16 @@ def align_tensors_pure(
                         names.add(str(node.args[0]))
         return names
 
-    all_referenced_names: set[str] = set()
+    # Collect all tensor names referenced by IndirectAccess
+    all_indirect_names: set[str] = set()
     for tensor in tensors:
-        all_referenced_names |= referenced_indirect_names(tensor["coordinates"])
+        all_indirect_names |= extract_indirect_access_names(tensor["coordinates"])
 
-    index_tensor_indices_pre_norm = {}
+    # Index tensors: those with a non-None name field
+    index_tensor_indices_pre_norm: dict[int, bool] = {}
     for tensor_idx, tensor in enumerate(tensors):
-        is_index_tensor = tensor.get("name") in all_referenced_names
+        tensor_name = tensor.get("name")
+        is_index_tensor: bool = bool(tensor_name)
         index_tensor_indices_pre_norm[tensor_idx] = is_index_tensor
 
     for tensor_idx, tensor in enumerate(tensors):
@@ -921,19 +924,18 @@ def align_tensors_pure(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                # For index tensors (stick_dim[i] is None), add all split factors.
-                # For normal tensors, exclude stick dim/size to preserve stick boundaries.
-                is_stick_tensor = stick_dim[i] is not None
-                is_stick_var = is_stick_tensor and var == stick_dim[i]
+                # Index tensors skip split contribution
+                if i in index_tensor_indices:
+                    continue
+
+                is_stick_var = var == stick_dim[i]
                 if not is_stick_var or den != stick_size[i]:
-                    # add den to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(den)
                 if (
                     not is_stick_var
                     or mod != stick_size[i]
                     or var in repeat_info.keys()
                 ):
-                    # add mod to splits unless (normal tensor AND stick dim and stick size)
                     splits[var].add(mod)
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
@@ -1044,8 +1046,22 @@ def align_tensors_pure(
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
+        # Index tensors: pass through unchanged
+        if j in index_tensor_indices:
+            size = [term.dim_size for term in terms]
+            coordinates = [
+                (term.var if term.var is not None else sympy.S.Zero) % term.dim_size
+                + term.offset
+                if term.var is not None
+                else term.offset
+                for term in terms
+            ]
+            new_tensors.append({"size": size, "coordinates": coordinates})
+            continue
+
         size = []
         coordinates = []
+
         for num, den, var, mod, dim_size, offset in [
             astuple(term) for term in terms[:-1]
         ]:
