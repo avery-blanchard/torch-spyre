@@ -89,7 +89,21 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     }
   }
 
-  if (dim_map[stick_dim_index] != -1) {
+  // The main loop above resolves splits correctly on its own whenever a
+  // split part's host stride is distinguishable from other device dims via
+  // the `hst <= dst` interval comparison. It only needs help when the tile
+  // immediately enclosing the stick dim has a host stride that does not
+  // survive that comparison. Detect that case structurally: the tile
+  // enclosing the stick dim always has host stride
+  // `stride_map[device_rank - 1] * device_sizes[device_rank - 1]`. Only
+  // overwrite `dim_map[stick_dim_index]` when it is truly the stick's
+  // enclosing tile; otherwise `stick_dim_index` may hold an unrelated real
+  // dimension (e.g. a reordered dimension placed between the stick split's
+  // tile-count part and the stick itself), and overwriting it would corrupt
+  // that dimension's mapping.
+  if (dim_map[stick_dim_index] != -1 &&
+      stride_map[stick_dim_index] ==
+          stride_map[device_rank - 1] * device_sizes[device_rank - 1]) {
     dim_map[stick_dim_index] = dim_map[device_rank - 1];
   }
 
