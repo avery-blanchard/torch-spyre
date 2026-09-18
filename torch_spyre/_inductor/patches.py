@@ -178,24 +178,22 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One indirect operation per kernel. Strategy:
-        # - Gather itself (origin_node.target in INDIRECT_OPS): False (inlineable)
-        # - Everything else: True (realize immediately)
-        #
-        # This ensures the gather can fuse with its consumer (exp) during
-        # exp's inner_fn construction, then exp realizes before tanh is lowered,
-        # so tanh reads from exp's buffer rather than inlining exp's inner_fn.
+        # Indirect loads can fuse with their consumers. Only ops that directly
+        # perform an indirect load stay inlineable. Everything else realizes.
         if not isinstance(self, Pointwise):
             return old_loop(self, threshold)
 
-        # Identify the gather by checking origin_node.target
+        # Get the FX node that THIS Pointwise is being created from
+        current_node = V.get_current_node()
+
         if (
-            self.origin_node is not None
-            and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
+            current_node is not None
+            and current_node.target in _INDIRECT_ACCESS_ATEN_OPS
         ):
+            # This Pointwise is being created from a gather/scatter FX node
             return False
 
-        # Everything else: realize
+        # Everything else realizes
         return True
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
