@@ -161,7 +161,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
     }
 
     from torch._inductor.ir import Loops, Pointwise
-    from torch._inductor.dependencies import MemoryDep
     import torch
 
     old_loop = Loops.has_large_inner_fn
@@ -179,20 +178,24 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One indirect operation per kernel: ops with indirect reads stay
-        # inlineable to fuse with their producer (the gather). Ops without
-        # indirect reads realize to prevent chaining.
+        # One indirect operation per kernel. Strategy:
+        # - Gather itself (origin_node.target in INDIRECT_OPS): False (inlineable)
+        # - Everything else: True (realize immediately)
+        #
+        # This ensures the gather can fuse with its consumer (exp) during
+        # exp's inner_fn construction, then exp realizes before tanh is lowered,
+        # so tanh reads from exp's buffer rather than inlining exp's inner_fn.
         if not isinstance(self, Pointwise):
             return old_loop(self, threshold)
 
-        # Check if this op has an indirect memory dependency.
-        # If it does, it's either the gather itself or an op that will inline
-        # the gather, so it should stay inlineable to allow fusion.
-        for dep in self.get_reads():
-            if isinstance(dep, MemoryDep) and dep.is_indirect():
-                return False
+        # Identify the gather by checking origin_node.target
+        if (
+            self.origin_node is not None
+            and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
+        ):
+            return False
 
-        # No indirect dependency: realize to block further chaining.
+        # Everything else: realize
         return True
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
