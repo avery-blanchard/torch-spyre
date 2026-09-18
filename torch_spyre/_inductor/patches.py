@@ -161,7 +161,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
     }
 
     from torch._inductor.ir import Loops, Pointwise
-    from torch._inductor.dependencies import MemoryDep
     import torch
 
     old_loop = Loops.has_large_inner_fn
@@ -179,31 +178,24 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One indirect operation per kernel: x[i] stays inlineable so it can
-        # fuse with its consumer (exp). But exp then realizes to break the chain,
-        # preventing tanh from inlining into it. Net: x[i].exp() is one fused
-        # kernel, tanh is separate.
-        # Exception: the gather itself (origin_node in INDIRECT_OPS) stays
-        # inlineable. Everything else with indirect reads realizes.
+        # One indirect operation per kernel: gather fuses with one consumer,
+        # then that consumer realizes to block further chaining.
+        #
+        # Only the gather itself stays inlineable (False).
+        # Everything else realizes (True).
         if not isinstance(self, Pointwise):
             return old_loop(self, threshold)
 
-        # If this IS the gather/scatter, stay inlineable.
+        # Gather: stay inlineable so it can fuse with its consumer.
         if (
             self.origin_node is not None
             and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
         ):
             return False
 
-        # If this Pointwise reads indirectly (either it's the gather, or it
-        # inherited an indirect read by inlining), realize it. This check
-        # catches exp(x[i]) and forces it to realize after fusing with x[i],
-        # blocking tanh from chaining onto it.
-        for dep in self.get_reads():
-            if isinstance(dep, MemoryDep) and dep.is_indirect():
-                return True
-
-        return old_loop(self, threshold)
+        # Everything else: realize. This forces consumers of gathers to
+        # materialize as buffers, blocking further chaining.
+        return True
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
