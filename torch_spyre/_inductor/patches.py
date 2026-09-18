@@ -166,18 +166,17 @@ def enable_spyre_context(example_inputs: list[InputType]):
     old_loop = Loops.has_large_inner_fn
 
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One LLIR: one indirect op + one compute op. Mark buffers produced
-        # by indirect ops or consuming them, then force any op consuming such
-        # marked buffers to realize. This prevents chaining: x[i].exp().tanh()
-        # → x[i] stays inlineable, exp consumes it (realized, marked), tanh
-        # cannot inline into exp's marked output.
+        # One LLIR: one indirect op + one compute op. Indirect ops stay
+        # inlineable; compute ops consuming indirect buffers realize. Track
+        # which buffers were consumed by indirect ops, so downstream ops
+        # reading them also realize (no chaining).
         from torch._inductor.ir import Pointwise
 
         if not isinstance(self, Pointwise):
             return True
 
-        if not hasattr(V.graph, "_spyre_indirect_buffers"):
-            V.graph._spyre_indirect_buffers = set()
+        if not hasattr(V.graph, "_spyre_indirect_touched"):
+            V.graph._spyre_indirect_touched = set()
 
         has_indirect_read = False
         for dep in self.get_reads():
@@ -192,25 +191,28 @@ def enable_spyre_context(example_inputs: list[InputType]):
                     has_indirect_write = True
                     break
 
-        reads_from_indirect = False
-        for dep in self.get_reads():
-            if dep.name in V.graph._spyre_indirect_buffers:
-                reads_from_indirect = True
-                break
-
-        # Mark this op's output if it produces an indirect-indexed buffer
-        # OR if it reads from an indirect-touched buffer (propagate the mark).
-        if has_indirect_read or has_indirect_write or reads_from_indirect:
-            if hasattr(self, "name"):
-                V.graph._spyre_indirect_buffers.add(self.name)
-
-        # Stay inlineable only if this op IS an indirect op (not a consumer).
+        # If this op IS an indirect op, stay inlineable.
         if has_indirect_read or has_indirect_write:
             return False
 
-        # Force realize if this op reads from an indirect-touched buffer.
-        if reads_from_indirect:
+        # If this op reads from a buffer marked as indirect-touched, it will
+        # be realized. Mark this op's output so downstream ops also realize.
+        reads_from_indirect_touched = False
+        for dep in self.get_reads():
+            if dep.name in V.graph._spyre_indirect_touched:
+                reads_from_indirect_touched = True
+                break
+
+        if reads_from_indirect_touched:
+            if hasattr(self, "name"):
+                V.graph._spyre_indirect_touched.add(self.name)
             return True
+
+        # Also mark any op output as indirect-touched if it has an indirect
+        # read, so the next consumer knows to realize too.
+        if has_indirect_read or has_indirect_write:
+            if hasattr(self, "name"):
+                V.graph._spyre_indirect_touched.add(self.name)
 
         return True
 
