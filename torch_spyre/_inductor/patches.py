@@ -160,61 +160,45 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "fallback_random": True,
     }
 
-    from torch._inductor.dependencies import MemoryDep
-    from torch._inductor.ir import Loops
+    from torch._inductor.ir import Loops, Pointwise
+    import torch
 
     old_loop = Loops.has_large_inner_fn
 
+    # aten ops whose lowering itself performs the indirect access (calls
+    # ops.indirect_indexing() directly in its own inner_fn, not inherited via
+    # inlining a producer). Bare gather/index_select lower straight to a
+    # Pointwise whose origin_node.target is one of these.
+    _INDIRECT_ACCESS_ATEN_OPS = frozenset(
+        {
+            torch.ops.aten.index.Tensor,
+            torch.ops.aten.index_select.default,
+            torch.ops.aten.index_put.default,
+            torch.ops.aten.index_put_.default,
+            torch.ops.aten._unsafe_index.Tensor,
+            torch.ops.aten._unsafe_index_put.default,
+        }
+    )
+
     def _spyre_has_large_inner_fn(self, threshold=None):
-        # One LLIR: one indirect op + one compute op. Indirect ops stay
-        # inlineable; compute ops consuming indirect buffers realize. Track
-        # which buffers were consumed by indirect ops, so downstream ops
-        # reading them also realize (no chaining).
-        from torch._inductor.ir import Pointwise
-
-        if not isinstance(self, Pointwise):
-            return True
-
-        if not hasattr(V.graph, "_spyre_indirect_touched"):
-            V.graph._spyre_indirect_touched = set()
-
-        has_indirect_read = False
-        for dep in self.get_reads():
-            if isinstance(dep, MemoryDep) and dep.is_indirect():
-                has_indirect_read = True
-                break
-
-        has_indirect_write = False
-        if hasattr(self, "get_writes"):
-            for dep in self.get_writes():
-                if isinstance(dep, MemoryDep) and dep.is_indirect():
-                    has_indirect_write = True
-                    break
-
-        # If this op IS an indirect op, stay inlineable.
-        if has_indirect_read or has_indirect_write:
+        # One indirect op (gather/scatter) may fuse with exactly one consumer.
+        # Identify "is this op itself the indirect access" via origin_node.target
+        # -- set before inlining, unlike get_reads() which re-executes inner_fn
+        # and so can't distinguish "I am the gather" from "I inherited one by
+        # inlining my producer". Only the gather's own node stays inlineable
+        # (False); every other op realizes (True), which -- because upstream
+        # mutates the producer's TensorBox to ComputedBuffer synchronously,
+        # before the next FX node lowers -- prevents anything from inlining
+        # INTO an already-realized op. Net effect: gather fuses with its one
+        # immediate consumer, then that fused result realizes, so a second
+        # consumer (tanh in x[i].exp().tanh()) cannot chain onto it.
+        if (
+            isinstance(self, Pointwise)
+            and self.origin_node is not None
+            and self.origin_node.target in _INDIRECT_ACCESS_ATEN_OPS
+        ):
             return False
-
-        # If this op reads from a buffer marked as indirect-touched, it will
-        # be realized. Mark this op's output so downstream ops also realize.
-        reads_from_indirect_touched = False
-        for dep in self.get_reads():
-            if dep.name in V.graph._spyre_indirect_touched:
-                reads_from_indirect_touched = True
-                break
-
-        if reads_from_indirect_touched:
-            if hasattr(self, "name"):
-                V.graph._spyre_indirect_touched.add(self.name)
-            return True
-
-        # Also mark any op output as indirect-touched if it has an indirect
-        # read, so the next consumer knows to realize too.
-        if has_indirect_read or has_indirect_write:
-            if hasattr(self, "name"):
-                V.graph._spyre_indirect_touched.add(self.name)
-
-        return True
+        return old_loop(self, threshold)
 
     Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
