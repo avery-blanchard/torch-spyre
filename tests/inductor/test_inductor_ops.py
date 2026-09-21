@@ -9041,6 +9041,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
         )
 
+    def test_index_select_pinned_layout_multi_head_pages(self):
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        num_blocks_total = 16
+        num_blocks = 8
+        block_size = 128
+        num_kv_heads = 8
+        head_size = 128
+
+        def fn(k_pages, page_index):
+            k = k_pages.reshape(num_kv_heads * num_blocks_total, block_size, head_size)
+            return k.index_select(0, page_index)
+
+        torch.manual_seed(0)
+        page_ids = torch.randperm(num_blocks_total, dtype=torch.int32)[:num_blocks]
+        page_index = (
+            torch.arange(num_kv_heads, dtype=torch.int32)[:, None] * num_blocks_total
+            + page_ids[None, :]
+        ).reshape(-1)
+        k_cache = torch.randn(
+            num_blocks_total,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype=torch.float16,
+        )
+        k_host = k_cache.permute(2, 0, 1, 3).contiguous()
+        k_layout = SpyreTensorLayout(
+            [num_kv_heads, num_blocks_total, block_size, head_size // 64, 64],
+            [
+                num_blocks_total * block_size * head_size,
+                block_size * head_size,
+                head_size,
+                64,
+                1,
+            ],
+            get_device_dtype(k_host.dtype),
+        )
+        k_dev = k_host.to("spyre", device_layout=k_layout)
+        page_index_dev = page_index.to("spyre")
+
+        expected = fn(k_host, page_index)
+        got = torch.compile(fn, dynamic=False)(k_dev, page_index_dev).cpu()
+        torch.testing.assert_close(got, expected, atol=0.1, rtol=0.1)
+
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]

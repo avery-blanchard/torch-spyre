@@ -1315,9 +1315,17 @@ def _create_sdsc_tensors(
             and not _is_keep_by_index(op_spec.op)
         ):
             if not (has_indirect_access and i in index_tensor_indices):
+                # op_dim_order == dim_order when this is the reference arg
+                # itself, so also check against the full iteration space
+                # (dims) to catch a broadcast dim missing from op_dim_order.
+                op_level_missing = (
+                    [d for d in dims if d not in op_dim_order and d is not mb_sym]
+                    if has_indirect_access
+                    else []
+                )
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
-                ]
+                ] + [d for d in op_level_missing if d not in dim_order]
                 dim_order = dim_order + reduced_dims
 
         if is_matmul and i == 0 and matmul_x_reuse_dims:
