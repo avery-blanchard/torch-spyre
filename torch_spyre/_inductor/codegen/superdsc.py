@@ -1190,6 +1190,7 @@ def _create_sdsc_tensors(
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
     injected_dims: dict[str, Any] | None = None,
+    work_slices: dict | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     if injected_dims is None:
@@ -1499,6 +1500,22 @@ def _create_sdsc_tensors(
                 if not _is_conv(op_spec.op):
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+
+        # For index tensors, rescale strides to account for multi-core work splits.
+        # When work_slices splits a dimension across multiple cores, the stride must
+        # account for all earlier dimensions' splits to ensure unique per-core addressing.
+        # Example: with mb_split=16, x_split=2 on 32 cores, x's stride should be
+        # multiplied by 16 (the mb split) so cores differ by more than the mb stride.
+        if has_indirect_access and i in index_tensor_indices and work_slices:
+            sorted_ws_dims = sorted(work_slices.keys(), key=str)
+            dim_order_set = set(dim_order)
+            relevant_ws_dims = [d for d in sorted_ws_dims if d in dim_order_set]
+            for dim_idx, ws_dim in enumerate(relevant_ws_dims):
+                if ws_dim in strides:
+                    prior_splits = math.prod(
+                        int(work_slices[d]) for d in relevant_ws_dims[:dim_idx]
+                    )
+                    strides[ws_dim] = strides[ws_dim] * prior_splits
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
         # require explicit max_dim_size: 1 for value/output, -1 for others.
@@ -2266,6 +2283,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         op_dim_order,
         op_stick_dim,
         injected_dims=injected_dims,
+        work_slices=work_slices,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices

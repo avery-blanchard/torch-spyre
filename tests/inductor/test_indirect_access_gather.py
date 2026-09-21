@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
-    register_multicore_variants,
+    IndirectAccessTestCase,
     bundle_jsons_from_captured,
     capture_op_specs,
     capture_sdsc_calls,
@@ -1055,10 +1055,9 @@ class _GatherScenarios:
         self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
 
 
-# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
-# / run each op and do not depend on the core count, so sweeping all ~90 of them
-# across every SENCORES value added little coverage for a 7x test-count blowup.
-register_multicore_variants(_GatherScenarios, "TestGather", globals(), counts=(32,))
+# Op-behaviour scenarios run once at the default core count.
+class TestGather(_GatherScenarios, IndirectAccessTestCase):
+    pass
 
 
 class _GatherMulticoreScenarios:
@@ -1177,9 +1176,8 @@ class _GatherMulticoreScenarios:
         )
 
 
-register_multicore_variants(
-    _GatherMulticoreScenarios, "TestGatherMulticore", globals(), counts=(32,)
-)
+class TestGatherMulticore(_GatherMulticoreScenarios, IndirectAccessTestCase):
+    pass
 
 
 # Non-multicore scenarios: run once at the default SENCORES, not swept across configs
@@ -1256,13 +1254,11 @@ class _GatherIndexEntryCountScenarios:
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
 
-# Register the index-entry count scenarios once at default SENCORES (no sweep)
-register_multicore_variants(
-    _GatherIndexEntryCountScenarios,
-    "TestGatherIndexEntryCounts",
-    globals(),
-    counts=(32,),
-)
+# Register the index-entry count scenarios once at default core count.
+class TestGatherIndexEntryCounts(
+    _GatherIndexEntryCountScenarios, IndirectAccessTestCase
+):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1334,12 +1330,11 @@ for _sticks in range(1, 33):
 del _sticks, _sticks_test
 
 
-register_multicore_variants(
-    _EmbeddingAllIndexBucketsScenario,
-    "TestEmbeddingAllIndexBuckets",
-    globals(),
-    counts=(32,),
-)
+class TestEmbeddingAllIndexBuckets(
+    _EmbeddingAllIndexBucketsScenario, IndirectAccessTestCase
+):
+    pass
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
