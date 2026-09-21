@@ -914,7 +914,10 @@ def align_tensors_pure(
     # sensitive to iteration_space dim label order even though semantically it
     # should not be.
     all_vars = dict.fromkeys(var_ranges.keys())
-    for terms in all_terms:
+    for tensor_idx, terms in enumerate(all_terms):
+        # Skip collecting variables from index tensors
+        if tensor_idx in index_tensor_indices:
+            continue
         for term in terms:
             if term.var is not None:
                 all_vars[term.var] = None
@@ -959,11 +962,15 @@ def align_tensors_pure(
     # expressions in preceding dimensions can legally split it at other points.
     # The final boundary is the logical range endpoint, so a partial last stick
     # (for example 7 int32 elements in a 32-element stick) remains valid.
+    # Skip this check for index tensors: they have no stick constraint.
     for tensor_index, (terms, var, physical_stick_size) in enumerate(
         zip(all_terms, stick_dim, stick_size)
     ):
         if var is None:
             # A constant/broadcast innermost coordinate has no stick loop to split.
+            continue
+        if tensor_index in index_tensor_indices:
+            # Index tensors have no stick constraint
             continue
         has_outer_stick_coordinate = any(
             term.var == var and term.den == physical_stick_size for term in terms[:-1]
