@@ -36,7 +36,7 @@ from indirect_access_common import (  # noqa: E402
     GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
-    register_multicore_variants,
+    IndirectAccessTestCase,
     plain_to_spyre,
 )
 
@@ -1099,10 +1099,9 @@ class _ScatterScenarios:
         self.check(kernel, inp, mask, src, expect=CRASHED)
 
 
-# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
-# / run each op and do not depend on the core count, so sweeping them across every
-# SENCORES value added little coverage for a 7x test-count blowup.
-register_multicore_variants(_ScatterScenarios, "TestScatter", globals(), counts=(32,))
+# Op-behaviour scenarios run once at the default core count.
+class TestScatter(_ScatterScenarios, IndirectAccessTestCase):
+    pass
 
 
 # Non-multicore scenarios: run once at the default SENCORES, not swept across configs
@@ -1197,10 +1196,9 @@ class _ScatterEntryCountScenarios:
         )
 
 
-# Register the entry-count scenarios once at default SENCORES (no sweep)
-register_multicore_variants(
-    _ScatterEntryCountScenarios, "TestScatterEntryCounts", globals(), counts=(32,)
-)
+# Register the entry-count scenarios once at default core count.
+class TestScatterEntryCounts(_ScatterEntryCountScenarios, IndirectAccessTestCase):
+    pass
 
 
 if __name__ == "__main__":

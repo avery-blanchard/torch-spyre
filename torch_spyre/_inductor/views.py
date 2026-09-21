@@ -23,7 +23,6 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 from torch._inductor.virtualized import V
 
 from .errors import Unsupported
-from .op_spec import IndirectAccess
 
 
 def _mixed_radix_digits(expr, var, var_range, mods):
@@ -550,7 +549,6 @@ def normalize_coordinates(
     synthetic_var_fn: Callable[[], sympy.Symbol],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     compare_value: Callable[[sympy.Expr], int | float] = _concretize_for_cmp,
-    is_index_tensor: bool = False,
 ) -> list[Term]:
     """
     Normalize coordinate expressions obtained from compute_coordinates.
@@ -578,12 +576,7 @@ def normalize_coordinates(
         offset = expr.xreplace({var: sympy.S.Zero for var in vars})
 
         if len(vars) == 0:
-            # For index tensors, no synthetic vars are created (all dims treated like stick).
-            # For normal tensors, only the stick dim (last dim) skips synthetic var creation.
-            is_stick_dim = dim_idx == len(size) - 1
-            should_skip_synthetic = is_index_tensor or is_stick_dim
-
-            if dim_size > 1 and not should_skip_synthetic:
+            if dim_size > 1 and dim_idx != len(size) - 1:
                 # A non-stick dimension with no variables but size > 1 indicates an elided
                 # dimension with offset/gap. Create a new variable to restore this dimension.
                 var = synthetic_var_fn()
@@ -730,7 +723,7 @@ class AlignmentInputs:
     """Everything tensor alignment needs, captured without hidden graph state."""
 
     iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]]
-    tensors: list[dict[str, Any]]
+    tensors: list[dict[str, list[sympy.Expr] | str | None]]
     indirect_sizes: dict[sympy.Symbol, int] | None
     repeat_info: dict[sympy.Symbol, dict]
     concrete_ranges: dict[sympy.Symbol, int | float]
@@ -829,6 +822,9 @@ def align_tensors_pure(
 
     iteration_space = inputs.iteration_space
     tensors = inputs.tensors
+    print("Start of align tensors")
+    print(iteration_space)
+    print(tensors)
     indirect_sizes = inputs.indirect_sizes
     repeat_info = inputs.repeat_info
     var_ranges = dict(inputs.concrete_ranges)
@@ -851,58 +847,27 @@ def align_tensors_pure(
         _synthetic_var_idx += 1
         return var
 
-    all_terms: list = []  # terms for each tensor
-    stick_dim: list[
-        Optional[sympy.Symbol]
-    ] = []  # stick var for each tensor (None for index tensors)
-    stick_size: list = []  # stick size for each tensor
-    index_tensor_indices: set[int] = set()  # indices of index tensors
-
-    # Identify index tensors: those referenced by IndirectAccess in other tensors.
-    def extract_indirect_access_names(coordinates: Sequence) -> set[str]:
-        """Extract tensor names referenced via IndirectAccess(...) in coordinates."""
-        names: set[str] = set()
-        for coord in coordinates:
-            if isinstance(coord, sympy.Expr):
-                for node in sympy.preorder_traversal(coord):
-                    if isinstance(node, IndirectAccess):
-                        names.add(str(node.args[0]))
-        return names
-
-    # Collect all tensor names referenced by IndirectAccess
-    all_indirect_names: set[str] = set()
-    for tensor in tensors:
-        all_indirect_names |= extract_indirect_access_names(tensor["coordinates"])
-
-    # Index tensors: those with a non-None name field
-    index_tensor_indices_pre_norm: dict[int, bool] = {}
-    for tensor_idx, tensor in enumerate(tensors):
-        tensor_name = tensor.get("name")
-        is_index_tensor: bool = bool(tensor_name)
-        index_tensor_indices_pre_norm[tensor_idx] = is_index_tensor
+    all_terms = []  # terms for each tensor
+    stick_dim = []  # stick var for each tensor
+    stick_size = []  # stick size for each tensor
 
     for tensor_idx, tensor in enumerate(tensors):
-        _synthetic_var_idx = 0
-        is_index_tensor = index_tensor_indices_pre_norm[tensor_idx]
+        _synthetic_var_idx = 0  # reuse synthetic_var across tensors
         terms = normalize_coordinates(
             var_ranges,
-            tensor["size"],
-            tensor["coordinates"],
+            tensor["size"],  # type: ignore[arg-type]
+            tensor["coordinates"],  # type: ignore[arg-type]
             synthetic_var,
             indirect_sizes,
             _concrete_alignment_value,
-            is_index_tensor=is_index_tensor,
         )
+        stick_dim.append(terms[-1].var)
+        # Index tensors: marked by having a non-None "name" field.
+        # spyre_kernel.py sets this field (via opspec_name) only for index tensors used in indirect access.
+        # Output tensors have name=None (unless KTIR emitter is enabled, which we don't rely on).
+        is_index_tensor = bool(tensor.get("name"))
+        stick_size.append(1 if is_index_tensor else terms[-1].dim_size)
         all_terms.append(terms)
-
-        # Set stick_dim and stick_size based on whether this is an index tensor
-        if is_index_tensor:
-            stick_dim.append(None)
-            stick_size.append(1)
-            index_tensor_indices.add(tensor_idx)
-        else:
-            stick_dim.append(terms[-1].var)
-            stick_size.append(terms[-1].dim_size)
 
     _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
 
@@ -914,7 +879,10 @@ def align_tensors_pure(
     # sensitive to iteration_space dim label order even though semantically it
     # should not be.
     all_vars = dict.fromkeys(var_ranges.keys())
-    for terms in all_terms:
+    for i, terms in enumerate(all_terms):
+        # Index tensors have stick_size=1 and don't contribute to split boundaries
+        if stick_size[i] == 1:
+            continue
         for term in terms:
             if term.var is not None:
                 all_vars[term.var] = None
@@ -924,18 +892,18 @@ def align_tensors_pure(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                # Index tensors skip split contribution
-                if i in index_tensor_indices:
+                # Index tensors have stick_size=1 and don't contribute to splits
+                if stick_size[i] == 1:
                     continue
-
-                is_stick_var = var == stick_dim[i]
-                if not is_stick_var or den != stick_size[i]:
+                if den != stick_size[i] or var != stick_dim[i]:
+                    # add den to splits unless stick dim and stick size
                     splits[var].add(den)
                 if (
-                    not is_stick_var
-                    or mod != stick_size[i]
+                    mod != stick_size[i]
+                    or var != stick_dim[i]
                     or var in repeat_info.keys()
                 ):
+                    # add mod to splits unless stick dim and stick size
                     splits[var].add(mod)
 
     # Insert restored size-1 dimensions with offset/gap to the other tensors
@@ -980,6 +948,15 @@ def align_tensors_pure(
                     int(physical_stick_size),
                 )
 
+    # Identify variables that come from index tensors (stick_size=1)
+    # These should not participate in work division calculations
+    index_tensor_vars = set()
+    for i, terms in enumerate(all_terms):
+        if stick_size[i] == 1:
+            for term in terms:
+                if term.var is not None:
+                    index_tensor_vars.add(term.var)
+
     # create new vars, var ranges, and work division for each variable
     # with one var per segment (split[i], split[i+1])
     new_var_ranges = {}
@@ -987,6 +964,17 @@ def align_tensors_pure(
     remap = {}  # map old var to new vars in splits order
     work_division_remap = {}
     for var, split in splits.items():
+        # Skip work division recalculation for variables from index tensors
+        # Preserve their original work division
+        if var in index_tensor_vars:
+            new_var_ranges[var] = var_ranges[var]
+            new_op_it_space_splits[var] = (
+                op_it_space_splits[var] if var in op_it_space_splits else 1
+            )
+            remap[var] = [var]
+            work_division_remap[var] = tuple([(var, 1)])  # type: ignore[assignment]
+            continue
+
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
         if len(split) > 1:
             new_var_ranges[var] = split[1] // split[0]
@@ -999,28 +987,21 @@ def align_tensors_pure(
             bases = {}
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
-                # Re-intersect the committed split against the basis work division.
-                # Skip stick-count logic if v is the stick var of an index tensor.
-                is_index_tensor_stick_var = False
-                is_stick_var = False
+                # Re-intersect the committed split against the basis work
+                # division used for this var.
                 if v == var and v in stick_dim:
-                    stick_idx = stick_dim.index(v)
-                    # Ensure this is actually a stick var (not None) and not an index tensor
-                    if stick_dim[stick_idx] is not None:
-                        is_stick_var = True
-                        is_index_tensor_stick_var = stick_idx in index_tensor_indices
-
-                if v == var and is_stick_var and not is_index_tensor_stick_var:
-                    # Stick var of normal tensor: use stick count.
+                    # Stick var: stick count. The element range would drop a
+                    # legal split when the size is not a multiple of it
+                    # (e.g. gcd(2, 67) == 1).
                     eps = int(stick_size[stick_dim.index(v)])
-                    basis = (int(new_var_ranges[v]) + eps - 1) // eps
+                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
                 else:
-                    # Non-stick var or stick var of index tensor: use element range.
+                    # Non-stick var (or synthetic sub-dim): element range.
                     basis = new_var_ranges[v]
                 bases[v] = int(basis)
                 new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
-            work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
+            work_division_remap[var] = tuple([(v, bases[v]) for v in remap[var]])  # type: ignore[assignment]
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
@@ -1029,13 +1010,12 @@ def align_tensors_pure(
             # Synthetic vars (z0, z1, …) are introduced by normalize_coordinates
             # for restored size-1 dims and are not in orig_ranges; fall back to
             # the concretized value (always 1) for those.
+            new_var_ranges[var] = inputs.restored_ranges.get(var, var_ranges[var])
             # var can be a loop var or an indirect symbol
             if var in var_ranges:
                 new_var_ranges[var] = var_ranges[var]
             elif indirect_sizes is not None and var in indirect_sizes:
                 new_var_ranges[var] = indirect_sizes[var]
-            elif var in inputs.restored_ranges:
-                new_var_ranges[var] = inputs.restored_ranges[var]
             else:
                 raise Unsupported(
                     f"Variable {var} has no range in var_ranges or indirect_sizes"
@@ -1047,22 +1027,8 @@ def align_tensors_pure(
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
-        # Index tensors: pass through unchanged
-        if j in index_tensor_indices:
-            size = [term.dim_size for term in terms]
-            coordinates = [
-                (term.var if term.var is not None else sympy.S.Zero) % term.dim_size
-                + term.offset
-                if term.var is not None
-                else term.offset
-                for term in terms
-            ]
-            new_tensors.append({"size": size, "coordinates": coordinates})
-            continue
-
         size = []
         coordinates = []
-
         for num, den, var, mod, dim_size, offset in [
             astuple(term) for term in terms[:-1]
         ]:
@@ -1074,14 +1040,27 @@ def align_tensors_pure(
                 coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
-            low = (
-                0
-                if var == stick_dim[j]
-                and den == stick_size[j]
-                and den not in splits[var]
-                else splits[var].index(den)
-            )  # replace split[var].index(stick_size) with 0 for stick dim
-            high = splits[var].index(mod)
+
+            # Handle variables not in splits (indirect symbols like tmp0)
+            if var not in splits:
+                # Indirect symbol or variable with no splits - no decomposition needed
+                size.append(dim_size)
+                coordinates.append(var + offset)
+                continue
+
+            # For index tensors with stick_size=1, den=1 may not be in splits[var]
+            # because we skip index tensors from contributing to splits computation.
+            # Treat missing den values as 0 (stick dimension).
+            if den not in splits[var]:
+                low = 0
+            else:
+                low = splits[var].index(den)
+
+            # Similarly for mod: if it's not in splits, use the last index
+            if mod not in splits[var]:
+                high = len(splits[var]) - 1
+            else:
+                high = splits[var].index(mod)
             if low == high:
                 size.append(dim_size)
                 coordinates.append(var + offset)

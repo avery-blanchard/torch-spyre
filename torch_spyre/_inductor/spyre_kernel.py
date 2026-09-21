@@ -1838,6 +1838,10 @@ def simplify_op_spec(
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
 
+    print("Before align tensors")
+    print("Iteration space:", op_spec.iteration_space)
+    for arg in op_spec.args:
+        print("arg ", arg.device_size, arg.device_coordinates, arg.name)
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
         [
