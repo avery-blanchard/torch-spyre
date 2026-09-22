@@ -177,10 +177,8 @@ def enable_spyre_context(example_inputs: list[InputType]):
         }
     )
 
-    # Track indirect ops per compile to allow only one to fuse into each consumer.
-    # The key is the set of consumers (FX nodes); the value is whether we've seen
-    # an indirect op for that consumer set.
-    _indirect_ops_by_consumers = {}
+    # Track indirect ops that are inlineable per consumer set
+    _inlineable_indirect_per_consumer = {}
 
     def _spyre_has_large_inner_fn(self, threshold=None):
         # Indirect loads can fuse with their consumers. Only ops that directly
@@ -196,27 +194,22 @@ def enable_spyre_context(example_inputs: list[InputType]):
             and current_node.target in _INDIRECT_ACCESS_ATEN_OPS
         ):
             # This Pointwise is being created from a gather/scatter FX node.
-            # Identify its consumers (the FX nodes that will use this op).
-            consumers_key = (
-                tuple(
-                    sorted(
-                        id(u)
-                        for u in (
-                            current_node.users if hasattr(current_node, "users") else []
-                        )
-                    )
-                )
-                if hasattr(current_node, "users")
-                else (0,)
+            # Create a hashable key from our consumers
+            my_consumers = frozenset(
+                id(u)
+                for u in (current_node.users if hasattr(current_node, "users") else [])
             )
 
-            if consumers_key not in _indirect_ops_by_consumers:
-                # First indirect op for these consumers; allow fusion
-                _indirect_ops_by_consumers[consumers_key] = True
+            if not my_consumers:
                 return False
-            else:
-                # Already have an indirect op for these consumers; realize this one
+
+            if my_consumers in _inlineable_indirect_per_consumer:
+                # Already have an indirect op inlineable for these consumers; realize us
                 return True
+            else:
+                # First indirect op for these consumers; mark and stay inlineable
+                _inlineable_indirect_per_consumer[my_consumers] = True
+                return False
 
         # Delegate to original behavior for all other cases
         return old_loop(self, threshold)
@@ -292,7 +285,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         try:
             yield
         finally:
-            _indirect_ops_by_consumers.clear()
+            _inlineable_indirect_per_consumer.clear()
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
