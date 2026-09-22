@@ -189,15 +189,41 @@ class _TracingHandler:
     def load(self, name, index):
         """Record a load operation from a named buffer.
 
+        For indirect access, the index may be a sympy expression containing _Val objects
+        from previous loads (e.g., offset + scale * tmp0). We need to extract the _Val
+        VIDs and record them as dependencies while preserving the index expression structure.
+
         Args:
             name: Buffer name to load from
-            index: Index expression for the load
+            index: Index expression (may contain _Val objects for indirect access)
 
         Returns:
             _Val representing the loaded value
         """
+        # Extract VIDs from _Val objects in the index expression
+        vids = []
+
+        def extract_vids(expr):
+            if isinstance(expr, _Val):
+                vids.append(expr.vid)
+                return expr.vid  # Replace _Val with its VID in the expression
+            elif isinstance(expr, (int, float, bool)):
+                return expr
+            elif hasattr(expr, "subs"):  # sympy expression
+                # Recursively process sympy expression args
+                new_args = tuple(extract_vids(arg) for arg in expr.args)
+                if new_args != expr.args:
+                    return expr.func(*new_args)
+                return expr
+            else:
+                return expr
+
+        processed_index = extract_vids(index)
+
         vid = self._alloc_vid()
-        self.ops.append(("load", vid, (), {"_name": name, "_index": index}))
+        self.ops.append(
+            ("load", vid, tuple(vids), {"_name": name, "_index": processed_index})
+        )
         return _Val(self, vid)
 
     def store(self, name, index, value, mode=None):
@@ -390,7 +416,13 @@ def _trace_inner_fn(op):
                 op.data.inner_fn(syms, r_syms)
             else:
                 op.data.inner_fn(syms)
-    except Exception:
+    except Exception as e:
+        import sys
+
+        print(
+            f"[SPLIT] _trace_inner_fn exception: {type(e).__name__}: {str(e)[:100]}",
+            file=sys.stderr,
+        )
         return None
     return tracer.ops
 
@@ -843,10 +875,20 @@ def split_multi_ops(graph: GraphLowering):
     Args:
         graph: GraphLowering instance containing operations to process
     """
+    import sys
+
+    print("[SPLIT] split_multi_ops called", file=sys.stderr)
+
     gl = V.graph
     # Skip if in graph lowering context
     if not (hasattr(gl, "graph") and hasattr(gl, "run_node")):
+        print(
+            f"[SPLIT] Exiting: gl.graph={hasattr(gl, 'graph')}, gl.run_node={hasattr(gl, 'run_node')}",
+            file=sys.stderr,
+        )
         return
+
+    print(f"[SPLIT] Proceeding: {len(graph.operations)} operations", file=sys.stderr)
 
     # Build environment mapping FX nodes to TensorBox for node lookup. Prefer
     # the origin in the current lowering graph so subgraph buffers key on their
@@ -863,16 +905,28 @@ def split_multi_ops(graph: GraphLowering):
 
     operations = graph.operations
     for op in list(operations):
+        print(f"[SPLIT] Processing op: {op.get_name()}", file=sys.stderr)
+
         if _is_invalid_compute_op(op):
+            print("[SPLIT]   Invalid compute op, skipping", file=sys.stderr)
             continue
 
         trace = _trace_inner_fn(op)
+        print(f"[SPLIT]   Trace: {len(trace) if trace else 0} items", file=sys.stderr)
         if not trace:
+            print("[SPLIT]   No trace, skipping", file=sys.stderr)
             continue
 
         compute_ops = _get_compute_ops(trace)
+        print(f"[SPLIT]   Compute ops: {len(compute_ops)}", file=sys.stderr)
+        for i, cop in enumerate(compute_ops):
+            print(f"[SPLIT]     [{i}] {cop[0]}", file=sys.stderr)
+
         if _skip_splitting(op, compute_ops):
+            print("[SPLIT]   Skip splitting, continue", file=sys.stderr)
             continue
+
+        print("[SPLIT]   Proceeding with split", file=sys.stderr)
 
         # Use real_layout() for MutationLayoutSHOULDREMOVE so _make_intermediate_bufs
         # gets a valid device and dtype from the underlying FixedLayout.
