@@ -177,7 +177,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         }
     )
 
-    # Track indirect ops that are inlineable per consumer set
+    # Track indirect ops that are inlineable per consumer set during this compile
     _inlineable_indirect_per_consumer = {}
 
     def _spyre_has_large_inner_fn(self, threshold=None):
@@ -194,11 +194,13 @@ def enable_spyre_context(example_inputs: list[InputType]):
             and current_node.target in _INDIRECT_ACCESS_ATEN_OPS
         ):
             # This Pointwise is being created from a gather/scatter FX node.
-            # Create a hashable key from our consumers
-            my_consumers = frozenset(
-                id(u)
-                for u in (current_node.users if hasattr(current_node, "users") else [])
+            # Get consumers: in FX graphs, node.users is a dict mapping to use counts
+            consumers = (
+                list(current_node.users.keys())
+                if hasattr(current_node, "users")
+                else []
             )
+            my_consumers = frozenset(id(u) for u in consumers)
 
             if not my_consumers:
                 return False
