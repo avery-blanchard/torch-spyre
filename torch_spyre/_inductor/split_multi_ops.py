@@ -42,7 +42,7 @@ from torch_spyre.constants import DEVICE_NAME
 logger = get_inductor_logger("split_multi_ops")
 
 # Operations that don't perform computation but manage data flow
-_STRUCTURAL_OPS = frozenset({"load", "store", "get_index"})
+_STRUCTURAL_OPS = frozenset({"load", "store", "get_index", "indirect_indexing"})
 
 # Operations that involve dtype conversion
 _DTYPE_OPS = frozenset({"to_dtype", "convert_element_type"})
@@ -123,6 +123,24 @@ class _Val:
 
     def __init__(self, handler, vid):
         self.handler, self.vid = handler, vid
+
+    def __add__(self, other):
+        return self.vid + other
+
+    def __radd__(self, other):
+        return other + self.vid
+
+    def __mul__(self, other):
+        return self.vid * other
+
+    def __rmul__(self, other):
+        return other * self.vid
+
+    def __sub__(self, other):
+        return self.vid - other
+
+    def __rsub__(self, other):
+        return other - self.vid
 
 
 class _TracingHandler:
@@ -416,13 +434,7 @@ def _trace_inner_fn(op):
                 op.data.inner_fn(syms, r_syms)
             else:
                 op.data.inner_fn(syms)
-    except Exception as e:
-        import sys
-
-        print(
-            f"[SPLIT] _trace_inner_fn exception: {type(e).__name__}: {str(e)[:100]}",
-            file=sys.stderr,
-        )
+    except Exception:
         return None
     return tracer.ops
 
@@ -875,20 +887,11 @@ def split_multi_ops(graph: GraphLowering):
     Args:
         graph: GraphLowering instance containing operations to process
     """
-    import sys
-
-    print("[SPLIT] split_multi_ops called", file=sys.stderr)
 
     gl = V.graph
     # Skip if in graph lowering context
     if not (hasattr(gl, "graph") and hasattr(gl, "run_node")):
-        print(
-            f"[SPLIT] Exiting: gl.graph={hasattr(gl, 'graph')}, gl.run_node={hasattr(gl, 'run_node')}",
-            file=sys.stderr,
-        )
         return
-
-    print(f"[SPLIT] Proceeding: {len(graph.operations)} operations", file=sys.stderr)
 
     # Build environment mapping FX nodes to TensorBox for node lookup. Prefer
     # the origin in the current lowering graph so subgraph buffers key on their
@@ -905,28 +908,16 @@ def split_multi_ops(graph: GraphLowering):
 
     operations = graph.operations
     for op in list(operations):
-        print(f"[SPLIT] Processing op: {op.get_name()}", file=sys.stderr)
-
         if _is_invalid_compute_op(op):
-            print("[SPLIT]   Invalid compute op, skipping", file=sys.stderr)
             continue
 
         trace = _trace_inner_fn(op)
-        print(f"[SPLIT]   Trace: {len(trace) if trace else 0} items", file=sys.stderr)
         if not trace:
-            print("[SPLIT]   No trace, skipping", file=sys.stderr)
             continue
 
         compute_ops = _get_compute_ops(trace)
-        print(f"[SPLIT]   Compute ops: {len(compute_ops)}", file=sys.stderr)
-        for i, cop in enumerate(compute_ops):
-            print(f"[SPLIT]     [{i}] {cop[0]}", file=sys.stderr)
-
         if _skip_splitting(op, compute_ops):
-            print("[SPLIT]   Skip splitting, continue", file=sys.stderr)
             continue
-
-        print("[SPLIT]   Proceeding with split", file=sys.stderr)
 
         # Use real_layout() for MutationLayoutSHOULDREMOVE so _make_intermediate_bufs
         # gets a valid device and dtype from the underlying FixedLayout.
