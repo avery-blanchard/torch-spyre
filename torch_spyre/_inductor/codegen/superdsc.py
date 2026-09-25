@@ -1191,7 +1191,6 @@ def _create_sdsc_tensors(
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
     injected_dims: dict[str, Any] | None = None,
-    work_slices: dict | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     if injected_dims is None:
@@ -1376,20 +1375,6 @@ def _create_sdsc_tensors(
                 # constant slot cannot shift an outer role onto the wrong
                 # device extent (notably Hkv in native GQA with D=128).
                 physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-                # For index tensors, adjust physical_axis to account for outer dims
-                # not in dim_order. Index tensors have shorter dim_order than device_size
-                # due to align_tensors adding broadcast dimensions.
-                # For index tensors with outer broadcast dims, adjust physical_axis
-                if (
-                    has_indirect_access
-                    and i in index_tensor_indices
-                    and physical_axis is not None
-                ):
-                    num_device_dims = len(arg.device_size)
-                    num_layout_dims = len(dim_order)
-                    num_outer_dims = num_device_dims - num_layout_dims
-                    if num_outer_dims > 0:
-                        physical_axis = physical_axis - num_outer_dims
             else:
                 physical_axis = None
 
@@ -1410,35 +1395,10 @@ def _create_sdsc_tensors(
                 # position so those axes contribute to its physical stride
                 # without being mistaken for a neighboring logical role.
                 physical_gap_factor = gap_factor_by_inner_axis.get(physical_axis, 1)
-                # For index tensors with outer broadcast dims, compute stride from sliced device_size.
-                if has_indirect_access and i in index_tensor_indices:
-                    num_device_dims = len(arg.device_size)
-                    num_layout_dims = len(dim_order)
-                    num_outer_dims = num_device_dims - num_layout_dims
-                    if num_outer_dims > 0:
-                        device_size_for_stride = arg.device_size[num_outer_dims:]
-                        # stride_idx in dim_order gives the position for stride calculation
-                        pos_in_dim_order = stride_idx
-                        strides[dim] = (
-                            math.prod(device_size_for_stride[pos_in_dim_order + 1 :])
-                            * physical_gap_factor
-                        )
-                        dim_device_stride = math.prod(
-                            device_size_for_stride[pos_in_dim_order + 2 :]
-                        )
-                    else:
-                        strides[dim] = (
-                            math.prod(arg.device_size[physical_axis:])
-                            * physical_gap_factor
-                        )
-                        dim_device_stride = math.prod(
-                            arg.device_size[physical_axis + 1 :]
-                        )
-                else:
-                    strides[dim] = (
-                        math.prod(arg.device_size[physical_axis:]) * physical_gap_factor
-                    )
-                    dim_device_stride = math.prod(arg.device_size[physical_axis + 1 :])
+                strides[dim] = (
+                    math.prod(arg.device_size[physical_axis:]) * physical_gap_factor
+                )
+                dim_device_stride = math.prod(arg.device_size[physical_axis + 1 :])
             # Injected stick dims don't exist in device_size; use stride=1.
             elif (
                 has_indirect_access
@@ -1448,30 +1408,8 @@ def _create_sdsc_tensors(
                 strides[dim] = 1
                 dim_device_stride = 1
             else:
-                # For index tensors with outer broadcast dims, compute stride from sliced device_size.
-                if has_indirect_access and i in index_tensor_indices:
-                    num_device_dims = len(arg.device_size)
-                    num_layout_dims = len(dim_order)
-                    num_outer_dims = num_device_dims - num_layout_dims
-                    if num_outer_dims > 0:
-                        device_size_for_stride = arg.device_size[num_outer_dims:]
-                        pos_in_dim_order = stride_idx
-                        strides[dim] = math.prod(
-                            device_size_for_stride[pos_in_dim_order + 1 :]
-                        )
-                        dim_device_stride = math.prod(
-                            device_size_for_stride[pos_in_dim_order + 2 :]
-                        )
-                    else:
-                        strides[dim] = _calculate_device_stride(
-                            stride_idx, arg.device_size
-                        )
-                        dim_device_stride = math.prod(
-                            arg.device_size[-stride_idx - 1 :]
-                        )
-                else:
-                    strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
-                    dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+                strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
+                dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
             offsets[dim] = 0
 
             if dim is stick_dim and dim in sdsc_dim_advance:
@@ -1559,10 +1497,10 @@ def _create_sdsc_tensors(
                 # accounts for the gap between the device extent and the
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
-
-        # For index tensors, the strides are already correct from the stride computation.
-        # The core_idx_to_slice_offset formula divides by work_slices[dim], so the
-        # strides don't need to be rescaled here.
+                #
+                if not _is_conv(op_spec.op):
+                    backGap[dim] = dev_dim_size - it_dim_size
+                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
         # require explicit max_dim_size: 1 for value/output, -1 for others.
@@ -2330,7 +2268,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         op_dim_order,
         op_stick_dim,
         injected_dims=injected_dims,
-        work_slices=work_slices,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices
