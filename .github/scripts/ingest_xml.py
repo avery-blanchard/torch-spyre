@@ -20,7 +20,6 @@ Usage (called by the GHA workflow):
 """
 
 import argparse
-import hashlib
 import json
 import os
 import platform as _platform
@@ -33,24 +32,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
-# Aliased to `v2_schema` so the call sites below read unchanged.
-from spyre_clickhouse_ingest import schema as v2_schema
+# Aliased to `schema_model` so the call sites below read unchanged.
+from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
-    V2_NAMESPACE,
-    V2_SEP,
     extract_properties,
     get_client,
-    insert_v2,
+    insert_benchmarks,
+    insert_gha_artifact_result,
+    insert_test_results,
     promote_xpass,
-    v2_already_ingested,
-    v2_canonical_arch,
-    v2_component,
-    v2_database,
-    v2_run_id_for,
-    v2_source_and_external_run_id,
-    v2_tables_present,
+    cases_already_ingested,
+    benchmarks_already_ingested,
+    component_of,
+    target_database,
+    run_id_for,
+    source_and_external_run_id,
+    tables_present,
 )
-from spyre_clickhouse_ingest.identity import _v2_norm
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
 import regex as re
 
@@ -102,6 +100,12 @@ PERF_SUITE_NAME = "spyre-perf-suite"
 # version_info must name these four with a real commit. spyre-perf-suite is
 # not required until that SHA is emitted (#150).
 _REQUIRED_PROVENANCE_KEYS = ("torch-spyre", "flex", "deeptools", "spyre-comms")
+# Prod report.xml often uses RPM-style keys; bare keys remain valid (#4896).
+_PROVENANCE_KEY_ALIASES = {
+    "flex": ("flex/ibm-flex",),
+    "deeptools": ("deeptools/ibm-deeptools",),
+    "spyre-comms": ("spyre-comms/ibm-spyre-comms",),
+}
 _MISSING_COMMIT = {"", "null", "N/A", "None"}
 
 
@@ -416,12 +420,26 @@ def _null_tag(value):
     return None if value in (None, "", "null", "N/A") else value
 
 
+def _has_provenance_commit(info: dict, key: str) -> bool:
+    """True if bare key or a known RPM alias has a non-empty commit str."""
+    for candidate in (key,) + _PROVENANCE_KEY_ALIASES.get(key, ()):
+        comp = info.get(candidate)
+        if not isinstance(comp, dict):
+            continue
+        commit = comp.get("commit")
+        if isinstance(commit, str) and commit.strip() not in _MISSING_COMMIT:
+            return True
+    return False
+
+
 def classify_run_quality(version_info: str | None) -> tuple[str, int]:
     """Return (quality, regression_eligible) from testsuite version_info JSON.
 
     Incomplete provenance is still ingested (visible on Benchmark Runs) but
     must not feed regression views. version may be JSON null; commit must be
     a non-empty Python str. Unparseable / missing version_info is incomplete.
+    For flex / deeptools / spyre-comms, bare keys or RPM-style aliases
+    (flex/ibm-flex, …) both count (#4896).
     """
     if not version_info:
         return "incomplete", 0
@@ -432,11 +450,7 @@ def classify_run_quality(version_info: str | None) -> tuple[str, int]:
     if not isinstance(info, dict):
         return "incomplete", 0
     for key in _REQUIRED_PROVENANCE_KEYS:
-        comp = info.get(key)
-        if not isinstance(comp, dict):
-            return "incomplete", 0
-        commit = comp.get("commit")
-        if not isinstance(commit, str) or commit.strip() in _MISSING_COMMIT:
+        if not _has_provenance_commit(info, key):
             return "incomplete", 0
     return "valid", 1
 
@@ -497,10 +511,15 @@ _V2_BENCH_METRIC_KEYS = (
     "mem_size_mb",
     "pt_util_percent",
     "duration_ms",
-    "torch_spyre_ms",
     "sendnn_ms",
     "ratio",
 )
+# Not stored: torch_spyre_ms is the tsp time of the case whose tags were read, so it only
+# ever repeats duration_ms (kernel rows) or total_duration_ms (report rows).
+
+# The harness writes 0.0 for these when it did not capture them (no trace, no compile or
+# launch timing), so a report where every record has 0 carries no measurement of them.
+_ZERO_WHEN_UNCAPTURED = ("pt_util_percent", "compile_ms", "runtime_ms")
 
 
 # In the benchmark_id hash, not merely in props: one operation_name occurs at more
@@ -517,134 +536,104 @@ _V2_BENCH_ID_KEYS = (
 )
 
 
-# Segregates this producer's benchmarks from every other one: in the identity hash and
-# leading both perf sort keys, exactly as component is for test_cases/test_case_runs.
-# Defined here rather than beside V2_COMPONENT_DEFAULT so it precedes its first use -- a later
-# definition raises only at call time, which no import-level check would catch.
-V2_BENCH_COMPONENT = "torch-spyre"
+_BENCH_TABLES = (schema_model.BENCHMARKS, schema_model.BENCHMARK_RUNS)
 
 
-def v2_benchmark_id(component: str, name: str, tags, disc=None) -> str:
-    """uuid5 over component + name + sorted tags + the identity discriminators in
-    _V2_BENCH_ID_KEYS. Same refuse-on-empty rule as v2_test_case_id: an empty name
-    still hashes to a real uuid, so every unidentifiable benchmark would collide on
-    ONE id rather than merely being orphaned.
+def benchmark_tables_present(client, db: str) -> bool:
+    """Both benchmark tables exist in `db` AND carry every column the writer inserts.
 
-    component leads the string, matching the spyre-inference vLLM writer. The two
-    producers carry DIFFERENT discriminator key sets (this one has config_name /
-    input_shapes / kernel_name / is_total; vLLM has tensor_parallel / input_len /
-    output_len), which is fine precisely because component leads: no id from one
-    producer can ever equal one from the other, so each set only has to be internally
-    consistent. If a single component were ever written by both, they would have to
-    agree on the keys as well."""
-    if not _v2_norm(name):
-        return ""
-    tag_part = ",".join(sorted({_v2_norm(t) for t in (tags or []) if _v2_norm(t)}))
-    disc = disc or {}
-    disc_part = ",".join(f"{k}={_v2_norm(disc.get(k))}" for k in _V2_BENCH_ID_KEYS)
-    return str(
-        uuid.uuid5(V2_NAMESPACE, f"{component}|{_v2_norm(name)}|{tag_part}|{disc_part}")
-    )
-
-
-def v2_benchmark_tables_present(client, db: str) -> bool:
-    return _table_exists(client, "benchmarks", db) and _table_exists(
-        client, "benchmark_runs", db
-    )
-
-
-def v2_benchmarks_already_ingested(client, db: str, run_id: str) -> bool:
-    """benchmark_runs is a plain MergeTree with no dedup key, so a re-ingest
-    doubles every measurement behind an average."""
-    rows = client.query(
-        f"SELECT count() FROM {v2_schema.BENCHMARK_RUNS.qualified(db)} "
-        "WHERE run_id = {run_id:UUID}",
-        parameters={"run_id": run_id},
-    ).result_rows
-    return bool(rows and rows[0][0] > 0)
+    Delegates the existence+column diff to the shared tables_present so the
+    functional-test and benchmark write paths get the same drift protection; only the
+    per-table warning naming the missing columns is specific to this call site.
+    """
+    if tables_present(client, db, tables=_BENCH_TABLES):
+        return True
+    for t in _BENCH_TABLES:
+        if not bool(client.command(f"EXISTS TABLE {t.qualified(db)}")):
+            print(
+                f"  [warn] v2 skipped: {db}.{t.name} does not exist "
+                "-- apply the v2 benchmark DDL",
+                file=sys.stderr,
+            )
+            continue
+        rows = client.query(
+            "SELECT name FROM system.columns "
+            "WHERE database = {db:String} AND table = {t:String}",
+            parameters={"db": db, "t": t.name},
+        ).result_rows
+        missing = sorted(set(t.columns) - {r[0] for r in rows})
+        if missing:
+            print(
+                f"  [warn] v2 skipped: {db}.{t.name} is missing {', '.join(missing)} "
+                "-- apply the v2 benchmark DDL",
+                file=sys.stderr,
+            )
+    return False
 
 
 # perf_kernels.metric is the real backend axis: cpu_kernel_ms on 16,734 prod rows,
 # spyre_kernel_ms on 3,475. Its torch_spyre_ms/sendnn_ms/ratio columns are NULL on all
 # 20,209 rows, so the comparison v1 looks like it stores was never actually written.
-_V2_BACKEND_BY_METRIC = {
+_BACKEND_BY_METRIC = {
     "cpu_kernel_ms": "cpu",
     "spyre_kernel_ms": "spyre",
     "sendnn_ms": "sendnn",
 }
 
 
-def _v2_bench_backend(rec: dict) -> str:
+def _bench_backend(rec: dict) -> str:
     """Which implementation produced these numbers, so the same benchmark measured on
     two backends compares by self-join instead of by a stored ratio that can disagree
     with its operands."""
     metric = (rec.get("metric") or "").strip()
-    if metric in _V2_BACKEND_BY_METRIC:
-        return _V2_BACKEND_BY_METRIC[metric]
+    if metric in _BACKEND_BY_METRIC:
+        return _BACKEND_BY_METRIC[metric]
     if rec.get("sendnn_ms") is not None and rec.get("torch_spyre_ms") is None:
         return "sendnn"
-    return "torch-spyre"
+    # report.xml records are torch-spyre's own run on the card.
+    return "spyre"
 
 
-def insert_benchmarks_v2(client, db: str, run_id: str, records: list) -> int:
-    """Write benchmarks (identity) + benchmark_runs (measurements) for one run.
+def _bench_entries(records: list) -> list:
+    """This producer's perf records in the shared writer's entry shape.
 
-    Dropped from v2 deliberately: regression_status and ratio (verdicts with no
-    recorded baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare
-    instead), and every run-context column (reached through run_id).
+    Measurements become single-element ARRAYS: benchmark_runs stores a metric's samples, and
+    this harness reports one pre-averaged value per metric, so `iterations` carries the n
+    behind it.
+
+    Dropped from v2 deliberately: regression_status and ratio (verdicts with no recorded
+    baseline -- derived in v_benchmark_regression / v_benchmark_backend_compare instead), and
+    every run-context column (reached through run_id).
     """
-    if not records:
-        return 0
-    ident_rows, fact_rows = {}, []
-    skipped = 0
+    uncaptured = {
+        k
+        for k in _ZERO_WHEN_UNCAPTURED
+        if all(rec[k] == 0 for rec in records if rec.get(k) is not None)
+    }
+    entries = []
     for rec in records:
-        name = rec.get("operation_name") or ""
-        tags = sorted({t for t in (rec.get("tags") or []) if t})
-        bid = v2_benchmark_id(V2_BENCH_COMPONENT, name, tags, rec)
-        if not bid:
-            skipped += 1
-            continue
-        props = {
-            k: str(rec[k])
-            for k in _V2_BENCH_PROP_KEYS
-            if rec.get(k) is not None and str(rec[k]) != ""
-        }
-        measurements = {
-            k: float(rec[k]) for k in _V2_BENCH_METRIC_KEYS if rec.get(k) is not None
-        }
-        if not measurements:
-            # chk_measurements refuses an empty map: a benchmark row that measured
-            # nothing is a parse failure, not a result.
-            skipped += 1
-            continue
-        ident_rows[bid] = {
-            "benchmark_id": bid,
-            "component": V2_BENCH_COMPONENT,
-            "name": name,
-            "tags": tags,
-            "props": props,
-        }
         num_runs = rec.get("num_runs")
-        fact_rows.append(
+        entries.append(
             {
-                "run_id": run_id,
-                "benchmark_id": bid,
-                "component": V2_BENCH_COMPONENT,
-                "backend": _v2_bench_backend(rec),
-                "measurements": measurements,
+                "name": rec.get("operation_name") or "",
+                "tags": sorted({t for t in (rec.get("tags") or []) if t}),
+                "backend": _bench_backend(rec),
+                "props": {
+                    k: str(rec[k])
+                    for k in _V2_BENCH_PROP_KEYS
+                    if rec.get(k) is not None and str(rec[k]) != ""
+                },
+                "measurements": {
+                    k: [float(rec[k])]
+                    for k in _V2_BENCH_METRIC_KEYS
+                    if rec.get(k) is not None and k not in uncaptured
+                },
                 "iterations": int(num_runs) if num_runs is not None else 0,
-                "props": {},
+                "disc": rec,
+                "disc_keys": _V2_BENCH_ID_KEYS,
             }
         )
-    v2_schema.insert_identities(client, v2_schema.BENCHMARKS, ident_rows, db=db)
-    v2_schema.insert(client, v2_schema.BENCHMARK_RUNS, fact_rows, db=db)
-    if skipped:
-        print(
-            f"  [warn] v2: {skipped} benchmark(s) skipped -- no derivable "
-            f"benchmark_id or no measurements",
-            file=sys.stderr,
-        )
-    return len(fact_rows)
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +916,12 @@ def parse_test_xml(xml_path: Path):
     except ValueError:
         triggered_at = datetime.now(UTC)
 
-    raw_cases = []
+    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins.
+    by_key = {}
     for tc in suite.findall(".//testcase"):
+        by_key[(tc.get("classname", ""), tc.get("name", ""))] = tc
+    raw_cases = []
+    for tc in by_key.values():
         status, fail_msg = classify_testcase(tc)
         properties = extract_properties(tc)
         op_name, dtype, platform = extract_op_dtype_platform(
@@ -1136,60 +1129,7 @@ def insert_properties(client, run_id: str, cases: list[dict]):
 # and the docstring's own rule (group trends on (component, classname, name)) then splits one
 # suite across two components. --component lets the caller name the component whose suite this
 # actually is; product-test already knows it (config.yaml's `PRODUCT`).
-V2_COMPONENT_DEFAULT = "torch-spyre"
-
-
-def v2_artifact_id(component: str, artifact_name: str, id12: str, arch: str) -> str:
-    """Content identity of one built artifact: (component, artifact_name, id12, arch).
-
-    DERIVED, never minted. A consumer that knows only those four fields computes the same
-    id the producer did, with nothing threaded to it -- which is the whole reason it is a
-    hash and not a random uuid. v1's newRunId minted uuid4 and only 0.31% of
-    artifact_results ever resolved against a run; an artifact id has the same exposure.
-
-    The four fields also stay in `props` on the row, because the id is opaque once hashed
-    and nothing downstream can parse a component or an arch back out of it.
-    """
-    if not (_v2_norm(component) and v2_canonical_arch(arch)):
-        # An all-blank hash is a real uuid that every incomplete artifact would share.
-        return ""
-    return str(
-        uuid.uuid5(
-            V2_NAMESPACE,
-            V2_SEP.join(
-                (
-                    _v2_norm(component),
-                    _v2_norm(artifact_name),
-                    _v2_norm(id12),
-                    v2_canonical_arch(arch),
-                )
-            ),
-        )
-    )
-
-
-def v2_gha_artifact_id(
-    component: str, base_image: str, installed: str, arch: str
-) -> str:
-    """Artifact identity for a GHA-invoked run, where no orchestrator minted an id12.
-
-    A GHA leg knows what it RAN ON even without a build: the base image plus the set of
-    packages installed into it. Hashing those two into the id12 slot makes such a run
-    joinable on the same column as an orchestrator-built one, so `artifact_results` needs
-    no second, GHA-shaped identity.
-
-    `installed` is normalised to a SORTED, deduped set: install order is incidental, and an
-    order-sensitive hash would mint a fresh identity for a re-run of the same environment.
-    """
-    if not (_v2_norm(component) and v2_canonical_arch(arch)):
-        return ""
-    items = sorted(
-        {_v2_norm(x) for x in (installed or "").replace(",", " ").split() if x}
-    )
-    digest = (
-        hashlib.sha256(V2_SEP.join(items).encode()).hexdigest()[:12] if items else ""
-    )
-    return v2_artifact_id(component, _v2_norm(base_image), digest, arch)
+COMPONENT_DEFAULT = "torch-spyre"
 
 
 def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> int:
@@ -1212,11 +1152,11 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
     if not covered:
         return 0
     total = 0
-    runs = v2_schema.TEST_CASE_RUNS.qualified(db)
+    runs = schema_model.TEST_CASE_RUNS.qualified(db)
     for tier, src_run in covered:
         if not src_run:
             continue
-        # Guard on the SOURCE run, not the tier: v2_already_ingested keys on
+        # Guard on the SOURCE run, not the tier: cases_already_ingested keys on
         # props['source_file'], which these copies inherit from the source row, so it cannot
         # see a re-copy -- without a guard here a second call doubled 4 rows to 8.
         #
@@ -1241,7 +1181,7 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             continue
         # Only the cases carrying this tier's tag: the covering run may have executed a
         # wider set, and importing all of it would credit this tier with foreign cases.
-        cases = v2_schema.TEST_CASES.qualified(db)
+        cases = schema_model.TEST_CASES.qualified(db)
         client.command(
             f"INSERT INTO {runs} "
             "(run_id, test_case_id, component, status, duration_s, fail_message, props) "
@@ -1268,6 +1208,90 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
     return total
 
 
+# ---------------------------------------------------------------------------
+# The GHA leg's artifact, and its verdict. The id is derived on the RUNNER (only it can read
+# the image's stamped base id and knows the installed delta) and arrives as --artifact-id.
+# ---------------------------------------------------------------------------
+
+
+def _parse_artifact_record(raw: str):
+    """Split --artifact-id into (artifact_id, base_artifact_id, installed).
+
+    Tolerant both ways -- producer and parser are versioned independently, so a strict arity
+    check would turn a format bump into lost rows for every in-flight run.
+    """
+    parts = [f.strip() for f in (raw or "").split("|")]
+    parts += [""] * (3 - len(parts))
+    return parts[0], parts[1], parts[2]
+
+
+def _leg_state(failed: int, total: int) -> str:
+    """artifact_results.state. 'error' for no cases: that suite did not run, it did not regress."""
+    if total <= 0:
+        return "error"
+    return "failed" if failed > 0 else "passed"
+
+
+def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
+    """Write one artifacts row and one artifact_results row per (run_id, tier) of this leg."""
+    if not legs or not v2db or not args.artifact_id:
+        return
+    artifact_id, base_id, installed = _parse_artifact_record(args.artifact_id)
+    if not artifact_id:
+        return
+    try:
+        for (run_id, tier), acc in sorted(legs.items()):
+            if tier not in schema_model.TEST_TYPE_VALUES:
+                # Loud: this is the last thing between a derived id and its verdict.
+                print(
+                    f"  [warn] v2: artifact verdict skipped for run_id={run_id} -- "
+                    f"test_type {tier!r} is not a tier the DDL admits "
+                    f"({sorted(schema_model.TEST_TYPE_VALUES)}); --trigger-type is the "
+                    "field usually missing",
+                    file=sys.stderr,
+                )
+                continue
+            wrote = insert_gha_artifact_result(
+                client,
+                v2db,
+                artifact_id=artifact_id,
+                component=component_of(args, COMPONENT_DEFAULT),
+                arch=args.platform or "",
+                run_id=run_id,
+                test_type=tier,
+                state=_leg_state(acc["failed"], acc["total"]),
+                duration_s=acc["duration_s"],
+                # Hash inputs, carried through the record -- unreachable from this job.
+                base_artifact_id=base_id,
+                installed=installed,
+                repo=args.repository,
+                git_ref=args.branch,
+                git_sha=args.sha,
+                run_url=_gha_run_url(args),
+            )
+            if wrote:
+                print(
+                    f"  v2: artifact_results {artifact_id} "
+                    f"[{tier}] state={_leg_state(acc['failed'], acc['total'])} "
+                    f"under run_id={run_id}"
+                )
+    except Exception as err:
+        # The cases are already in; losing the verdict must not also lose them.
+        print(
+            f"  [warn] v2: artifact verdict write failed, rows unaffected: {err!r}",
+            file=sys.stderr,
+        )
+
+
+def _gha_run_url(args) -> str:
+    """`run_url` -- the ONE url key in v2: the CI run behind the row."""
+    repo, rid = (args.repository or "").strip(), (args.gha_run_id or "").strip()
+    if not (repo and rid):
+        return ""
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+    return f"{server}/{repo}/actions/runs/{rid}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml-dir", default=None)
@@ -1284,6 +1308,21 @@ def main():
         "the test_case_id they hash into) name the suite's real owner.",
     )
     parser.add_argument("--gha-run-id", default="")
+    parser.add_argument(
+        "--artifact-id",
+        default="",
+        help="Identity of what this leg ACTUALLY RAN, derived on the runner by "
+        "derive-gha-artifact-id. A bare artifact_id, or the record "
+        "'<artifact_id>|<base_artifact_id>|<installed,comma,joined>' whose extra fields are "
+        "the hash inputs. Given, the ingest also writes the artifacts row and the "
+        "artifact_results verdict; empty writes neither and the cases land as before.",
+    )
+    parser.add_argument(
+        "--repository",
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="owner/repo the tested commit came from, recorded in artifacts.sources -- the "
+        "column resolve_covered_tiers.py reaches an artifact through.",
+    )
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
     parser.add_argument(
@@ -1348,9 +1387,9 @@ def main():
     )
     client = get_client()
     # One client, both generations: v2 is reached by QUALIFYING every statement with this
-    # database name (see v2_database). "" means v2 is not configured, which every v2 site
+    # database name (see target_database). "" means v2 is not configured, which every v2 site
     # treats as "skip".
-    v2db = v2_database() if args.write_v2 else ""
+    v2db = target_database() if args.write_v2 else ""
     if args.write_v2 and not v2db:
         print(
             "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
@@ -1371,6 +1410,13 @@ def main():
     total_benchmarks = 0
     parsed_benchmarks = 0
     total_kernels = 0
+
+    # (run_id, tier) -> aggregate outcome, written AFTER the loop: a sharded run is many
+    # files under one run_id, so a per-file write would report only the first shard's verdict.
+    artifact_legs = {}
+
+    # Hoisted: the gate costs round trips and v2db is fixed for the invocation.
+    bench_ready = bool(v2db) and benchmark_tables_present(client, v2db)
 
     for xml_path in xml_files:
         print(f"Processing: {xml_path.name}")
@@ -1408,7 +1454,7 @@ def main():
                 continue
 
             # v1-table read, so it only applies when v1 is being written. The v2 path has its
-            # own dedup (v2_benchmarks_already_ingested) against its own table.
+            # own dedup (benchmarks_already_ingested) against its own table.
             if args.write_v1:
                 existing = client.query(
                     "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
@@ -1430,21 +1476,37 @@ def main():
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
-            if v2db and v2_benchmark_tables_present(client, v2db):
-                _src, _ext = v2_source_and_external_run_id(args, str(run_id))
-                _v2_run_id = v2_run_id_for(
-                    args, str(run_id), args.platform or "", "perf"
-                )
+            if bench_ready:
+                _src, _ext = source_and_external_run_id(args, str(run_id))
+                _v2_run_id = run_id_for(args, str(run_id), args.platform or "", "perf")
                 if not _v2_run_id:
                     print(
                         "  [warn] v2 skipped: run_id not derivable "
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, v2db, _v2_run_id):
-                    print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
+                elif benchmarks_already_ingested(
+                    client,
+                    v2db,
+                    _v2_run_id,
+                    component_of(args, COMPONENT_DEFAULT),
+                    "kernel",
+                    run_meta["source_file"],
+                ):
+                    print(
+                        f"  v2: already ingested kernel report for "
+                        f"run_id={_v2_run_id} — skipping"
+                    )
                 else:
-                    _n = insert_benchmarks_v2(client, v2db, _v2_run_id, kernels)
+                    _n = insert_benchmarks(
+                        client,
+                        v2db,
+                        component_of(args, COMPONENT_DEFAULT),
+                        _v2_run_id,
+                        _bench_entries(kernels),
+                        report_kind="kernel",
+                        source_file=run_meta["source_file"],
+                    )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_kernels += len(kernels)
@@ -1495,21 +1557,37 @@ def main():
             # Additive v2 write: the same measurements under a DERIVED run_id, so a
             # perf number can name the artifact it measured. Guarded on both tables
             # existing so this deploys before the migration.
-            if v2db and v2_benchmark_tables_present(client, v2db):
-                _src, _ext = v2_source_and_external_run_id(args, str(run_id))
-                _v2_run_id = v2_run_id_for(
-                    args, str(run_id), args.platform or "", "perf"
-                )
+            if bench_ready:
+                _src, _ext = source_and_external_run_id(args, str(run_id))
+                _v2_run_id = run_id_for(args, str(run_id), args.platform or "", "perf")
                 if not _v2_run_id:
                     print(
                         "  [warn] v2 skipped: run_id not derivable "
                         f"(source={_src!r} external_run_id={_ext!r})",
                         file=sys.stderr,
                     )
-                elif v2_benchmarks_already_ingested(client, v2db, _v2_run_id):
-                    print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
+                elif benchmarks_already_ingested(
+                    client,
+                    v2db,
+                    _v2_run_id,
+                    component_of(args, COMPONENT_DEFAULT),
+                    "benchmark",
+                    run_meta["source_file"],
+                ):
+                    print(
+                        f"  v2: already ingested benchmark report for "
+                        f"run_id={_v2_run_id} — skipping"
+                    )
                 else:
-                    _n = insert_benchmarks_v2(client, v2db, _v2_run_id, benchmarks)
+                    _n = insert_benchmarks(
+                        client,
+                        v2db,
+                        component_of(args, COMPONENT_DEFAULT),
+                        _v2_run_id,
+                        _bench_entries(benchmarks),
+                        report_kind="benchmark",
+                        source_file=run_meta["source_file"],
+                    )
                     print(f"  v2: {_n} benchmark_runs under run_id={_v2_run_id}")
 
             total_benchmarks += len(benchmarks)
@@ -1534,7 +1612,7 @@ def main():
             # but two distinct runs must never collapse. runner_run_id mirrors run_id for a Jenkins/standalone leg, so it's only an independent signal for a GHA numeric id.
             runner_run_id = _runner_run_id(args, run_id)
             # v1-table reads, so gated on v1 being written. v2 dedups on its own table via
-            # v2_already_ingested(run_id, component).
+            # cases_already_ingested(run_id, component).
             if args.write_v1:
                 existing = client.query(
                     "SELECT count() FROM test_runs "
@@ -1581,10 +1659,10 @@ def main():
             # authoritative, so the experimental write is contained rather than allowed to
             # abort the loop and drop every remaining file's v1 insert.
             try:
-                if v2db and v2_tables_present(client, v2db):
-                    _v2_source, _v2_ext = v2_source_and_external_run_id(args, run_id)
+                if v2db and tables_present(client, v2db):
+                    _v2_source, _v2_ext = source_and_external_run_id(args, run_id)
                     _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
-                    _v2_run_id = v2_run_id_for(
+                    _v2_run_id = run_id_for(
                         args, run_id, args.platform or run["platform"], _v2_tier
                     )
                     if not _v2_run_id:
@@ -1597,24 +1675,35 @@ def main():
                             f"--trigger-type is the field usually missing",
                             file=sys.stderr,
                         )
-                    elif v2_already_ingested(
+                    elif cases_already_ingested(
                         client,
                         v2db,
                         _v2_run_id,
-                        v2_component(args, V2_COMPONENT_DEFAULT),
+                        component_of(args, COMPONENT_DEFAULT),
                         xml_path.name,
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
-                        _n = insert_v2(
+                        _n = insert_test_results(
                             client,
                             v2db,
-                            v2_component(args, V2_COMPONENT_DEFAULT),
+                            component_of(args, COMPONENT_DEFAULT),
                             _v2_run_id,
                             cases,
                             xml_path.name,
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
+
+                    # Accumulated even when the cases were already ingested, so a re-ingest
+                    # can still land a verdict that failed to write. The writer dedups.
+                    if _v2_run_id and args.artifact_id:
+                        _acc = artifact_legs.setdefault(
+                            (_v2_run_id, _v2_tier),
+                            {"failed": 0, "total": 0, "duration_s": 0.0},
+                        )
+                        _acc["failed"] += int(run.get("failed", 0) or 0)
+                        _acc["total"] += int(run.get("total_tests", 0) or 0)
+                        _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
             except Exception as _v2_err:
                 print(
                     f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}",
@@ -1627,6 +1716,8 @@ def main():
                     f"  Inserted {len(cases)} test cases + "
                     f"{sum(len(c['properties']) for c in cases)} properties"
                 )
+
+    _write_artifact_verdicts(client, v2db, args, artifact_legs)
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
