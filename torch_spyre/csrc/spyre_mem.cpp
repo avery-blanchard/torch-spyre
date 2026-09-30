@@ -469,10 +469,33 @@ auto get_device_stride_infos_from_tile_size(
     }
   }
 
-  // No remainder transfers: tile_size defines complete transfers
+  // Detect remainders by checking divisibility of real_count by device_stride
   std::vector<std::vector<int64_t>> remainders;
   std::vector<int64_t> host_offsets;
   std::vector<int64_t> device_offsets;
+
+  for (const auto& [dev_dims, real_count] : stl.tile_size) {
+    for (int d : dev_dims) {
+      const int64_t dev_stride = device_strides[d];
+      if (dev_stride == 0) continue;
+
+      if (real_count % dev_stride != 0) {
+        // Remainder detected: real_count doesn't evenly fill this device dim
+        int64_t complete_tiles = real_count / dev_stride;
+        int64_t remainder_count = real_count % dev_stride;
+
+        std::vector<int64_t> remainder(device_rank, 0);
+        remainder[d] = remainder_count;
+
+        remainders.push_back(remainder);
+        host_offsets.push_back(complete_tiles * host_strides[d]);
+        device_offsets.push_back(complete_tiles * device_strides[d]);
+
+        // Clamp main transfer to complete tiles
+        dcsi_sizes[d] = complete_tiles;
+      }
+    }
+  }
 
   // Create first DataConversionStrideInfo
   DataConversionStrideInfo stride_info;
