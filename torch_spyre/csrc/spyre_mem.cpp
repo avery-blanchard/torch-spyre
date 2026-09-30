@@ -446,52 +446,39 @@ auto get_device_stride_infos_from_tile_size(
   // Build dcsi_sizes (unpadded) from tile_size
   std::vector<int64_t> dcsi_sizes(device_rank, 1);
 
-  for (const auto& [dev_dims, real_count] : stl.tile_size) {
-    if (dev_dims.size() == 1) {
-      // Single dim group: just use real_count
-      dcsi_sizes[dev_dims[0]] = real_count;
-    } else {
-      // Multi-dim group (stick dims): last dim = elems_per_stick, others =
-      // ceiling(real_count / elems_per_stick)
-      int last_dev_dim = dev_dims.back();
-      int64_t elems_per_stick = stl.device_size[last_dev_dim];
-      int64_t count_dim_size =
-          (real_count + elems_per_stick - 1) / elems_per_stick;
-
-      int64_t last_dim_size = std::min(elems_per_stick, real_count);
-      for (int d : dev_dims) {
-        if (d == last_dev_dim) {
-          dcsi_sizes[d] = last_dim_size;
-        } else {
-          dcsi_sizes[d] = count_dim_size;
-        }
-      }
-    }
-  }
-
-  // Detect remainders by checking divisibility of real_count by device_stride
   std::vector<std::vector<int64_t>> remainders;
   std::vector<int64_t> host_offsets;
   std::vector<int64_t> device_offsets;
+  remainders.reserve(stl.tile_size.size());
 
-  // Detect remainders: only for multi-dim groups where real_count > stick_size
-  for (const auto& [dev_dims, real_count] : stl.tile_size) {
-    if (dev_dims.size() > 1) {
-      // Stick group: check if real_count spans multiple sticks
+  // Single pass: compute dcsi_sizes and detect remainders
+  for (const auto& [dev_dims, num_valid_elems] : stl.tile_size) {
+    if (dev_dims.size() == 1) {
+      dcsi_sizes[dev_dims[0]] = num_valid_elems;
+    } else {
+      // Multi-dim (stick) group: compute sizes and check for padding
       int last_dev_dim = dev_dims.back();
-      int64_t stick_size = stl.device_size[last_dev_dim];
+      int64_t elems_per_stick = stl.device_size[last_dev_dim];
+      int64_t stick_count =
+          (num_valid_elems + elems_per_stick - 1) / elems_per_stick;
+      int64_t last_dim_size = std::min(elems_per_stick, num_valid_elems);
 
-      int64_t last_stick_elements = real_count % stick_size;
-      if (last_stick_elements != 0) {
-        // Last stick has padding: remainder is the unfilled portion
-        int64_t remainder_count = stick_size - last_stick_elements;
+      for (int d : dev_dims) {
+        dcsi_sizes[d] = (d == last_dev_dim) ? last_dim_size : stick_count;
+      }
 
-        std::vector<int64_t> remainder(device_rank, 0);
-        remainder[last_dev_dim] = remainder_count;
-
-        remainders.push_back(remainder);
-        host_offsets.push_back(real_count * host_strides[last_dev_dim]);
-        device_offsets.push_back(real_count * device_strides[last_dev_dim]);
+      // Check if last stick has padding (only for multi-stick cases)
+      if (num_valid_elems > elems_per_stick) {
+        int64_t partial_stick_count = num_valid_elems % elems_per_stick;
+        if (partial_stick_count != 0) {
+          int64_t padding_elems = elems_per_stick - partial_stick_count;
+          std::vector<int64_t> remainder(device_rank, 0);
+          remainder[last_dev_dim] = padding_elems;
+          remainders.push_back(remainder);
+          host_offsets.push_back(num_valid_elems * host_strides[last_dev_dim]);
+          device_offsets.push_back(num_valid_elems *
+                                   device_strides[last_dev_dim]);
+        }
       }
     }
   }
@@ -510,26 +497,20 @@ auto get_device_stride_infos_from_tile_size(
 
   std::vector<DataConversionStrideInfo> stride_infos = {stride_info};
 
-  // Generate remainder DataConversionStrideInfo
+  // Generate remainder DataConversionStrideInfo (linear, not exponential)
   for (size_t i = 0; i < remainders.size(); i++) {
     std::reverse(remainders[i].begin(), remainders[i].end());
-    const int64_t offset_src =
-        host2device ? host_offsets[i] : device_offsets[i];
-    const int64_t offset_dst =
-        host2device ? device_offsets[i] : host_offsets[i];
-
-    const size_t num_infos = stride_infos.size();
-    for (size_t j = 0; j < num_infos; j++) {
-      DataConversionStrideInfo info = stride_infos[j];
-      for (int k = 0; k < device_rank; k++) {
-        if (remainders[i][k] > 0) {
-          info.size_[k] = remainders[i][k];
-        }
+    DataConversionStrideInfo info = stride_infos[0];
+    for (int k = 0; k < device_rank; k++) {
+      if (remainders[i][k] > 0) {
+        info.size_[k] = remainders[i][k];
       }
-      info.offset_src_ += offset_src;
-      info.offset_dst_ += offset_dst;
-      stride_infos.push_back(info);
     }
+    info.offset_src_ = stride_infos[0].offset_src_ +
+                       (host2device ? host_offsets[i] : device_offsets[i]);
+    info.offset_dst_ = stride_infos[0].offset_dst_ +
+                       (host2device ? device_offsets[i] : host_offsets[i]);
+    stride_infos.push_back(info);
   }
 
   return stride_infos;
