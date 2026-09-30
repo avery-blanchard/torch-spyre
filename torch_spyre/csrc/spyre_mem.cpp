@@ -443,25 +443,27 @@ auto get_device_stride_infos_from_tile_size(
     prev_size *= stl.device_size[i];
   }
 
-  // Initialize dcsi_sizes from device_size, marking broadcasted dims
+  // Build dcsi_sizes (unpadded) from tile_size
   std::vector<int64_t> dcsi_sizes(device_rank, 1);
-  for (int i = 0; i < device_rank; i++) {
-    if (stl.stride_map[i] == 0) {
-      dcsi_sizes[i] = stl.device_size[i];
-    }
-  }
 
-  // Clamp dcsi_sizes to real element counts from tile_size
-  // Padding is implicit in device_size; strides computed from full device_size
-  // skip it
   for (const auto& [dev_dims, real_count] : stl.tile_size) {
-    // Last dim in group gets clamped to real_count; others stay full
-    int last_dev_dim = dev_dims.back();
-    for (int d : dev_dims) {
-      if (d == last_dev_dim) {
-        dcsi_sizes[d] = real_count;
-      } else {
-        dcsi_sizes[d] = stl.device_size[d];
+    if (dev_dims.size() == 1) {
+      // Single dim group: just use real_count
+      dcsi_sizes[dev_dims[0]] = real_count;
+    } else {
+      // Multi-dim group (stick dims): last dim = elems_per_stick, others =
+      // ceiling(real_count / elems_per_stick)
+      int last_dev_dim = dev_dims.back();
+      int64_t elems_per_stick = stl.device_size[last_dev_dim];
+      int64_t count_dim_size =
+          (real_count + elems_per_stick - 1) / elems_per_stick;
+
+      for (int d : dev_dims) {
+        if (d == last_dev_dim) {
+          dcsi_sizes[d] = elems_per_stick;
+        } else {
+          dcsi_sizes[d] = count_dim_size;
+        }
       }
     }
   }
