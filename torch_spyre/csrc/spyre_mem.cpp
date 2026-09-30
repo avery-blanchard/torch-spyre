@@ -186,8 +186,11 @@ static int64_t valid_size(int64_t dim_idx, const SpyreTensorLayout& stl) {
     const int64_t stick_size = stl.device_size[stick_dim];
     TORCH_CHECK(stick_size > 0, "Invalid device size ", stick_size,
                 " for stick dimension ", stick_dim);
+    // For stick dim: return min of valid_count and stick_size (saturate at
+    // stick boundary) For count dim: return ceiling division (number of sticks
+    // needed for valid_count elements)
     return dim_idx == stick_dim ? std::min<int64_t>(valid_count, stick_size)
-                                : valid_count / stick_size;
+                                : (valid_count + stick_size - 1) / stick_size;
   }
   return stl.device_size[dim_idx];
 }
@@ -402,6 +405,129 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       for (int k = 0; k < device_rank; k++) {
         info.size_[k] =
             remainders[i][k] == 0 ? info.size_[k] : remainders[i][k];
+      }
+      info.offset_src_ += offset_src;
+      info.offset_dst_ += offset_dst;
+      stride_infos.push_back(info);
+    }
+  }
+
+  return stride_infos;
+}
+
+/* Parallel tile_size-centric implementation of DCI generation.
+ *
+ * This function generates DataConversionStrideInfo by iterating over
+ * tile_size groups (device dim groups) directly instead of deriving
+ * dim_map. Each tile_size group maps to a real element count.
+ */
+auto get_device_stride_infos_from_tile_size(
+    c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t cpu_offset,
+    int64_t device_offset, SpyreTensorLayout stl, bool host2device)
+    -> std::vector<DataConversionStrideInfo> {
+  const int device_rank = stl.stride_map.size();
+
+  // Build host_strides from stride_map
+  std::vector<int64_t> host_strides(device_rank, 1);
+  for (int i = 0; i < device_rank; i++) {
+    if (stl.stride_map[i] > 0) {
+      host_strides[i] = stl.stride_map[i];
+    }
+  }
+
+  // Build contiguous device_strides
+  std::vector<int64_t> device_strides(device_rank, 1);
+  int64_t prev_size = 1;
+  for (int i = device_rank - 1; i >= 0; i--) {
+    device_strides[i] = prev_size;
+    prev_size *= stl.device_size[i];
+  }
+
+  // Initialize dcsi_sizes from device_size, marking broadcasted dims
+  std::vector<int64_t> dcsi_sizes(device_rank, 1);
+  for (int i = 0; i < device_rank; i++) {
+    if (stl.stride_map[i] == 0) {
+      dcsi_sizes[i] = stl.device_size[i];
+    }
+  }
+
+  // Iterate over tile_size groups and check for padding
+  std::vector<std::vector<int64_t>> remainders;
+  std::vector<int64_t> host_offsets;
+  std::vector<int64_t> device_offsets;
+
+  for (const auto& [dev_dims, real_count] : stl.tile_size) {
+    // Compute padded element count for this group
+    int64_t padded_count = 1;
+    for (int d : dev_dims) {
+      padded_count *= stl.device_size[d];
+    }
+
+    // No padding case: all elements are real
+    if (padded_count == real_count) {
+      for (int d : dev_dims) {
+        dcsi_sizes[d] = std::min(stl.device_size[d], real_count);
+      }
+    } else {
+      // Padding case: first transfer is main, remainder follows
+      // Mark device dims in this group for remainder handling
+      std::vector<int64_t> remainder(device_rank, 0);
+      int64_t remainder_scale = 1;
+
+      for (size_t idx = 0; idx < dev_dims.size(); idx++) {
+        int d = dev_dims[idx];
+        // Last dim in group holds the remainder
+        if (idx == dev_dims.size() - 1) {
+          int64_t remainder_count = padded_count / real_count;
+          remainder[d] = stl.device_size[d] % remainder_count;
+          dcsi_sizes[d] = real_count / remainder_scale;
+        } else {
+          remainder_scale *= stl.device_size[d];
+        }
+      }
+
+      if (std::any_of(remainder.begin(), remainder.end(),
+                      [](int64_t r) { return r > 0; })) {
+        remainders.push_back(remainder);
+
+        // Compute offset to remainder region
+        int last_dev_dim = dev_dims.back();
+        int64_t remainder_elem = real_count % stl.device_size[last_dev_dim];
+        host_offsets.push_back(remainder_elem * host_strides[last_dev_dim]);
+        device_offsets.push_back(remainder_elem * device_strides[last_dev_dim]);
+      }
+    }
+  }
+
+  // Create first DataConversionStrideInfo
+  DataConversionStrideInfo stride_info;
+  stride_info.size_ = dcsi_sizes;
+  stride_info.stride_src_ = host2device ? host_strides : device_strides;
+  stride_info.stride_dst_ = host2device ? device_strides : host_strides;
+  stride_info.offset_src_ = host2device ? cpu_offset : device_offset;
+  stride_info.offset_dst_ = host2device ? device_offset : cpu_offset;
+
+  std::reverse(stride_info.size_.begin(), stride_info.size_.end());
+  std::reverse(stride_info.stride_src_.begin(), stride_info.stride_src_.end());
+  std::reverse(stride_info.stride_dst_.begin(), stride_info.stride_dst_.end());
+
+  std::vector<DataConversionStrideInfo> stride_infos = {stride_info};
+
+  // Generate remainder DataConversionStrideInfo
+  for (size_t i = 0; i < remainders.size(); i++) {
+    std::reverse(remainders[i].begin(), remainders[i].end());
+    const int64_t offset_src =
+        host2device ? host_offsets[i] : device_offsets[i];
+    const int64_t offset_dst =
+        host2device ? device_offsets[i] : host_offsets[i];
+
+    const size_t num_infos = stride_infos.size();
+    for (size_t j = 0; j < num_infos; j++) {
+      DataConversionStrideInfo info = stride_infos[j];
+      for (int k = 0; k < device_rank; k++) {
+        if (remainders[i][k] > 0) {
+          info.size_[k] = remainders[i][k];
+        }
       }
       info.offset_src_ += offset_src;
       info.offset_dst_ += offset_dst;
@@ -797,8 +923,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     }
   }
 
-  dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
-                                      device_offset, stl, host2device);
+  // Use tile_size-centric path when available; fall back to dim_map path
+  if (!stl.tile_size.empty()) {
+    dci.dcsi_ = get_device_stride_infos_from_tile_size(
+        cpu_sizes, cpu_strides, cpu_offset, device_offset, stl, host2device);
+  } else {
+    dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
+                                        device_offset, stl, host2device);
+  }
 
   // Reverse PyTorch ordering
   std::reverse(cpu_sizes.begin(), cpu_sizes.end());
