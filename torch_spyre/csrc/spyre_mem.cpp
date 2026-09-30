@@ -451,7 +451,7 @@ auto get_device_stride_infos_from_tile_size(
     }
   }
 
-  // Iterate over tile_size groups and check for padding
+  // Detect padding and build remainder transfers
   std::vector<std::vector<int64_t>> remainders;
   std::vector<int64_t> host_offsets;
   std::vector<int64_t> device_offsets;
@@ -463,39 +463,35 @@ auto get_device_stride_infos_from_tile_size(
       padded_count *= stl.device_size[d];
     }
 
-    // No padding case: all elements are real
-    if (padded_count == real_count) {
-      for (int d : dev_dims) {
-        dcsi_sizes[d] = std::min(stl.device_size[d], real_count);
-      }
-    } else {
-      // Padding case: first transfer is main, remainder follows
-      // Mark device dims in this group for remainder handling
-      std::vector<int64_t> remainder(device_rank, 0);
-      int64_t remainder_scale = 1;
+    if (padded_count > real_count) {
+      // There is padding: clamp main transfer, generate remainder
+      int64_t remainder_count = padded_count - real_count;
 
-      for (size_t idx = 0; idx < dev_dims.size(); idx++) {
-        int d = dev_dims[idx];
-        // Last dim in group holds the remainder
-        if (idx == dev_dims.size() - 1) {
-          int64_t remainder_count = padded_count / real_count;
-          remainder[d] = stl.device_size[d] % remainder_count;
-          dcsi_sizes[d] = real_count / remainder_scale;
-        } else {
-          remainder_scale *= stl.device_size[d];
+      // Clamp dcsi_sizes for main transfer
+      for (int d : dev_dims) {
+        if (dcsi_sizes[d] == stl.device_size[d]) {
+          // This dim spans full padded size; clamp to real
+          int64_t real_per_dim = real_count;
+          for (int other : dev_dims) {
+            if (other != d) {
+              real_per_dim =
+                  std::max(real_per_dim / stl.device_size[other], 1LL);
+            }
+          }
+          dcsi_sizes[d] = real_per_dim;
         }
       }
 
-      if (std::any_of(remainder.begin(), remainder.end(),
-                      [](int64_t r) { return r > 0; })) {
-        remainders.push_back(remainder);
+      // Build remainder spec: only last dim in group has remainder
+      std::vector<int64_t> remainder(device_rank, 0);
+      int last_dev_dim = dev_dims.back();
+      remainder[last_dev_dim] = remainder_count;
 
-        // Compute offset to remainder region
-        int last_dev_dim = dev_dims.back();
-        int64_t remainder_elem = real_count % stl.device_size[last_dev_dim];
-        host_offsets.push_back(remainder_elem * host_strides[last_dev_dim]);
-        device_offsets.push_back(remainder_elem * device_strides[last_dev_dim]);
-      }
+      remainders.push_back(remainder);
+
+      // Offset to remainder region: skip real_count elements
+      host_offsets.push_back(real_count * host_strides[last_dev_dim]);
+      device_offsets.push_back(real_count * device_strides[last_dev_dim]);
     }
   }
 
