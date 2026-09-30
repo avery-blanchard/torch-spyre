@@ -476,7 +476,7 @@ auto get_device_stride_infos_from_tile_size(
             if (other != d) {
               real_per_dim = std::max(
                   static_cast<int64_t>(real_per_dim / stl.device_size[other]),
-                  1LL);
+                  static_cast<int64_t>(1));
             }
           }
           dcsi_sizes[d] = real_per_dim;
