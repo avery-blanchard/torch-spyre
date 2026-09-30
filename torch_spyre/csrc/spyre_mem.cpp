@@ -481,10 +481,9 @@ auto get_device_stride_infos_from_tile_size(
       int last_dev_dim = dev_dims.back();
       int64_t stick_size = stl.device_size[last_dev_dim];
 
-      if (real_count > stick_size) {
-        // Multi-stick with padding in last stick: remainder is the padding
-        int64_t complete_sticks = real_count / stick_size;
-        int64_t last_stick_elements = real_count % stick_size;
+      int64_t last_stick_elements = real_count % stick_size;
+      if (last_stick_elements != 0) {
+        // Last stick has padding: remainder is the unfilled portion
         int64_t remainder_count = stick_size - last_stick_elements;
 
         std::vector<int64_t> remainder(device_rank, 0);
@@ -493,9 +492,6 @@ auto get_device_stride_infos_from_tile_size(
         remainders.push_back(remainder);
         host_offsets.push_back(real_count * host_strides[last_dev_dim]);
         device_offsets.push_back(real_count * device_strides[last_dev_dim]);
-
-        // Main transfer already has dcsi_sizes[last_dev_dim] = min(stick_size,
-        // real_count)
       }
     }
   }
