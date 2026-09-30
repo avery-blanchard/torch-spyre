@@ -458,9 +458,10 @@ auto get_device_stride_infos_from_tile_size(
       int64_t count_dim_size =
           (real_count + elems_per_stick - 1) / elems_per_stick;
 
+      int64_t last_dim_size = std::min(elems_per_stick, real_count);
       for (int d : dev_dims) {
         if (d == last_dev_dim) {
-          dcsi_sizes[d] = elems_per_stick;
+          dcsi_sizes[d] = last_dim_size;
         } else {
           dcsi_sizes[d] = count_dim_size;
         }
