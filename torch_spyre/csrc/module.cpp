@@ -292,7 +292,17 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def_readonly("element_arrangement",
                     &spyre::SpyreTensorLayout::element_arrangement)
-      .def_readonly("tile_size", &spyre::SpyreTensorLayout::tile_size)
+      .def_property_readonly("tile_size",
+                             [](const spyre::SpyreTensorLayout& stl) {
+                               // Convert vector keys to tuple keys for Python
+                               // hashability
+                               py::dict result;
+                               for (const auto& [dims, count] : stl.tile_size) {
+                                 py::tuple key = py::cast(dims);
+                                 result[key] = count;
+                               }
+                               return result;
+                             })
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
            py::arg("element_arrangement"))
@@ -327,9 +337,15 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
+            // Convert tile_size vector keys to tuple keys for pickling
+            py::dict tile_size_tupled;
+            for (const auto& [dims, count] : p.tile_size) {
+              py::tuple key = py::cast(dims);
+              tile_size_tupled[key] = count;
+            }
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement, p.tile_size);
+                                  p.element_arrangement, tile_size_tupled);
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -366,15 +382,23 @@ PYBIND11_MODULE(_C, m) {
             } else if (version == 4) {
               // Version 4: (version, device_size, stride_map, device_dtype,
               // element_arrangement, tile_size)
+              // tile_size has tuple keys (from pickle), convert back to vectors
               if (t.size() != 6) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
               }
+              py::dict tile_size_dict = t[5].cast<py::dict>();
+              std::map<std::vector<int64_t>, int64_t> tile_size_map;
+              for (const auto& [key, value] : tile_size_dict) {
+                std::vector<int64_t> vec_key =
+                    py::cast<std::vector<int64_t>>(key);
+                int64_t count = py::cast<int64_t>(value);
+                tile_size_map[vec_key] = count;
+              }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
-                  t[4].cast<spyre::ElementArrangement>(),
-                  t[5].cast<std::map<std::vector<int64_t>, int64_t>>());
+                  t[4].cast<spyre::ElementArrangement>(), tile_size_map);
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +

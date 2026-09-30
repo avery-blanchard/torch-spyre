@@ -162,6 +162,36 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   return tile_map;
 }
 
+/* Valid (non-padded) element count for device dimension dim_idx.
+ * If tile_size is populated (from init() path), read directly from it.
+ * Otherwise (raw constructor path), default to device_size (assume no padding).
+ */
+static int64_t valid_size(int64_t dim_idx, const SpyreTensorLayout& stl) {
+  // If tile_size is empty, default to device capacity (no padding assumed)
+  if (stl.tile_size.empty()) {
+    return stl.device_size[dim_idx];
+  }
+
+  for (const auto& [dims, valid_count] : stl.tile_size) {
+    if (dims.size() == 1) {
+      if (dims[0] == dim_idx) return valid_count;
+      continue;
+    }
+    // A multi-key entry is always a stick-count dim paired with its
+    // trailing within-stick dim (see SpyreTensorLayout::tile_size doc): the
+    // within-stick dimension is sized up to a full stick, and the count
+    // dimension gets what remains after dividing out that stick size.
+    const int64_t stick_dim = dims.back();
+    if (stick_dim != dim_idx && dims.front() != dim_idx) continue;
+    const int64_t stick_size = stl.device_size[stick_dim];
+    TORCH_CHECK(stick_size > 0, "Invalid device size ", stick_size,
+                " for stick dimension ", stick_dim);
+    return dim_idx == stick_dim ? std::min<int64_t>(valid_count, stick_size)
+                                : valid_count / stick_size;
+  }
+  return stl.device_size[dim_idx];
+}
+
 /*
  * Fills out size and strides for each dimension of the tensor.
  *
@@ -287,9 +317,12 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
       if (current_elements % tile_stride == 0) {
         // When the current elements is evenly divisible by the tile stride then
-        // this tile has no remainder.
-
-        dcsi_sizes[tile_index] = std::min(remaining_elements, tile_size);
+        // this tile has no remainder. Clamp to the valid (non-padded)
+        // element count recorded in tile_size instead of the possibly-padded
+        // device size, so a fully-padded trailing tile isn't reported as
+        // valid data.
+        dcsi_sizes[tile_index] =
+            std::min(remaining_elements, valid_size(tile_index, stl));
 
         elements_before *= dcsi_sizes[tile_index];
       } else {

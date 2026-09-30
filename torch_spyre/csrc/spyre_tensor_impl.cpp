@@ -21,6 +21,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +30,62 @@
 #include "types_mapping.h"
 
 namespace spyre {
+static std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+    const std::vector<int64_t>& host_size,
+    const std::vector<int64_t>& host_strides,
+    const std::vector<int64_t>& stride_map) {
+  std::map<std::vector<int64_t>, int64_t> tile_size;
+  if (host_size.empty() || stride_map.empty()) {
+    return tile_size;
+  }
+
+  // Find the base host stride for a device stride. For positive strides,
+  // find the largest host stride that divides it. For -1 (size-1), find the
+  // size-1 host stride. For 0 (broadcast), return 0.
+  auto get_base_host_stride = [&](int64_t dst) -> int64_t {
+    int64_t best = 0;
+    for (int64_t i = 0; i < static_cast<int64_t>(host_strides.size()); ++i) {
+      const int64_t hst = host_strides[i];
+      if (hst <= 0) continue;
+      if (dst > 0) {
+        // Positive stride: find largest that divides it
+        if (dst % hst == 0 && hst > best) {
+          best = hst;
+        }
+      } else if (dst == -1 && host_size[i] == 1) {
+        // Size-1: match size-1 host strides
+        best = hst;
+        break;
+      }
+    }
+    return best;
+  };
+
+  // Group device dims by their base host stride. All device dims with the
+  // same base stride come from the same host dimension and share the same
+  // real element count. Include all dims, including broadcast (stride 0).
+  std::map<int64_t, std::vector<int64_t>> stride_groups;
+  for (int64_t d = 0; d < static_cast<int64_t>(stride_map.size()); ++d) {
+    int64_t base_stride = get_base_host_stride(stride_map[d]);
+    if (base_stride >= 0) {
+      stride_groups[base_stride].push_back(d);
+    }
+  }
+
+  // For each stride group, find its real element count (host_size) and
+  // add a tile_size entry with sorted device dim keys.
+  for (auto& [base_stride, dims] : stride_groups) {
+    for (int64_t i = 0; i < static_cast<int64_t>(host_size.size()); ++i) {
+      if (host_strides[i] == base_stride) {
+        std::sort(dims.begin(), dims.end());
+        tile_size[dims] = host_size[i];
+        break;
+      }
+    }
+  }
+
+  return tile_size;
+}
 
 int64_t elems_per_stick(const DataFormats& df) {
   // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
@@ -167,6 +224,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->stride_map.resize(2);
     this->stride_map[0] = -1;
     this->stride_map[1] = -1;
+    // Scalar: stick pair has 1 real element
+    this->tile_size[{0, 1}] = 1;
     return;
   }
 
@@ -192,6 +251,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
   this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
                                            this->device_size);
+  this->tile_size =
+      compute_tile_size(host_size, host_strides, this->stride_map);
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -223,12 +284,14 @@ std::string SpyreTensorLayout::toString() const {
     for (const auto& [dims, size] : this->tile_size) {
       if (!first) ss << ", ";
       first = false;
-      ss << "[";
+      ss << "(";
       for (size_t i = 0; i < dims.size(); i++) {
         ss << dims[i];
         if (i + 1 < dims.size()) ss << ", ";
       }
-      ss << "]: " << size;
+      // Single-element tuples need trailing comma in Python
+      if (dims.size() == 1) ss << ",";
+      ss << "): " << size;
     }
     ss << "}";
   }
