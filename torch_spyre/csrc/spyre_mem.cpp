@@ -451,50 +451,25 @@ auto get_device_stride_infos_from_tile_size(
     }
   }
 
-  // Detect padding and build remainder transfers
+  // Clamp dcsi_sizes to real element counts from tile_size
+  // Padding is implicit in device_size; strides computed from full device_size
+  // skip it
+  for (const auto& [dev_dims, real_count] : stl.tile_size) {
+    // Last dim in group gets clamped to real_count; others stay full
+    int last_dev_dim = dev_dims.back();
+    for (int d : dev_dims) {
+      if (d == last_dev_dim) {
+        dcsi_sizes[d] = real_count;
+      } else {
+        dcsi_sizes[d] = stl.device_size[d];
+      }
+    }
+  }
+
+  // No remainder transfers: tile_size defines complete transfers
   std::vector<std::vector<int64_t>> remainders;
   std::vector<int64_t> host_offsets;
   std::vector<int64_t> device_offsets;
-
-  for (const auto& [dev_dims, real_count] : stl.tile_size) {
-    // Compute padded element count for this group
-    int64_t padded_count = 1;
-    for (int d : dev_dims) {
-      padded_count *= stl.device_size[d];
-    }
-
-    if (padded_count > real_count) {
-      // There is padding: clamp main transfer, generate remainder
-      int64_t remainder_count = padded_count - real_count;
-
-      // Clamp dcsi_sizes for main transfer
-      for (int d : dev_dims) {
-        if (dcsi_sizes[d] == stl.device_size[d]) {
-          // This dim spans full padded size; clamp to real
-          int64_t real_per_dim = real_count;
-          for (int other : dev_dims) {
-            if (other != d) {
-              real_per_dim = std::max(
-                  static_cast<int64_t>(real_per_dim / stl.device_size[other]),
-                  static_cast<int64_t>(1));
-            }
-          }
-          dcsi_sizes[d] = real_per_dim;
-        }
-      }
-
-      // Build remainder spec: only last dim in group has remainder
-      std::vector<int64_t> remainder(device_rank, 0);
-      int last_dev_dim = dev_dims.back();
-      remainder[last_dev_dim] = remainder_count;
-
-      remainders.push_back(remainder);
-
-      // Offset to remainder region: skip real_count elements
-      host_offsets.push_back(real_count * host_strides[last_dev_dim]);
-      device_offsets.push_back(real_count * device_strides[last_dev_dim]);
-    }
-  }
 
   // Create first DataConversionStrideInfo
   DataConversionStrideInfo stride_info;
