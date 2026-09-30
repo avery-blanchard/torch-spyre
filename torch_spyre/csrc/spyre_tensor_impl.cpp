@@ -33,56 +33,81 @@ namespace spyre {
 static std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     const std::vector<int64_t>& host_size,
     const std::vector<int64_t>& host_strides,
-    const std::vector<int64_t>& stride_map) {
+    const std::vector<int64_t>& stride_map,
+    const std::vector<int64_t>& device_size) {
   std::map<std::vector<int64_t>, int64_t> tile_size;
   if (host_size.empty() || stride_map.empty()) {
     return tile_size;
   }
 
-  // Find the base host stride for a device stride. For positive strides,
-  // find the largest host stride that divides it (from non-size-1 host dims).
-  // For -1 (size-1), find the size-1 host stride. For 0 (broadcast), return 0.
-  auto get_base_host_stride = [&](int64_t dst) -> int64_t {
-    int64_t best = 0;
-    for (int64_t i = 0; i < static_cast<int64_t>(host_strides.size()); ++i) {
-      const int64_t hst = host_strides[i];
-      if (hst <= 0) continue;
-      if (dst > 0) {
-        // Positive stride: find largest that divides it (only from non-size-1
-        // dims)
-        if (host_size[i] > 1 && dst % hst == 0 && hst > best) {
-          best = hst;
-        }
-      } else if (dst == -1 && host_size[i] == 1) {
-        // Size-1: match size-1 host strides
-        best = hst;
-        break;
-      }
-    }
-    return best;
-  };
+  // Mirror get_dim_map logic: for each device dim, find the best-fit host dim
+  // (largest host stride that divides device stride). Track via max_stride_le.
+  const int64_t device_rank = static_cast<int64_t>(stride_map.size());
+  const int64_t host_rank = static_cast<int64_t>(host_size.size());
+  const int64_t count_dev_dim = device_rank > 2 ? device_rank - 3 : 0;
 
-  // Group device dims by their base host stride. All device dims with the
-  // same base stride come from the same host dimension and share the same
-  // real element count. Include all dims, including broadcast (stride 0).
-  std::map<int64_t, std::vector<int64_t>> stride_groups;
-  for (int64_t d = 0; d < static_cast<int64_t>(stride_map.size()); ++d) {
-    int64_t base_stride = get_base_host_stride(stride_map[d]);
-    if (base_stride >= 0) {
-      stride_groups[base_stride].push_back(d);
+  std::vector<int64_t> max_stride_le(device_rank, 0);
+  std::vector<int64_t> dev_dim_to_host_dim(device_rank, -1);
+
+  // Best-fit matching: for each host dim, find device dims where
+  // host_stride is largest that divides device_stride
+  for (int64_t i = 0; i < host_rank; ++i) {
+    if (host_size[i] == 1) continue;
+    const int64_t hst = host_strides[i];
+    if (hst == 0) continue;
+
+    for (int64_t j = 0; j < device_rank; ++j) {
+      if (device_size[j] == 1) continue;
+      const int64_t dst = stride_map[j];
+      if (hst > max_stride_le[j] && hst <= dst) {
+        max_stride_le[j] = hst;
+        dev_dim_to_host_dim[j] = i;
+      }
     }
   }
 
-  // For each stride group, find its real element count (host_size) and
-  // add a tile_size entry with sorted device dim keys.
-  for (auto& [base_stride, dims] : stride_groups) {
-    for (int64_t i = 0; i < static_cast<int64_t>(host_size.size()); ++i) {
-      if (host_strides[i] == base_stride) {
-        std::sort(dims.begin(), dims.end());
-        tile_size[dims] = host_size[i];
-        break;
+  // Handle broadcasted dims (stride_map == 0): map to first broadcasted host
+  // dim
+  for (int64_t j = 0; j < device_rank; ++j) {
+    if (stride_map[j] == 0) {
+      for (int64_t i = 0; i < host_rank; ++i) {
+        if (host_strides[i] == 0) {
+          dev_dim_to_host_dim[j] = i;
+          break;
+        }
       }
     }
+  }
+
+  // Force count dim to map to same host dim as within-stick dim
+  if (dev_dim_to_host_dim[device_rank - 1] != -1) {
+    dev_dim_to_host_dim[count_dev_dim] = dev_dim_to_host_dim[device_rank - 1];
+  }
+
+  // Handle size-1 device dims (stride_map == -1)
+  for (int64_t j = 0; j < device_rank; ++j) {
+    if (device_size[j] == 1 && stride_map[j] == -1) {
+      for (int64_t i = 0; i < host_rank; ++i) {
+        if (host_size[i] == 1) {
+          dev_dim_to_host_dim[j] = i;
+          break;
+        }
+      }
+    }
+  }
+
+  // Group device dims by their host dim and convert to tile_size
+  std::map<int64_t, std::vector<int64_t>> host_dim_groups;
+  for (int64_t d = 0; d < device_rank; ++d) {
+    int64_t h = dev_dim_to_host_dim[d];
+    if (h >= 0) {
+      host_dim_groups[h].push_back(d);
+    }
+  }
+
+  for (auto& [h, dims] : host_dim_groups) {
+    std::sort(dims.begin(), dims.end());
+    tile_size[dims] = host_size[h];
   }
 
   return tile_size;
@@ -252,8 +277,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
   this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
                                            this->device_size);
-  this->tile_size =
-      compute_tile_size(host_size, host_strides, this->stride_map);
+  this->tile_size = compute_tile_size(host_size, host_strides, this->stride_map,
+                                      this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {
