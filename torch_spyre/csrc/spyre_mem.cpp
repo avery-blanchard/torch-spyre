@@ -474,25 +474,28 @@ auto get_device_stride_infos_from_tile_size(
   std::vector<int64_t> host_offsets;
   std::vector<int64_t> device_offsets;
 
+  // Detect remainders: only for multi-dim groups where real_count > stick_size
   for (const auto& [dev_dims, real_count] : stl.tile_size) {
-    for (int d : dev_dims) {
-      const int64_t dev_stride = device_strides[d];
-      if (dev_stride == 0) continue;
+    if (dev_dims.size() > 1) {
+      // Stick group: check if real_count spans multiple sticks
+      int last_dev_dim = dev_dims.back();
+      int64_t stick_size = stl.device_size[last_dev_dim];
 
-      if (real_count % dev_stride != 0) {
-        // Remainder detected: real_count doesn't evenly fill this device dim
-        int64_t complete_tiles = real_count / dev_stride;
-        int64_t remainder_count = real_count % dev_stride;
+      if (real_count > stick_size) {
+        // Multi-stick with padding in last stick: remainder is the padding
+        int64_t complete_sticks = real_count / stick_size;
+        int64_t last_stick_elements = real_count % stick_size;
+        int64_t remainder_count = stick_size - last_stick_elements;
 
         std::vector<int64_t> remainder(device_rank, 0);
-        remainder[d] = remainder_count;
+        remainder[last_dev_dim] = remainder_count;
 
         remainders.push_back(remainder);
-        host_offsets.push_back(complete_tiles * host_strides[d]);
-        device_offsets.push_back(complete_tiles * device_strides[d]);
+        host_offsets.push_back(real_count * host_strides[last_dev_dim]);
+        device_offsets.push_back(real_count * device_strides[last_dev_dim]);
 
-        // Clamp main transfer to complete tiles
-        dcsi_sizes[d] = complete_tiles;
+        // Main transfer already has dcsi_sizes[last_dev_dim] = min(stick_size,
+        // real_count)
       }
     }
   }
