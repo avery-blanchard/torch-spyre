@@ -40,16 +40,17 @@ static std::map<std::vector<int64_t>, int64_t> compute_tile_size(
   }
 
   // Find the base host stride for a device stride. For positive strides,
-  // find the largest host stride that divides it. For -1 (size-1), find the
-  // size-1 host stride. For 0 (broadcast), return 0.
+  // find the largest host stride that divides it (from non-size-1 host dims).
+  // For -1 (size-1), find the size-1 host stride. For 0 (broadcast), return 0.
   auto get_base_host_stride = [&](int64_t dst) -> int64_t {
     int64_t best = 0;
     for (int64_t i = 0; i < static_cast<int64_t>(host_strides.size()); ++i) {
       const int64_t hst = host_strides[i];
       if (hst <= 0) continue;
       if (dst > 0) {
-        // Positive stride: find largest that divides it
-        if (dst % hst == 0 && hst > best) {
+        // Positive stride: find largest that divides it (only from non-size-1
+        // dims)
+        if (host_size[i] > 1 && dst % hst == 0 && hst > best) {
           best = hst;
         }
       } else if (dst == -1 && host_size[i] == 1) {
