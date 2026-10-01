@@ -458,30 +458,33 @@ auto get_device_stride_infos_from_tile_size(
     } else {
       // Multi-dim (stick) group: compute sizes and check for padding
       int last_dev_dim = dev_dims.back();
+      int count_dim = dev_dims[0];
       int64_t elems_per_stick = stl.device_size[last_dev_dim];
-      int64_t stick_count =
-          (num_valid_elems + elems_per_stick - 1) / elems_per_stick;
-      int64_t last_dim_size = std::min(elems_per_stick, num_valid_elems);
+      int64_t complete_sticks = num_valid_elems / elems_per_stick;
+      int64_t partial_stick_count = num_valid_elems % elems_per_stick;
+
+      // Main transfer: complete sticks (or single partial stick if no
+      // remainder)
+      int64_t main_stick_count =
+          partial_stick_count != 0 ? complete_sticks : complete_sticks;
+      int64_t main_last_dim_size =
+          partial_stick_count != 0 ? elems_per_stick : num_valid_elems;
 
       for (int d : dev_dims) {
-        dcsi_sizes[d] = (d == last_dev_dim) ? last_dim_size : stick_count;
+        dcsi_sizes[d] =
+            (d == last_dev_dim) ? main_last_dim_size : main_stick_count;
       }
 
-      // Check if last stick has padding (only for multi-stick cases)
-      if (num_valid_elems > elems_per_stick) {
-        int64_t partial_stick_count = num_valid_elems % elems_per_stick;
-        if (partial_stick_count != 0) {
-          int64_t padding_elems = elems_per_stick - partial_stick_count;
-          int64_t complete_sticks = num_valid_elems / elems_per_stick;
-          int count_dim = dev_dims[0];
-          std::vector<int64_t> remainder(device_rank, 0);
-          remainder[count_dim] = 1;                       // Just the last stick
-          remainder[last_dev_dim] = partial_stick_count;  // Partial elements
-          remainders.push_back(remainder);
-          // Offset moves through the count dimension (sticks)
-          host_offsets.push_back(complete_sticks * host_strides[count_dim]);
-          device_offsets.push_back(complete_sticks * device_strides[count_dim]);
-        }
+      // Generate remainder if there's a partial stick
+      if (partial_stick_count != 0) {
+        int64_t padding_elems = elems_per_stick - partial_stick_count;
+        std::vector<int64_t> remainder(device_rank, 0);
+        remainder[count_dim] = 1;                       // Just the last stick
+        remainder[last_dev_dim] = partial_stick_count;  // Partial elements
+        remainders.push_back(remainder);
+        // Offset moves through the count dimension (sticks)
+        host_offsets.push_back(complete_sticks * host_strides[count_dim]);
+        device_offsets.push_back(complete_sticks * device_strides[count_dim]);
       }
     }
   }
