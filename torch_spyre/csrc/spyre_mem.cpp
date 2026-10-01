@@ -194,41 +194,64 @@ auto get_device_stride_infos_from_tile_size(
 // For each device dimension, find which host dim it maps to (by matching
 // stride values), then recalculate stride_map entry using new host stride.
 static std::vector<int64_t> rebuild_stride_map_for_host_strides(
+    const std::vector<int64_t>& cpu_sizes,
     const std::vector<int64_t>& dev_strides,
     const std::vector<int64_t>& cpu_strides,
     const std::vector<int64_t>& device_size,
+    const std::map<std::vector<int64_t>, int64_t>& tile_size,
     const std::vector<int64_t>& original_stride_map) {
   const int n = original_stride_map.size();
-  std::vector<int64_t> new_stride_map(n, -1);
-  std::vector<int64_t> last_stride(cpu_strides.size(), -1);
+  std::vector<int32_t> host_dim_map(n, -1);
 
-  for (int j = n - 1; j >= 0; --j) {
-    int64_t old_stride = original_stride_map[j];
-    if (old_stride <= 0) {
-      new_stride_map[j] = old_stride;  // Preserve broadcast/sparse markers
-      continue;
+  // Reconstruct which host dim each device dim maps to by matching strides
+  for (int j = 0; j < n; ++j) {
+    int64_t stride_val = original_stride_map[j];
+    if (stride_val <= 0) {
+      host_dim_map[j] = -1;
+    } else {
+      for (size_t h = 0; h < dev_strides.size(); ++h) {
+        if (dev_strides[h] == stride_val) {
+          host_dim_map[j] = h;
+          break;
+        }
+      }
     }
+  }
 
-    // Find which host dimension this device dim maps to
-    int32_t host_dim = -1;
-    for (size_t h = 0; h < dev_strides.size(); ++h) {
-      if (dev_strides[h] == old_stride) {
-        host_dim = h;
+  // Find stick-count dimension from tile_size (explicit, not positional)
+  int stick_count_dim = -1;
+  for (const auto& [dims, _] : tile_size) {
+    if (dims.size() == 2) {       // Multi-key entry = stick pair
+      stick_count_dim = dims[0];  // First element is count dim
+      break;
+    }
+  }
+
+  // Stick-count dim inherits host dim mapping from within-stick dim
+  if (stick_count_dim >= 0 && host_dim_map[stick_count_dim] == -1) {
+    for (const auto& [dims, _] : tile_size) {
+      if (dims.size() == 2 && dims[0] == stick_count_dim) {
+        int within_stick_dim = dims[1];
+        host_dim_map[stick_count_dim] = host_dim_map[within_stick_dim];
         break;
       }
     }
+  }
 
-    if (host_dim == -1 ||
-        host_dim >= static_cast<int32_t>(cpu_strides.size())) {
-      new_stride_map[j] = old_stride;
-      continue;
+  // Recalculate stride_map using new host strides (dim_map_to_stride_map logic)
+  std::vector<int64_t> new_stride_map(n, -1);
+  std::vector<int64_t> last_stride(cpu_strides.size(), -1);
+  for (int j = n - 1; j >= 0; --j) {
+    int32_t d = host_dim_map[j];
+    if (d == -1) {
+      new_stride_map[j] = -1;
+    } else {
+      new_stride_map[j] =
+          last_stride[d] == -1 ? cpu_strides[d] : last_stride[d];
+      // Use cpu_sizes to get the full span like dim_map_to_stride_map does
+      last_stride[d] = std::min(new_stride_map[j] * device_size[j],
+                                cpu_strides[d] * cpu_sizes[d]);
     }
-
-    // Recalculate stride_map entry with new host stride
-    new_stride_map[j] = last_stride[host_dim] == -1 ? cpu_strides[host_dim]
-                                                    : last_stride[host_dim];
-    last_stride[host_dim] =
-        std::min(new_stride_map[j] * device_size[j], cpu_strides[host_dim]);
   }
 
   return new_stride_map;
@@ -354,7 +377,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   std::vector<int64_t> host_strides_for_dci = stl.stride_map;
   if (host2device && cpu_strides != dev_strides) {
     host_strides_for_dci = rebuild_stride_map_for_host_strides(
-        dev_strides, cpu_strides, device_sizes, stl.stride_map);
+        cpu_sizes, dev_strides, cpu_strides, device_sizes, stl.tile_size,
+        stl.stride_map);
   }
 
   // Use tile_size-centric path for DCI generation
