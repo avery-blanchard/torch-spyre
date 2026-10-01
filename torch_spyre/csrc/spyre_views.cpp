@@ -55,8 +55,6 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
   spyre_tensor_impl_->set_storage_offset(self.storage_offset());
   spyre_tensor_impl_->set_sizes_and_strides(sizes, strides);
   spyre_tensor_impl_->spyre_layout = stl;
-  spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-  spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   return self_;
 }
 
@@ -81,8 +79,6 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   spyre_tensor_impl_->set_sizes_and_strides(sizes, strides,
                                             self.sym_storage_offset());
   spyre_tensor_impl_->spyre_layout = stl;
-  spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-  spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   return self_;
 }
 
@@ -132,15 +128,9 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
       self.dtype());
   at::native::setStrided(result, size, stride, storage_offset);
   auto spyre_impl = static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
-  spyre_impl->spyre_layout = device_layout;
-  if (device_layout == orig_impl->spyre_layout) {
-    spyre_impl->dma_sizes = orig_impl->dma_sizes;
-    spyre_impl->dma_strides = orig_impl->dma_strides;
-  } else {
-    spyre_impl->dma_sizes = size.vec();
-    spyre_impl->dma_strides = stride.vec();
-  }
-
+  // Views always preserve the original device layout. The layout describes
+  // physical memory arrangement on device, which doesn't change with views.
+  spyre_impl->spyre_layout = orig_impl->spyre_layout;
   return result;
 }
 
@@ -183,13 +173,6 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
                                          offset_increment);
   spyre_tensor_impl_->set_sizes_and_strides(size, stride);
   spyre_tensor_impl_->spyre_layout = stl;
-  if (stl == orig_stl) {
-    spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-    spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
-  } else {
-    spyre_tensor_impl_->dma_sizes = size.vec();
-    spyre_tensor_impl_->dma_strides = stride.vec();
-  }
   return self_;
 }
 
@@ -234,8 +217,6 @@ at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
   auto* result_impl =
       static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
   result_impl->spyre_layout = orig_impl->spyre_layout;
-  result_impl->dma_sizes = orig_impl->dma_sizes;
-  result_impl->dma_strides = orig_impl->dma_strides;
 
   return result;
 }

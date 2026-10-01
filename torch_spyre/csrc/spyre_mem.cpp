@@ -86,20 +86,15 @@ static int64_t valid_size(int64_t dim_idx, const SpyreTensorLayout& stl) {
  * This function generates DataConversionStrideInfo by iterating over
  * tile_size groups (device dim groups) directly instead of deriving
  * dim_map. Each tile_size group maps to a real element count.
+ *
+ * @param host_strides: Host memory strides for each device dimension
  */
 auto get_device_stride_infos_from_tile_size(
     c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t cpu_offset,
-    int64_t device_offset, SpyreTensorLayout stl, bool host2device)
+    int64_t device_offset, SpyreTensorLayout stl,
+    const std::vector<int64_t>& host_strides, bool host2device)
     -> std::vector<DataConversionStrideInfo> {
   const int device_rank = stl.stride_map.size();
-
-  // Build host_strides from stride_map
-  std::vector<int64_t> host_strides(device_rank, 1);
-  for (int i = 0; i < device_rank; i++) {
-    if (stl.stride_map[i] > 0) {
-      host_strides[i] = stl.stride_map[i];
-    }
-  }
 
   // Build contiguous device_strides
   std::vector<int64_t> device_strides(device_rank, 1);
@@ -279,8 +274,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   std::vector<int64_t> cpu_strides = cpu_tensor->strides().vec();
   std::vector<int64_t> dev_sizes = dev_tensor->sizes().vec();
   std::vector<int64_t> dev_strides = dev_tensor->strides().vec();
-  const std::vector<int64_t> dma_sizes = spyre_tensor_impl->dma_sizes;
-  const std::vector<int64_t> dma_strides = spyre_tensor_impl->dma_strides;
   std::vector<int64_t> device_sizes = stl.device_size;
 
   // While the source strides may differ from the destination strides when the
@@ -342,52 +335,13 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   }
   const bool dev_sliced = total_valid > dev_tensor->numel();
 
-  if (dev_sliced && !stl.tile_size.empty()) {
-    // With tile_size, we can directly adjust stride_map for the sliced view.
-    // For each device dimension, find the matching host dimension and update
-    // stride_map to reflect the actual host strides of the sliced view.
-    std::vector<int64_t> dst_stride_map = stl.stride_map;
-
-    for (const auto& [dev_dims, _] : stl.tile_size) {
-      for (int d : dev_dims) {
-        int64_t device_stride = stl.stride_map[d];
-        if (device_stride <= 0) continue;
-
-        // Find host dimension whose stride range covers this device stride
-        bool found = false;
-        for (int h = 0; h < static_cast<int>(cpu_strides.size()); h++) {
-          int64_t host_stride = cpu_strides[h];
-          if (host_stride <= 0) continue;
-          if (host_stride <= device_stride &&
-              device_stride < host_stride * cpu_sizes[h]) {
-            dst_stride_map[d] = std::min(device_stride, host_stride);
-            found = true;
-            break;
-          }
-        }
-        TORCH_CHECK(found,
-                    "Could not find matching host dimension for device stride ",
-                    device_stride);
-      }
-    }
-
-    stl.stride_map = dst_stride_map;
-  }
-
+  // For DCI generation, use stride_map (device dims to host strides).
+  // When host and device strides differ (H2D transfer), rebuild to use actual
+  // host strides instead of the device layout's assumed strides.
+  std::vector<int64_t> host_strides_for_dci = stl.stride_map;
   if (host2device && cpu_strides != dev_strides) {
-    // Host and device have different strides. Rebuild stride_map to use host
-    // strides instead of device strides for correct DCI generation.
-    stl.stride_map = rebuild_stride_map_for_host_strides(
+    host_strides_for_dci = rebuild_stride_map_for_host_strides(
         stl.device_size, dev_strides, cpu_sizes, cpu_strides, stl.stride_map);
-  }
-
-  if (!host2device) {
-    // If the device tensors is not sliced we use the original dma_sizes and
-    // dma_strides.
-    if (!dev_sliced) {
-      cpu_sizes = dma_sizes;
-      cpu_strides = dma_strides;
-    }
   }
 
   // Use tile_size-centric path for DCI generation
@@ -395,7 +349,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       !stl.tile_size.empty(),
       "SpyreTensorLayout must have tile_size populated for DCI generation");
   dci.dcsi_ = get_device_stride_infos_from_tile_size(
-      cpu_sizes, cpu_strides, cpu_offset, device_offset, stl, host2device);
+      cpu_sizes, cpu_strides, cpu_offset, device_offset, stl,
+      host_strides_for_dci, host2device);
 
   // Reverse PyTorch ordering
   std::reverse(cpu_sizes.begin(), cpu_sizes.end());
@@ -510,8 +465,6 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->set_sizes_and_strides(size, stride);
 
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = stride.vec();
 
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
