@@ -30,7 +30,7 @@
 #include "types_mapping.h"
 
 namespace spyre {
-static std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     const std::vector<int64_t>& host_size,
     const std::vector<int64_t>& host_strides,
     const std::vector<int64_t>& stride_map,
