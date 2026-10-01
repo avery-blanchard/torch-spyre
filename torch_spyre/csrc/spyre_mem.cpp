@@ -463,12 +463,9 @@ auto get_device_stride_infos_from_tile_size(
       int64_t complete_sticks = num_valid_elems / elems_per_stick;
       int64_t partial_stick_count = num_valid_elems % elems_per_stick;
 
-      // Main transfer: complete sticks (or single partial stick if no
-      // remainder)
-      int64_t main_stick_count =
-          partial_stick_count != 0 ? complete_sticks : complete_sticks;
-      int64_t main_last_dim_size =
-          partial_stick_count != 0 ? elems_per_stick : num_valid_elems;
+      // Main transfer: complete sticks only (remainders in separate DCSI)
+      int64_t main_stick_count = complete_sticks;
+      int64_t main_last_dim_size = elems_per_stick;
 
       for (int d : dev_dims) {
         dcsi_sizes[d] =
