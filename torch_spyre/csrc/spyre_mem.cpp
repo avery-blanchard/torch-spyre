@@ -475,7 +475,8 @@ auto get_device_stride_infos_from_tile_size(
           int64_t complete_sticks = num_valid_elems / elems_per_stick;
           int count_dim = dev_dims[0];
           std::vector<int64_t> remainder(device_rank, 0);
-          remainder[last_dev_dim] = elems_per_stick - partial_stick_count;
+          remainder[count_dim] = 1;                       // Just the last stick
+          remainder[last_dev_dim] = partial_stick_count;  // Partial elements
           remainders.push_back(remainder);
           // Offset moves through the count dimension (sticks)
           host_offsets.push_back(complete_sticks * host_strides[count_dim]);
