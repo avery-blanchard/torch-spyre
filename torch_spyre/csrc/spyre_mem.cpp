@@ -185,35 +185,59 @@ auto get_device_stride_infos_from_tile_size(
 }
 
 // Rebuild stride_map using host strides instead of device strides.
-// When host and device have different stride patterns, stride_map needs to map
-// device dimensions to the host's actual memory access strides.
+// The original stride_map was built from device_strides. Use device_strides as
+// a guide to determine which host strides should map to each device dimension.
+// Rebuild stride_map by replacing device strides with cpu strides.
+// stride_map was created using device_strides as host stride values.
+// We replace each device_stride value with its corresponding cpu_stride.
+// Rebuild stride_map by matching host dims via sizes and replacing strides.
+// tile_size groups device dims. For each group, find the corresponding host dim
+// by matching sizes, then replace the stride_map entries with cpu_strides.
 static std::vector<int64_t> rebuild_stride_map_for_host_strides(
-    const std::vector<int64_t>& device_size,
-    const std::vector<int64_t>& device_strides,
-    const std::vector<int64_t>& host_sizes,
-    const std::vector<int64_t>& host_strides,
+    const std::vector<int64_t>& cpu_sizes,
+    const std::vector<int64_t>& dev_sizes,
+    const std::vector<int64_t>& dev_strides,
+    const std::vector<int64_t>& cpu_strides,
+    const std::map<std::vector<int64_t>, int64_t>& tile_size,
     const std::vector<int64_t>& original_stride_map) {
   std::vector<int64_t> new_stride_map = original_stride_map;
-  const int device_rank = device_size.size();
-  const int host_rank = host_sizes.size();
 
-  // Build mapping from device strides to host strides
-  // For each device dimension, find which host dimension it corresponds to
-  // and use that host's stride instead
-  std::map<int64_t, int64_t> dev_stride_to_host_stride;
-  for (int d = 0; d < device_rank; ++d) {
-    int64_t dev_stride = device_strides[d];
-    if (dev_stride <= 0) continue;
+  // For each tile_size group (which represents one host dim), find the
+  // corresponding host stride in dev_strides and replace with cpu_strides.
+  for (const auto& [dev_dims, _] : tile_size) {
+    if (dev_dims.empty()) continue;
 
-    // Find host dimension with matching stride range
-    for (int h = 0; h < host_rank; ++h) {
-      int64_t host_stride = host_strides[h];
-      if (host_stride <= 0) continue;
-      // Match if host stride falls in the device stride's range
-      if (host_stride <= dev_stride &&
-          dev_stride < host_stride * host_sizes[h]) {
-        new_stride_map[d] = host_stride;
+    // Find the host stride value for this group from stride_map
+    int64_t dev_stride_value = 0;
+    for (int d : dev_dims) {
+      if (original_stride_map[d] > 0) {
+        dev_stride_value = original_stride_map[d];
         break;
+      }
+    }
+
+    if (dev_stride_value <= 0) continue;  // Skip broadcast/sparse dims
+
+    // Match host dimension by finding which host index has dev_stride_value
+    // in dev_strides
+    int64_t host_dim_idx = -1;
+    for (size_t h = 0; h < dev_strides.size(); ++h) {
+      if (dev_strides[h] == dev_stride_value) {
+        host_dim_idx = h;
+        break;
+      }
+    }
+
+    if (host_dim_idx < 0 ||
+        host_dim_idx >= static_cast<int64_t>(cpu_strides.size())) {
+      continue;
+    }
+
+    // Get the cpu stride for this host dimension and update stride_map
+    int64_t cpu_stride_value = cpu_strides[host_dim_idx];
+    for (int d : dev_dims) {
+      if (original_stride_map[d] == dev_stride_value) {
+        new_stride_map[d] = cpu_stride_value;
       }
     }
   }
@@ -341,7 +365,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   std::vector<int64_t> host_strides_for_dci = stl.stride_map;
   if (host2device && cpu_strides != dev_strides) {
     host_strides_for_dci = rebuild_stride_map_for_host_strides(
-        stl.device_size, dev_strides, cpu_sizes, cpu_strides, stl.stride_map);
+        cpu_sizes, dev_sizes, dev_strides, cpu_strides, stl.tile_size,
+        stl.stride_map);
   }
 
   // Use tile_size-centric path for DCI generation
