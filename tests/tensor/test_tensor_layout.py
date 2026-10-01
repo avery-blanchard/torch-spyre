@@ -817,6 +817,60 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
 
+    def test_raw_constructor_tile_size_1d_single_stick(self):
+        """Raw constructor for 1D single stick groups dims correctly."""
+        fp16 = DataFormats.SEN169_FP16
+        stl = SpyreTensorLayout(
+            device_size=[1, 64],
+            stride_map=[64, 1],
+            device_dtype=fp16,
+        )
+        # Should create stick group (0,1): 1*64=64
+        self.assertEqual(stl.tile_size, {(0, 1): 64})
+
+    def test_raw_constructor_tile_size_1d_multi_stick(self):
+        fp16 = DataFormats.SEN169_FP16
+        stl = SpyreTensorLayout(
+            device_size=[4, 64],
+            stride_map=[64, 1],
+            device_dtype=fp16,
+        )
+        self.assertEqual(stl.tile_size, {(0, 1): 256})
+
+    def test_raw_constructor_tile_size_2d_layout(self):
+        fp16 = DataFormats.SEN169_FP16
+        stl = SpyreTensorLayout(
+            device_size=[1, 7, 100, 64],
+            stride_map=[700, 100, 64, 1],
+            device_dtype=fp16,
+        )
+        # Should have (1,): 7 and (2,3): 100*64=6400
+        self.assertEqual(stl.tile_size[(1,)], 7)
+        self.assertEqual(stl.tile_size[(1,)], 64)
+
+    def test_raw_constructor_tile_size_size_one_dim(self):
+        fp16 = DataFormats.SEN169_FP16
+        stl = SpyreTensorLayout(
+            device_size=[2, 1, 64],
+            stride_map=[64, -1, 1],
+            device_dtype=fp16,
+        )
+        # Should group (0,2): 2*64=128 and have (1,): 1
+        self.assertEqual(stl.tile_size[(0, 2)], 128)
+        self.assertEqual(stl.tile_size[(1,)], 1)
+
+    def test_raw_constructor_tile_size_multiple_sticks(self):
+        fp16 = DataFormats.SEN169_FP16
+        stl = SpyreTensorLayout(
+            device_size=[2, 8, 2, 64],
+            stride_map=[512, 64, 64, 1],
+            device_dtype=fp16,
+        )
+        # Should have (0,): 2, (1,): 8, (2,3): 2*64=128
+        self.assertEqual(stl.tile_size[(0,)], 2)
+        self.assertEqual(stl.tile_size[(1,)], 8)
+        self.assertEqual(stl.tile_size[(2, 3)], 128)
+
 
 if __name__ == "__main__":
     run_tests()
