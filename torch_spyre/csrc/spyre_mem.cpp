@@ -472,12 +472,14 @@ auto get_device_stride_infos_from_tile_size(
         int64_t partial_stick_count = num_valid_elems % elems_per_stick;
         if (partial_stick_count != 0) {
           int64_t padding_elems = elems_per_stick - partial_stick_count;
+          int64_t complete_sticks = num_valid_elems / elems_per_stick;
           std::vector<int64_t> remainder(device_rank, 0);
           remainder[last_dev_dim] = padding_elems;
           remainders.push_back(remainder);
-          host_offsets.push_back(num_valid_elems * host_strides[last_dev_dim]);
-          device_offsets.push_back(num_valid_elems *
-                                   device_strides[last_dev_dim]);
+          // Offset is at the start of the last (partial) stick
+          int count_dim = dev_dims[0];
+          host_offsets.push_back(complete_sticks * host_strides[count_dim]);
+          device_offsets.push_back(complete_sticks * device_strides[count_dim]);
         }
       }
     }
