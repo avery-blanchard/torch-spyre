@@ -189,6 +189,43 @@ auto get_device_stride_infos_from_tile_size(
   return stride_infos;
 }
 
+// Rebuild stride_map using host strides instead of device strides.
+// When host and device have different stride patterns, stride_map needs to map
+// device dimensions to the host's actual memory access strides.
+static std::vector<int64_t> rebuild_stride_map_for_host_strides(
+    const std::vector<int64_t>& device_size,
+    const std::vector<int64_t>& device_strides,
+    const std::vector<int64_t>& host_sizes,
+    const std::vector<int64_t>& host_strides,
+    const std::vector<int64_t>& original_stride_map) {
+  std::vector<int64_t> new_stride_map = original_stride_map;
+  const int device_rank = device_size.size();
+  const int host_rank = host_sizes.size();
+
+  // Build mapping from device strides to host strides
+  // For each device dimension, find which host dimension it corresponds to
+  // and use that host's stride instead
+  std::map<int64_t, int64_t> dev_stride_to_host_stride;
+  for (int d = 0; d < device_rank; ++d) {
+    int64_t dev_stride = device_strides[d];
+    if (dev_stride <= 0) continue;
+
+    // Find host dimension with matching stride range
+    for (int h = 0; h < host_rank; ++h) {
+      int64_t host_stride = host_strides[h];
+      if (host_stride <= 0) continue;
+      // Match if host stride falls in the device stride's range
+      if (host_stride <= dev_stride &&
+          dev_stride < host_stride * host_sizes[h]) {
+        new_stride_map[d] = host_stride;
+        break;
+      }
+    }
+  }
+
+  return new_stride_map;
+}
+
 /*
  * Generate description of data conversion for a tensor.
  *
@@ -337,47 +374,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     stl.stride_map = dst_stride_map;
   }
 
-  if (host2device && !stl.tile_size.empty()) {
-    // If the dev_strides do not match the cpu_strides then the cpu_tensor is
-    // sliced and/or expanded. With tile_size, we can adjust stride_map
-    // directly.
-    if (cpu_strides != dev_strides) {
-      std::vector<int64_t> dst_stride_map = stl.stride_map;
+  if (host2device && cpu_strides != dev_strides) {
+    // Host and device have different strides. Rebuild stride_map to use host
+    // strides instead of device strides for correct DCI generation.
+    stl.stride_map = rebuild_stride_map_for_host_strides(
+        stl.device_size, dev_strides, cpu_sizes, cpu_strides, stl.stride_map);
+  }
 
-      // For each device dimension, find the matching host dimension and update
-      // stride_map for broadcasts (stride=0) and slices (stride > expected).
-      for (const auto& [dev_dims, _] : stl.tile_size) {
-        for (int d : dev_dims) {
-          int64_t device_stride = stl.stride_map[d];
-          if (device_stride <= 0) continue;
-
-          for (int h = 0; h < static_cast<int>(cpu_strides.size()); h++) {
-            int64_t host_stride = cpu_strides[h];
-            if (host_stride < 0) continue;
-            if (host_stride == 0) {
-              // Broadcast dimension: zero out stride_map for this group
-              dst_stride_map[d] = 0;
-              break;
-            }
-            if (host_stride <= device_stride &&
-                device_stride < host_stride * cpu_sizes[h]) {
-              // Slice: check if strides suggest slicing
-              if (host_stride != dev_strides[h]) {
-                // Slice factor: multiply stride_map by the ratio
-                int64_t slice_factor = host_stride / dev_strides[h];
-                if (slice_factor > 1) {
-                  dst_stride_map[d] *= slice_factor;
-                }
-              }
-              break;
-            }
-          }
-        }
-      }
-
-      stl.stride_map = dst_stride_map;
-    }
-  } else if (!host2device) {
+  if (!host2device) {
     // If the device tensors is not sliced we use the original dma_sizes and
     // dma_strides.
     if (!dev_sliced) {
