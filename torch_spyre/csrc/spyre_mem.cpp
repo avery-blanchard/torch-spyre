@@ -410,8 +410,6 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->set_sizes_contiguous(size);
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = tensor.strides().vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -502,8 +500,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->set_sizes_and_strides(size, stride);
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = stride.vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -559,14 +555,22 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
           total_valid += count;
         }
       } else {
-        total_valid = c10::multiply_integers(spyre_impl->dma_sizes);
+        total_valid = c10::multiply_integers(stl.device_size);
       }
 
       if (expanded || total_valid > self.numel()) {
-        // Tensor is expanded or sliced: stage through full allocation
+        // Tensor is expanded or sliced: stage through full allocation.
+        // Use device_size with contiguous strides (device layout is
+        // contiguous).
         non_overlapping_and_dense = false;
-        c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
-        c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+        std::vector<int64_t> alloc_sizes = stl.device_size;
+        // Compute contiguous strides for device_size
+        std::vector<int64_t> alloc_strides(alloc_sizes.size(), 1);
+        int64_t stride = 1;
+        for (int i = static_cast<int>(alloc_sizes.size()) - 1; i >= 0; --i) {
+          alloc_strides[i] = stride;
+          stride *= alloc_sizes[i];
+        }
         alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
                                     /*storage_offset=*/0);
         cpu_alloc = at::empty(alloc_sizes, dst.options());
@@ -576,8 +580,14 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         // Tensor claims more elements than tile_size allows: stage through full
         // allocation
         non_overlapping_and_dense = false;
-        c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
-        c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+        std::vector<int64_t> alloc_sizes = stl.device_size;
+        // Compute contiguous strides for device_size
+        std::vector<int64_t> alloc_strides(alloc_sizes.size(), 1);
+        int64_t stride = 1;
+        for (int i = static_cast<int>(alloc_sizes.size()) - 1; i >= 0; --i) {
+          alloc_strides[i] = stride;
+          stride *= alloc_sizes[i];
+        }
         alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
                                     /*storage_offset=*/0);
         cpu_alloc = at::empty(alloc_sizes, dst.options());
@@ -642,8 +652,6 @@ at::Tensor empty_with_layout(
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->set_sizes_contiguous(size);
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = tensor.strides().vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -711,8 +719,6 @@ const at::Tensor& spyre_resize_(
   self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
   self_impl->set_sizes_contiguous(size_int);
   self_impl->spyre_layout = new_layout;
-  self_impl->dma_sizes = size_int.vec();
-  self_impl->dma_strides = self_impl->strides().vec();
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
   SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
                         << " layout=" << self_impl->spyre_layout.toString();
