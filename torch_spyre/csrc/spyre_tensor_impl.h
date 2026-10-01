@@ -20,6 +20,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include <util/sendefs/sendefs.h>
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <optional>
@@ -142,6 +143,41 @@ class SpyreTensorLayout {
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
         tile_size(std::move(tile_size)) {
+    // If tile_size is empty, populate with device_size values (assume no
+    // padding) Group by stride_map value to detect stick dimensions
+    if (this->tile_size.empty()) {
+      const int64_t device_rank = static_cast<int64_t>(stride_map.size());
+      const int64_t count_dev_dim = device_rank > 2 ? device_rank - 3 : 0;
+
+      // Group device dims by stride_map value
+      std::map<int64_t, std::vector<int64_t>> stride_groups;
+      for (int64_t j = 0; j < device_rank; ++j) {
+        stride_groups[stride_map[j]].push_back(j);
+      }
+
+      // Force count dim into within-stick dim's group (stick pairing)
+      if (device_rank > 2) {
+        int64_t within_stick_stride = stride_map[device_rank - 1];
+        if (within_stick_stride != -1 &&
+            stride_groups.count(within_stick_stride)) {
+          auto& group = stride_groups[within_stick_stride];
+          auto it = std::find(group.begin(), group.end(), count_dev_dim);
+          if (it == group.end()) {
+            group.push_back(count_dev_dim);
+          }
+        }
+      }
+
+      // Convert stride groups to tile_size: use device_size as real count
+      for (auto& [stride, dims] : stride_groups) {
+        int64_t real_count = 1;
+        for (int64_t d : dims) {
+          real_count *= device_size[d];
+        }
+        std::sort(dims.begin(), dims.end());
+        this->tile_size[dims] = real_count;
+      }
+    }
     validate_shape();
   }
 
