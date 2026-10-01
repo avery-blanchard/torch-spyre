@@ -39,6 +39,10 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     const std::vector<int64_t>& stride_map,
     const std::vector<int64_t>& device_size);
 
+std::map<std::vector<int64_t>, int64_t> compute_tile_size_from_device_layout(
+    const std::vector<int64_t>& device_size,
+    const std::vector<int64_t>& stride_map);
+
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -148,6 +152,12 @@ class SpyreTensorLayout {
         element_arrangement(element_arrangement),
         tile_size(std::move(tile_size)) {
     validate_shape();
+    // Auto-compute tile_size from device_size and stride_map if not provided.
+    // Assume device_size represents valid (non-padded) elements.
+    if (this->tile_size.empty() && !stride_map.empty()) {
+      this->tile_size =
+          compute_tile_size_from_device_layout(device_size, stride_map);
+    }
   }
 
   /**

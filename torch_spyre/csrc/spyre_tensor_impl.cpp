@@ -85,6 +85,55 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
   return tile_size;
 }
 
+std::map<std::vector<int64_t>, int64_t> compute_tile_size_from_device_layout(
+    const std::vector<int64_t>& device_size,
+    const std::vector<int64_t>& stride_map) {
+  std::map<std::vector<int64_t>, int64_t> tile_size;
+  if (stride_map.empty()) {
+    return tile_size;
+  }
+
+  const int64_t device_rank = static_cast<int64_t>(stride_map.size());
+  const int64_t count_dev_dim = device_rank > 2 ? device_rank - 3 : 0;
+
+  // Group device dims by stride_map value
+  std::map<int64_t, std::vector<int64_t>> stride_groups;
+  for (int64_t j = 0; j < device_rank; ++j) {
+    stride_groups[stride_map[j]].push_back(j);
+  }
+
+  // Force count dim into within-stick dim's group (stick pair)
+  int64_t within_stick_stride = stride_map[device_rank - 1];
+  if (within_stick_stride != -1) {
+    auto& group = stride_groups[within_stick_stride];
+    auto it = std::find(group.begin(), group.end(), count_dev_dim);
+    if (it == group.end()) {
+      group.push_back(count_dev_dim);
+    }
+  }
+
+  // Convert stride groups to tile_size using device_size values
+  for (auto& [stride_val, dims] : stride_groups) {
+    int64_t valid_count = 0;
+    if (stride_val == -1 || stride_val == 0) {
+      valid_count = 1;  // Synthetic or broadcast
+    } else {
+      // For regular dimensions, compute product of device_size values
+      valid_count = 1;
+      for (int64_t d : dims) {
+        valid_count *= device_size[d];
+      }
+    }
+
+    if (valid_count > 0) {
+      std::sort(dims.begin(), dims.end());
+      tile_size[dims] = valid_count;
+    }
+  }
+
+  return tile_size;
+}
+
 int64_t elems_per_stick(const DataFormats& df) {
   // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
   auto it = dataFormatToStickSize.find(df);
