@@ -124,17 +124,22 @@ auto get_device_stride_infos_from_tile_size(
       int64_t complete_sticks = num_valid_elems / elems_per_stick;
       int64_t partial_stick_count = num_valid_elems % elems_per_stick;
 
-      // Main transfer: complete sticks only (remainders in separate DCSI)
-      int64_t main_stick_count = complete_sticks;
-      int64_t main_last_dim_size = elems_per_stick;
+      // Main transfer: all sticks (complete + partial)
+      // If there are no complete sticks but there is a partial, count_dim = 1
+      int64_t main_stick_count = (complete_sticks > 0)
+                                     ? complete_sticks
+                                     : (partial_stick_count > 0 ? 1 : 0);
+      int64_t main_last_dim_size =
+          (complete_sticks > 0) ? elems_per_stick : partial_stick_count;
 
       for (int d : dev_dims) {
         dcsi_sizes[d] =
             (d == last_dev_dim) ? main_last_dim_size : main_stick_count;
       }
 
-      // Generate remainder if there's a partial stick
-      if (partial_stick_count != 0) {
+      // Generate remainder if there are complete sticks AND a partial stick
+      // (partial-only case is handled in main transfer above)
+      if (complete_sticks > 0 && partial_stick_count != 0) {
         std::vector<int64_t> remainder(device_rank, 0);
         remainder[count_dim] = 1;                       // Just the last stick
         remainder[last_dev_dim] = partial_stick_count;  // Partial elements
