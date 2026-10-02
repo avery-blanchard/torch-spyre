@@ -201,6 +201,16 @@ static std::vector<int64_t> rebuild_stride_map_for_host_strides(
     const std::map<std::vector<int64_t>, int64_t>& tile_size,
     const std::vector<int64_t>& original_stride_map) {
   const int n = original_stride_map.size();
+
+  // Always filter stride_map: -1→1, others pass through
+  std::vector<int64_t> result(n, 1);
+  for (int i = 0; i < n; ++i) {
+    if (original_stride_map[i] != -1) {
+      result[i] = original_stride_map[i];
+    }
+  }
+
+  // Recalculate using cpu_strides for H2D transfers
   std::vector<int32_t> host_dim_map(n, -1);
 
   // Reconstruct which host dim each device dim maps to by matching strides
@@ -239,12 +249,12 @@ static std::vector<int64_t> rebuild_stride_map_for_host_strides(
   }
 
   // Recalculate stride_map using new host strides (dim_map_to_stride_map logic)
-  std::vector<int64_t> new_stride_map(n, -1);
+  std::vector<int64_t> new_stride_map(n, 1);
   std::vector<int64_t> last_stride(cpu_strides.size(), -1);
   for (int j = n - 1; j >= 0; --j) {
     int32_t d = host_dim_map[j];
     if (d == -1) {
-      new_stride_map[j] = -1;
+      new_stride_map[j] = 1;  // Synthetic/broadcast stays 1
     } else {
       new_stride_map[j] =
           last_stride[d] == -1 ? cpu_strides[d] : last_stride[d];
@@ -363,6 +373,26 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   TORCH_CHECK(dev_offset == 0, "Invalid device tensor storage offset");
   TORCH_CHECK(device_offset < device_elements, "Invalid device storage offset");
 
+  // Reconstruct tile_size from device_size and stride_map if not already
+  // populated. Group dims by stride_map value and use device_size products.
+  if (stl.tile_size.empty()) {
+    const int64_t device_rank = static_cast<int64_t>(stl.stride_map.size());
+    std::map<int64_t, std::vector<int64_t>> stride_groups;
+    for (int64_t j = 0; j < device_rank; ++j) {
+      stride_groups[stl.stride_map[j]].push_back(j);
+    }
+
+    // For each stride group, multiply device_size values
+    for (auto& [stride_val, dims] : stride_groups) {
+      std::sort(dims.begin(), dims.end());
+      int64_t element_count = 1;
+      for (int64_t d : dims) {
+        element_count *= stl.device_size[d];
+      }
+      stl.tile_size[dims] = element_count;
+    }
+  }
+
   // Detect slicing via tile_size: compare total valid elements against tensor
   // numel
   int64_t total_valid = 0;
@@ -382,9 +412,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   }
 
   // Use tile_size-centric path for DCI generation
-  TORCH_CHECK(
-      !stl.tile_size.empty(),
-      "SpyreTensorLayout must have tile_size populated for DCI generation");
   dci.dcsi_ = get_device_stride_infos_from_tile_size(
       cpu_sizes, cpu_strides, cpu_offset, device_offset, stl,
       host_strides_for_dci, host2device);
