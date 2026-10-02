@@ -48,32 +48,40 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     stride_groups[stride_map[j]].push_back(j);
   }
 
-  // Find stick pair by identifying the two smallest positive stride values
-  // The within-stick dim has the smallest positive stride; the count dim
-  // has the next smallest. Force them into the same group.
-  std::vector<int64_t> positive_strides;
-  for (const auto& [stride_val, dims] : stride_groups) {
-    if (stride_val > 0) {
-      positive_strides.push_back(stride_val);
+  // Identify stick pair: find rightmost dimension with duplicate stride value
+  // (multiple device dims mapping to same host dim), then pair with
+  // within_stick_dim
+  const int64_t within_stick_dim = device_rank - 1;
+  int64_t count_dev_dim = -1;
+
+  // Count stride occurrences
+  std::map<int64_t, int> stride_count;
+  for (int64_t j = 0; j < device_rank; ++j) {
+    stride_count[stride_map[j]]++;
+  }
+
+  // Find rightmost dim with duplicate stride (closest to within_stick_dim)
+  for (int64_t j = device_rank - 2; j >= 0; --j) {
+    if (stride_count[stride_map[j]] > 1) {
+      count_dev_dim = j;
+      break;
     }
   }
-  std::sort(positive_strides.begin(), positive_strides.end());
 
-  if (positive_strides.size() >= 2) {
-    // Find which dims have the two smallest positive strides
-    int64_t smallest_stride = positive_strides[0];
-    int64_t second_smallest_stride = positive_strides[1];
+  // Force count_dev_dim into within_stick_dim's group
+  if (count_dev_dim >= 0 && count_dev_dim != within_stick_dim) {
+    int64_t count_stride = stride_map[count_dev_dim];
+    int64_t within_stick_stride = stride_map[within_stick_dim];
 
-    // The count dim is in the second-smallest group; move it to smallest
-    if (stride_groups.count(second_smallest_stride) &&
-        !stride_groups[second_smallest_stride].empty()) {
-      auto& count_group = stride_groups[second_smallest_stride];
-      int64_t count_dev_dim =
-          count_group.back();  // Take any dim from this group
-      count_group.pop_back();
-
-      // Add to the smallest stride group (stick group)
-      stride_groups[smallest_stride].push_back(count_dev_dim);
+    if (count_stride != within_stick_stride) {
+      // Remove count dim from its current group
+      auto& old_group = stride_groups[count_stride];
+      auto it = std::find(old_group.begin(), old_group.end(), count_dev_dim);
+      if (it != old_group.end()) {
+        old_group.erase(it);
+      }
+      // Add to within-stick dim's group
+      stride_groups[within_stick_stride].push_back(count_dev_dim);
     }
   }
 
