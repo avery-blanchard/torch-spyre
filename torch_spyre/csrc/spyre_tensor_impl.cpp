@@ -143,51 +143,47 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     const std::vector<int64_t>& device_size) {
   const int64_t device_rank = static_cast<int64_t>(stride_map.size());
 
-  // Group device dims by stride_map value
+  // Group device dims by stride_map value and count occurrences in one pass.
   std::map<int64_t, std::vector<int64_t>> stride_groups;
-  for (int64_t j = 0; j < device_rank; ++j) {
-    stride_groups[stride_map[j]].push_back(j);
-  }
-
-  // Identify stick pair: find rightmost dimension with duplicate stride value
-  const int64_t within_stick_dim = device_rank - 1;
-  int64_t count_dev_dim = -1;
-
-  // Count stride occurrences
   std::map<int64_t, int> stride_count;
   for (int64_t j = 0; j < device_rank; ++j) {
+    stride_groups[stride_map[j]].push_back(j);
     stride_count[stride_map[j]]++;
   }
 
-  // Find rightmost dim with duplicate stride (closest to within_stick_dim)
+  // Find the rightmost device dim (below the last) whose stride_map value is
+  // shared with at least one other dim; this dim and within_stick_dim form the
+  // within-stick group.
+  const int64_t within_stick_dim = device_rank - 1;
+  int64_t dup_stride_dim = -1;
   for (int64_t j = device_rank - 2; j >= 0; --j) {
     if (stride_count[stride_map[j]] > 1) {
-      count_dev_dim = j;
+      dup_stride_dim = j;
       break;
     }
   }
 
-  // Force count_dev_dim into within_stick_dim's group
-  if (count_dev_dim >= 0 && count_dev_dim != within_stick_dim) {
-    int64_t count_stride = stride_map[count_dev_dim];
+  // Move dup_stride_dim into within_stick_dim's group if it is not already
+  // there (i.e. the two dims have different stride_map values).
+  if (dup_stride_dim >= 0 && dup_stride_dim != within_stick_dim) {
+    int64_t dup_stride = stride_map[dup_stride_dim];
     int64_t within_stick_stride = stride_map[within_stick_dim];
 
-    if (count_stride != within_stick_stride) {
-      // Remove count dim from its current group
-      auto& old_group = stride_groups[count_stride];
-      auto it = std::find(old_group.begin(), old_group.end(), count_dev_dim);
+    if (dup_stride != within_stick_stride) {
+      // Already in the same group when strides match; nothing to move.
+      auto& old_group = stride_groups[dup_stride];
+      auto it = std::find(old_group.begin(), old_group.end(), dup_stride_dim);
       if (it != old_group.end()) {
         old_group.erase(it);
       }
-      // Add to within-stick dim's group
-      stride_groups[within_stick_stride].push_back(count_dev_dim);
+      stride_groups[within_stick_stride].push_back(dup_stride_dim);
     }
   }
 
-  // For each stride group, multiply device_size values to get tile_size
+  // For each stride group, record the corresponding host dimension size as the
+  // tile size for that group.
   std::map<std::vector<int64_t>, int64_t> tile_size;
   for (auto& [stride_val, dims] : stride_groups) {
-    // Find corresponding host size for this stride value
     int64_t host_sz = 1;
     for (int64_t h = 0; h < static_cast<int64_t>(host_strides.size()); ++h) {
       if (host_strides[h] == stride_val) {
@@ -196,10 +192,8 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
       }
     }
 
-    // Convert dims vector to tuple key
-    std::vector<int64_t> dims_key(dims.begin(), dims.end());
-    if (host_sz > 0 && !dims_key.empty()) {
-      tile_size[dims_key] = host_sz;
+    if (host_sz > 0) {
+      tile_size[dims] = host_sz;
     }
   }
 

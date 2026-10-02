@@ -379,40 +379,6 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   return stride_infos;
 }
 
-// Reconstruct original host allocation shape and strides from tile_size and
-// stride_map. For D2H transfers, cpu_tensor is a view on device (destination),
-// so its sizes/strides don't reflect the original host allocation. Use
-// tile_size (which encodes original allocation shape) and stride_map (which
-// encodes original host strides) to reconstruct them.
-static std::pair<std::vector<int64_t>, std::vector<int64_t>>
-reconstruct_alloc_shape_and_strides(
-    const std::vector<int64_t>& device_size,
-    const std::vector<int64_t>& stride_map,
-    const std::map<std::vector<int64_t>, int64_t>& tile_size) {
-  const int device_rank = stride_map.size();
-
-  // stride_map values are the original host strides; extract them directly
-  // (filter: -1 → 1, 0 → 1, others pass through)
-  std::vector<int64_t> host_strides(device_rank);
-  for (int i = 0; i < device_rank; i++) {
-    host_strides[i] = (stride_map[i] <= 0) ? 1 : stride_map[i];
-  }
-
-  // Start with device_size as host sizes
-  std::vector<int64_t> host_sizes = device_size;
-
-  // For stick groups, adjust within-stick dim to match tile_size (unpadded)
-  for (const auto& [dims, num_valid_elems] : tile_size) {
-    if (dims.size() > 1) {
-      // Multi-dim (stick) group: within_stick_dim is last element
-      int within_stick_dim = dims.back();
-      host_sizes[within_stick_dim] = num_valid_elems;
-    }
-  }
-
-  return {host_sizes, host_strides};
-}
-
 /*
  * Generate description of data conversion for a tensor.
  *
@@ -466,24 +432,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   std::vector<int64_t> cpu_strides = cpu_tensor->strides().vec();
   std::vector<int64_t> dev_sizes = dev_tensor->sizes().vec();
   std::vector<int64_t> dev_strides = dev_tensor->strides().vec();
+  const std::vector<int64_t> dma_sizes = spyre_tensor_impl->dma_sizes;
+  const std::vector<int64_t> dma_strides = spyre_tensor_impl->dma_strides;
   std::vector<int64_t> device_sizes = stl.device_size;
-
-  // For D2H non-sliced transfers using tile_size, reconstruct original
-  // allocation shape and strides from tile_size and stride_map
-  if (!host2device && !stl.tile_size.empty()) {
-    int64_t total_valid = 0;
-    for (const auto& [dims, count] : stl.tile_size) {
-      total_valid += count;
-    }
-    const bool dev_sliced = total_valid > dev_tensor->numel();
-
-    if (!dev_sliced) {
-      auto [alloc_sizes, alloc_strides] = reconstruct_alloc_shape_and_strides(
-          stl.device_size, stl.stride_map, stl.tile_size);
-      cpu_sizes = alloc_sizes;
-      cpu_strides = alloc_strides;
-    }
-  }
 
   // While the source strides may differ from the destination strides when the
   // source is non-dense or overlapping, the source sizes should always match
@@ -536,18 +487,11 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   TORCH_CHECK(dev_offset == 0, "Invalid device tensor storage offset");
   TORCH_CHECK(device_offset < device_elements, "Invalid device storage offset");
 
-  // Detect slicing: if tile_size is populated, use it to detect; otherwise skip
-  // old slicing logic (dma_sizes/dma_strides no longer exist)
-  bool dev_sliced = false;
-  if (!stl.tile_size.empty()) {
-    int64_t total_valid = 0;
-    for (const auto& [dims, count] : stl.tile_size) {
-      total_valid += count;
-    }
-    dev_sliced = total_valid > dev_tensor->numel();
-  }
-
-  if (dev_sliced && stl.tile_size.empty()) {
+  // If the dma_sizes contains more elements than dev_tensor contains then the
+  // dev_tensor is a slice.
+  const bool dev_sliced =
+      c10::multiply_integers(dma_sizes) > dev_tensor->numel();
+  if (dev_sliced) {
     // In these cases we first update the dma_sizes and dma_strides to reflect
     // the cpu_tensor sizes and strides.
     //

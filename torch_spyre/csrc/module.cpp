@@ -382,6 +382,8 @@ PYBIND11_MODULE(_C, m) {
             }
           }));
 
+  m.def("compute_tile_size", &spyre::compute_tile_size, py::arg("host_size"),
+        py::arg("host_strides"), py::arg("stride_map"), py::arg("device_size"));
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());

@@ -100,7 +100,8 @@ class SpyreTensorLayout {
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
   /**
-   * Maps tile dimension vectors to tile sizes. Placeholder; not yet computed.
+   * Maps groups of device dimension indices to the unpadded host dimension size
+   * (number of valid elements in that group). Populated by compute_tile_size.
    */
   std::map<std::vector<int64_t>, int64_t> tile_size;
 

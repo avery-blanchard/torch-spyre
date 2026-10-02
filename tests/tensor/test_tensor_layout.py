@@ -818,5 +818,55 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(ok.device_size), [1, 4, 64])
 
 
+@instantiate_parametrized_tests
+class TestComputeTileSize(TestCase):
+    @parametrize(
+        "host_size,host_strides,device_size,stride_map,expected",
+        [
+            # scalar
+            ([1], [1], [1, 64], [1, 1], {(0, 1): 1}),
+            # 1 stick
+            ([64], [1], [1, 64], [1, 1], {(0, 1): 64}),
+            # 1 partial stick
+            ([42], [1], [1, 64], [1, 1], {(0, 1): 42}),
+            # 1 stick and 1 partial stick
+            ([100], [1], [2, 64], [64, 1], {(0, 1): 100}),
+            # 2d tensor
+            (
+                [7, 100],
+                [100, 1],
+                [2, 7, 64],
+                [64, 100, 1],
+                {(0, 2): 100, (1,): 7},
+            ),
+            # padded 2d tensor
+            (
+                [7, 100],
+                [101, 1],
+                [2, 7, 64],
+                [64, 101, 1],
+                {(0, 2): 100, (1,): 7},
+            ),
+            # expanded dimension
+            ([42], [0], [1, 64], [1, 0], {(0, 1): 42}),
+            # 2d tensor with expanded dimension
+            (
+                [7, 100],
+                [4, 0],
+                [2, 7, 64],
+                [0, 4, 0],
+                {(0, 2): 100, (1,): 7},
+            ),
+        ],
+    )
+    def test_compute_tile_size(
+        self, host_size, host_strides, device_size, stride_map, expected
+    ):
+        from torch_spyre._C import compute_tile_size
+
+        result = compute_tile_size(host_size, host_strides, stride_map, device_size)
+        self.assertEqual(result, expected)
+
+
 if __name__ == "__main__":
     run_tests()
