@@ -41,7 +41,6 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
   }
 
   const int64_t device_rank = static_cast<int64_t>(stride_map.size());
-  const int64_t count_dev_dim = device_rank > 2 ? device_rank - 3 : 0;
 
   // Group device dims by stride_map value
   std::map<int64_t, std::vector<int64_t>> stride_groups;
@@ -49,13 +48,32 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     stride_groups[stride_map[j]].push_back(j);
   }
 
-  // Force count dim into within-stick dim's group
-  int64_t within_stick_stride = stride_map[device_rank - 1];
-  if (within_stick_stride != -1) {
-    auto& group = stride_groups[within_stick_stride];
-    auto it = std::find(group.begin(), group.end(), count_dev_dim);
-    if (it == group.end()) {
-      group.push_back(count_dev_dim);
+  // Find stick pair by identifying the two smallest positive stride values
+  // The within-stick dim has the smallest positive stride; the count dim
+  // has the next smallest. Force them into the same group.
+  std::vector<int64_t> positive_strides;
+  for (const auto& [stride_val, dims] : stride_groups) {
+    if (stride_val > 0) {
+      positive_strides.push_back(stride_val);
+    }
+  }
+  std::sort(positive_strides.begin(), positive_strides.end());
+
+  if (positive_strides.size() >= 2) {
+    // Find which dims have the two smallest positive strides
+    int64_t smallest_stride = positive_strides[0];
+    int64_t second_smallest_stride = positive_strides[1];
+
+    // The count dim is in the second-smallest group; move it to smallest
+    if (stride_groups.count(second_smallest_stride) &&
+        !stride_groups[second_smallest_stride].empty()) {
+      auto& count_group = stride_groups[second_smallest_stride];
+      int64_t count_dev_dim =
+          count_group.back();  // Take any dim from this group
+      count_group.pop_back();
+
+      // Add to the smallest stride group (stick group)
+      stride_groups[smallest_stride].push_back(count_dev_dim);
     }
   }
 
@@ -76,7 +94,7 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
       }
     }
 
-    if (host_sz > 0) {
+    if (host_sz > 0 && !dims.empty()) {
       std::sort(dims.begin(), dims.end());
       tile_size[dims] = host_sz;
     }
@@ -343,8 +361,6 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   }
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
-  impl->dma_sizes = this->dma_sizes;
-  impl->dma_strides = this->dma_strides;
   copy_tensor_metadata(
       /*src_impl=*/this,
       /*dest_impl=*/impl.get(),
@@ -374,8 +390,6 @@ void SpyreTensorImpl::shallow_copy_from(
     const at::intrusive_ptr<at::TensorImpl>& impl) {
   auto spyre_impl = static_cast<SpyreTensorImpl*>(impl.get());
   at::TensorImpl::shallow_copy_from(impl);
-  this->dma_sizes = spyre_impl->dma_sizes;
-  this->dma_strides = spyre_impl->dma_strides;
   this->spyre_layout = spyre_impl->spyre_layout;
 }
 

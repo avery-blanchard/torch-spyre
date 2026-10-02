@@ -339,7 +339,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   const int device_rank = stl.stride_map.size();
 
   // Compute the device_offset, which is the offset into stl.device_size, based
-  // on the dev_offset, which is the offset into dma_sizes.
+  // on the dev_offset, which is the offset into the host tensor.
   std::vector<int64_t> device_strides(device_rank, 1);
   int64_t device_elements = 1;
   for (int i = device_rank - 1; i >= 0; i--) {
@@ -374,16 +374,50 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   TORCH_CHECK(device_offset < device_elements, "Invalid device storage offset");
 
   // Reconstruct tile_size from device_size and stride_map if not already
-  // populated. Group dims by stride_map value and use device_size products.
+  // populated. Match the logic from compute_tile_size(): group by stride_map
+  // value, force stick-count dim into within-stick group, use device_size
+  // products.
   if (stl.tile_size.empty()) {
     const int64_t device_rank = static_cast<int64_t>(stl.stride_map.size());
+
+    // Group device dims by stride_map value
     std::map<int64_t, std::vector<int64_t>> stride_groups;
     for (int64_t j = 0; j < device_rank; ++j) {
       stride_groups[stl.stride_map[j]].push_back(j);
     }
 
+    // Find stick pair by identifying the two smallest positive stride values
+    // The within-stick dim has the smallest positive stride; the count dim
+    // has the next smallest. Force them into the same group.
+    std::vector<int64_t> positive_strides;
+    for (const auto& [stride_val, dims] : stride_groups) {
+      if (stride_val > 0) {
+        positive_strides.push_back(stride_val);
+      }
+    }
+    std::sort(positive_strides.begin(), positive_strides.end());
+
+    if (positive_strides.size() >= 2) {
+      // Find which dims have the two smallest positive strides
+      int64_t smallest_stride = positive_strides[0];
+      int64_t second_smallest_stride = positive_strides[1];
+
+      // The count dim is in the second-smallest group; move it to smallest
+      if (stride_groups.count(second_smallest_stride) &&
+          !stride_groups[second_smallest_stride].empty()) {
+        auto& count_group = stride_groups[second_smallest_stride];
+        int64_t count_dev_dim =
+            count_group.back();  // Take any dim from this group
+        count_group.pop_back();
+
+        // Add to the smallest stride group (stick group)
+        stride_groups[smallest_stride].push_back(count_dev_dim);
+      }
+    }
+
     // For each stride group, multiply device_size values
     for (auto& [stride_val, dims] : stride_groups) {
+      if (dims.empty()) continue;  // Skip empty groups (moved dims)
       std::sort(dims.begin(), dims.end());
       int64_t element_count = 1;
       for (int64_t d : dims) {
@@ -595,8 +629,8 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   } else {
     stream = getCurrentStream(self.device());
     // D2H staging path: DMA the full physical allocation into a CPU buffer
-    // using dma_sizes/dma_strides/spyre_layout (the layout the data was
-    // written with), then apply the logical view on the CPU side.
+    // using spyre_layout (the layout the data was written with), then apply
+    // the logical view on the CPU side.
     //
     // This path is taken when:
     //   (a) the tensor is expanded/repeated, where we transfer the minimal
@@ -765,8 +799,6 @@ const at::Tensor& spyre_resize_(
       last_dim_ok) {
     self_impl->set_sizes_contiguous(size_int);
     self_impl->spyre_layout = new_layout;
-    self_impl->dma_sizes = size_int.vec();
-    self_impl->dma_strides = self_impl->strides().vec();
     SPYRE_RUNTIME_DEBUG() << "to shape=" << size_int
                           << " layout=" << self_impl->spyre_layout.toString();
     return self;
