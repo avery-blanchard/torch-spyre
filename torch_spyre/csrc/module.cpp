@@ -292,7 +292,17 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def_readonly("element_arrangement",
                     &spyre::SpyreTensorLayout::element_arrangement)
-      .def_readonly("tile_size", &spyre::SpyreTensorLayout::tile_size)
+      .def_property_readonly("tile_size",
+                             [](const spyre::SpyreTensorLayout& stl) {
+                               // Convert vector keys to tuple keys for Python
+                               // hashability
+                               py::dict result;
+                               for (const auto& [dims, count] : stl.tile_size) {
+                                 py::tuple key = py::cast(dims);
+                                 result[key] = count;
+                               }
+                               return result;
+                             })
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
            py::arg("element_arrangement"))
@@ -327,9 +337,15 @@ PYBIND11_MODULE(_C, m) {
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
+            // Convert tile_size vector keys to tuple keys for pickling
+            py::dict tile_size_tupled;
+            for (const auto& [dims, count] : p.tile_size) {
+              py::tuple key = py::cast(dims);
+              tile_size_tupled[key] = count;
+            }
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement, p.tile_size);
+                                  p.element_arrangement, tile_size_tupled);
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -370,11 +386,19 @@ PYBIND11_MODULE(_C, m) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
               }
+              // tile_size was pickled as a dict with tuple keys; convert back
+              // to map<vector<int64_t>, int64_t> since pybind11 cannot cast
+              // Python tuple keys directly to std::vector<int64_t>.
+              std::map<std::vector<int64_t>, int64_t> tile_size_map;
+              for (auto item : t[5].cast<py::dict>()) {
+                auto key = item.first.cast<std::vector<int64_t>>();
+                auto val = item.second.cast<int64_t>();
+                tile_size_map[key] = val;
+              }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
-                  t[4].cast<spyre::ElementArrangement>(),
-                  t[5].cast<std::map<std::vector<int64_t>, int64_t>>());
+                  t[4].cast<spyre::ElementArrangement>(), tile_size_map);
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
@@ -382,6 +406,22 @@ PYBIND11_MODULE(_C, m) {
             }
           }));
 
+  m.def(
+      "compute_tile_size",
+      [](const std::vector<int64_t>& host_size,
+         const std::vector<int64_t>& host_strides,
+         const std::vector<int64_t>& stride_map,
+         const std::vector<int64_t>& device_size) -> py::dict {
+        auto result = spyre::compute_tile_size(host_size, host_strides,
+                                               stride_map, device_size);
+        py::dict py_result;
+        for (const auto& [dims, size] : result) {
+          py_result[py::tuple(py::cast(dims))] = size;
+        }
+        return py_result;
+      },
+      py::arg("host_size"), py::arg("host_strides"), py::arg("stride_map"),
+      py::arg("device_size"));
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());

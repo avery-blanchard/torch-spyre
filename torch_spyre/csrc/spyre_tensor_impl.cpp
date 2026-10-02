@@ -21,6 +21,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -135,6 +136,60 @@ static std::vector<int64_t> dim_map_to_stride_map(
   return stride_map;
 }
 
+std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+    const std::vector<int64_t>& host_size,
+    const std::vector<int64_t>& host_strides,
+    const std::vector<int64_t>& stride_map,
+    const std::vector<int64_t>& device_size) {
+  std::map<std::vector<int64_t>, int64_t> tile_size;
+
+  if (stride_map.empty() || device_size.empty()) {
+    return tile_size;
+  }
+
+  const int host_rank = host_strides.size();
+  const int device_rank = stride_map.size();
+  std::vector<int64_t> max_stride_le(device_rank, -1);
+  std::vector<bool> mapped(device_rank, false);
+
+  for (int i = 0; i < host_rank; i++) {
+    const int64_t hst = host_strides[i];
+    std::vector<int64_t> key;
+
+    for (int j = 0; j < device_rank; j++) {
+      const int64_t dst = stride_map[j];
+      if (hst > max_stride_le[j] && hst <= dst) {
+        max_stride_le[j] = hst;
+        key.push_back(j);
+        mapped[j] = true;
+      }
+    }
+
+    if (!key.empty()) {
+      tile_size[key] = host_size[i];
+    }
+  }
+
+  // Unmapped dims: singletons
+  for (int d = 0; d < device_rank; d++) {
+    if (!mapped[d]) {
+      tile_size[{static_cast<int64_t>(d)}] = device_size[d];
+    }
+  }
+
+  return tile_size;
+}
+
+std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+    const std::vector<int64_t>& device_size) {
+  std::map<std::vector<int64_t>, int64_t> tile_size;
+
+  for (int d = 0; d < static_cast<int>(device_size.size()); d++) {
+    tile_size[{static_cast<int64_t>(d)}] = device_size[d];
+  }
+
+  return tile_size;
+}
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
@@ -158,7 +213,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
   this->device_dtype = sen_dtype_dev;
-
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(2);
@@ -167,6 +221,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->stride_map.resize(2);
     this->stride_map[0] = -1;
     this->stride_map[1] = -1;
+    this->tile_size[{0, 1}] = 1;
     return;
   }
 
@@ -192,6 +247,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
   this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
                                            this->device_size);
+  this->tile_size = compute_tile_size(host_size, host_strides, this->stride_map,
+                                      this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -223,12 +280,14 @@ std::string SpyreTensorLayout::toString() const {
     for (const auto& [dims, size] : this->tile_size) {
       if (!first) ss << ", ";
       first = false;
-      ss << "[";
+      ss << "(";
       for (size_t i = 0; i < dims.size(); i++) {
         ss << dims[i];
         if (i + 1 < dims.size()) ss << ", ";
       }
-      ss << "]: " << size;
+      // Single-element tuples need trailing comma in Python
+      if (dims.size() == 1) ss << ",";
+      ss << "): " << size;
     }
     ss << "}";
   }

@@ -33,7 +33,13 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-
+std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+    const std::vector<int64_t>& host_size,
+    const std::vector<int64_t>& host_strides,
+    const std::vector<int64_t>& stride_map,
+    const std::vector<int64_t>& device_size);
+std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+    const std::vector<int64_t>& device_size);
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -95,7 +101,8 @@ class SpyreTensorLayout {
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
   /**
-   * Maps tile dimension vectors to tile sizes. Placeholder; not yet computed.
+   * Maps groups of device dimension indices to the unpadded host dimension size
+   * (number of valid elements in that group). Populated by compute_tile_size.
    */
   std::map<std::vector<int64_t>, int64_t> tile_size;
 
@@ -141,7 +148,8 @@ class SpyreTensorLayout {
         stride_map(stride_map),
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
-        tile_size(std::move(tile_size)) {
+        tile_size(tile_size.empty() ? compute_tile_size(device_size)
+                                    : std::move(tile_size)) {
     validate_shape();
   }
 
