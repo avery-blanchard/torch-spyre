@@ -161,7 +161,7 @@ class TestSpyreTensorLayout(TestCase):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
             str(stl),
-            "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16, tile_size={(0, 2): 256, (1,): 512})",
+            "SpyreTensorLayout(device_size=[4, 512, 64], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16, valid_elements={(0, 2): 256, (1,): 512})",
         )
 
     def test_device_alloc(self):
@@ -867,14 +867,102 @@ class TestComputeTileSize(TestCase):
                 [0, 4, 0],
                 {(0, 2): 100, (1,): 7},
             ),
+            # 3d contiguous: [8, 16, 64]
+            (
+                [8, 16, 64],
+                [1024, 64, 1],
+                [2, 8, 16, 64],
+                [1024, 1024, 64, 1],
+                {(0, 1): 8, (2,): 16, (3,): 64},
+            ),
+            # 3d with partial stick: [5, 10, 42]
+            (
+                [5, 10, 42],
+                [420, 42, 1],
+                [1, 5, 10, 1, 64],
+                [420, 420, 42, 1, 1],
+                {(0, 1): 5, (2,): 10, (3, 4): 42},
+            ),
+            # 2d with size-1 marker: [10, 1, 64]
+            (
+                [10, 1, 64],
+                [64, 64, 1],
+                [1, 10, 1, 64],
+                [64, 64, -1, 1],
+                {(0, 1): 10, (3,): 64, (2,): 1},
+            ),
+            # larger 2d: [16, 256]
+            (
+                [16, 256],
+                [256, 1],
+                [1, 16, 4, 64],
+                [256, 256, 64, 1],
+                {(0, 1): 16, (2, 3): 256},
+            ),
+            # 3D generic stick: [6, 8, 64] with dim_map=[1,2,0,2]
+            (
+                [6, 8, 64],
+                [512, 64, 1],
+                [8, 1, 6, 64],
+                [64, 64, 512, 1],
+                {(0, 3): 64, (1,): 8, (2,): 6},
+            ),
+            # 4D generic stick: [8, 16, 32, 64] with dim_map=[1,2,3,0,3]
+            (
+                [8, 16, 32, 64],
+                [32768, 2048, 64, 1],
+                [16, 32, 1, 8, 64],
+                [2048, 64, 64, 32768, 1],
+                {(0, 4): 64, (1,): 16, (2,): 32, (3,): 8},
+            ),
+            # 3D generic with partial stick: [10, 12, 42]
+            (
+                [10, 12, 42],
+                [504, 42, 1],
+                [1, 12, 10, 1, 64],
+                [504, 42, 504, 1, 1],
+                {(0, 4): 42, (1,): 12, (2,): 10, (3,): 1},
+            ),
+            # 2D non-generic: dim_map=[0, 1, 1]
+            (
+                [8, 64],
+                [64, 1],
+                [8, 1, 64],
+                [64, 64, 1],
+                {(0,): 8, (1, 2): 64},
+            ),
+            # 3D non-generic: dim_map=[0, 2, 1, 2]
+            (
+                [4, 8, 64],
+                [512, 64, 1],
+                [4, 1, 8, 64],
+                [512, 64, 64, 1],
+                {(0,): 4, (1,): 1, (2, 3): 64},
+            ),
+            # 3D non-generic: dim_map=[2, 0, 1, 2]
+            (
+                [3, 5, 128],
+                [640, 128, 1],
+                [5, 3, 2, 64],
+                [64, 640, 128, 1],
+                {(0, 3): 128, (1,): 5, (2,): 3},
+            ),
+            # 4D non-generic: dim_map=[0, 3, 1, 2, 2]
+            (
+                [2, 4, 8, 64],
+                [2048, 512, 64, 1],
+                [2, 1, 4, 8, 64],
+                [2048, 1, 512, 512, 64],
+                {(0,): 2, (2,): 4, (1,): 8, (3, 4): 64},
+            ),
         ],
     )
-    def test_compute_tile_size(
+    def test_compute_valid_elements(
         self, host_size, host_strides, device_size, stride_map, expected
     ):
-        from torch_spyre._C import compute_tile_size
+        from torch_spyre._C import compute_valid_elements
 
-        result = compute_tile_size(
+        result = compute_valid_elements(
             list(host_size), list(host_strides), list(stride_map), list(device_size)
         )
         self.assertEqual(result, expected)

@@ -136,15 +136,15 @@ static std::vector<int64_t> dim_map_to_stride_map(
   return stride_map;
 }
 
-std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& host_size,
     const std::vector<int64_t>& host_strides,
     const std::vector<int64_t>& stride_map,
     const std::vector<int64_t>& device_size) {
-  std::map<std::vector<int64_t>, int64_t> tile_size;
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
 
   if (stride_map.empty() || device_size.empty()) {
-    return tile_size;
+    return valid_elements;
   }
 
   const int host_rank = host_strides.size();
@@ -152,6 +152,7 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
   std::vector<int64_t> max_stride_le(device_rank, -1);
   std::vector<bool> mapped(device_rank, false);
 
+  // Process host strides in order, grouping device dims that match each one
   for (int i = 0; i < host_rank; i++) {
     const int64_t hst = host_strides[i];
     std::vector<int64_t> key;
@@ -166,29 +167,29 @@ std::map<std::vector<int64_t>, int64_t> compute_tile_size(
     }
 
     if (!key.empty()) {
-      tile_size[key] = host_size[i];
+      valid_elements[key] = host_size[i];
     }
   }
 
   // Unmapped dims: singletons
   for (int d = 0; d < device_rank; d++) {
     if (!mapped[d]) {
-      tile_size[{static_cast<int64_t>(d)}] = device_size[d];
+      valid_elements[{static_cast<int64_t>(d)}] = device_size[d];
     }
   }
 
-  return tile_size;
+  return valid_elements;
 }
 
-std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& device_size) {
-  std::map<std::vector<int64_t>, int64_t> tile_size;
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
 
   for (int d = 0; d < static_cast<int>(device_size.size()); d++) {
-    tile_size[{static_cast<int64_t>(d)}] = device_size[d];
+    valid_elements[{static_cast<int64_t>(d)}] = device_size[d];
   }
 
-  return tile_size;
+  return valid_elements;
 }
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
@@ -221,7 +222,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->stride_map.resize(2);
     this->stride_map[0] = -1;
     this->stride_map[1] = -1;
-    this->tile_size[{0, 1}] = 1;
+    this->valid_elements[{0, 1}] = 1;
     return;
   }
 
@@ -247,8 +248,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
   this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
                                            this->device_size);
-  this->tile_size = compute_tile_size(host_size, host_strides, this->stride_map,
-                                      this->device_size);
+  this->valid_elements = compute_valid_elements(
+      host_size, host_strides, this->stride_map, this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -274,10 +275,10 @@ std::string SpyreTensorLayout::toString() const {
     ss << ", element_arrangement=ElementArrangement.";
     ss << spyre::elementArrangementToString(this->element_arrangement);
   }
-  if (!this->tile_size.empty()) {
-    ss << ", tile_size={";
+  if (!this->valid_elements.empty()) {
+    ss << ", valid_elements={";
     bool first = true;
-    for (const auto& [dims, size] : this->tile_size) {
+    for (const auto& [dims, size] : this->valid_elements) {
       if (!first) ss << ", ";
       first = false;
       ss << "(";

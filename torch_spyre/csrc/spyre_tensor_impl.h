@@ -33,12 +33,12 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& host_size,
     const std::vector<int64_t>& host_strides,
     const std::vector<int64_t>& stride_map,
     const std::vector<int64_t>& device_size);
-std::map<std::vector<int64_t>, int64_t> compute_tile_size(
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& device_size);
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
@@ -101,10 +101,10 @@ class SpyreTensorLayout {
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
   /**
-   * Maps groups of device dimension indices to the unpadded host dimension size
-   * (number of valid elements in that group). Populated by compute_tile_size.
+   * Maps groups of device dimension indices to the number of valid (non-padded)
+   * elements in that group. Populated by compute_valid_elements.
    */
-  std::map<std::vector<int64_t>, int64_t> tile_size;
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
 
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
@@ -143,13 +143,14 @@ class SpyreTensorLayout {
       std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
       DataFormats device_dtype,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD,
-      std::map<std::vector<int64_t>, int64_t> tile_size = {})
+      std::map<std::vector<int64_t>, int64_t> valid_elements = {})
       : device_size(device_size),
         stride_map(stride_map),
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
-        tile_size(tile_size.empty() ? compute_tile_size(device_size)
-                                    : std::move(tile_size)) {
+        valid_elements(valid_elements.empty()
+                           ? compute_valid_elements(device_size)
+                           : std::move(valid_elements)) {
     validate_shape();
   }
 
@@ -213,7 +214,7 @@ class SpyreTensorLayout {
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
            this->element_arrangement == other.element_arrangement &&
-           this->tile_size == other.tile_size;
+           this->valid_elements == other.valid_elements;
   }
 };
 
@@ -283,7 +284,7 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
-    for (const auto& [dims, size] : layout.tile_size) {
+    for (const auto& [dims, size] : layout.valid_elements) {
       for (int64_t d : dims)
         seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
       seed = c10::hash_combine(seed, std::hash<int64_t>{}(size));
