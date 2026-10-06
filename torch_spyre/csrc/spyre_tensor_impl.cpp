@@ -151,47 +151,87 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
   const int device_rank = stride_map.size();
   std::vector<bool> mapped(device_rank, false);
 
-  // Reconstruct device dimension groupings by understanding the stride_map
-  // pattern created by dim_map_to_stride_map.
-  for (int h = 0; h < host_rank; ++h) {
-    const int64_t host_stride_val = host_strides[h];
-    std::vector<int> group;
-    int primary_device_dim = -1;
+  // Pass 1: Identify primary device_dims for each host_index (rightmost match)
+  // and compute their extent values. Use host_index as key, not host_stride
+  // value, so duplicate stride values don't overwrite each other.
+  std::map<int, int> primary_for_host;     // host_index -> primary device_dim
+  std::map<int, int64_t> extent_for_host;  // host_index -> extent_value
 
-    // Find the primary device_dim for this host dimension.
-    // The primary is the rightmost device_dim with stride_map ==
-    // host_stride_val.
+  for (int h = host_rank - 1; h >= 0; --h) {
+    const int64_t hst = host_strides[h];
+
+    // Find rightmost unmapped device_dim with stride_map == hst
     for (int j = device_rank - 1; j >= 0; --j) {
-      if (stride_map[j] == host_stride_val) {
-        primary_device_dim = j;
-        group.push_back(j);
-        mapped[j] = true;
+      if (!mapped[j] && stride_map[j] == hst) {
+        primary_for_host[h] = j;
+        int64_t extent = std::min(hst * device_size[j], hst * host_size[h]);
+        extent_for_host[h] = extent;
         break;
       }
     }
+  }
 
-    if (primary_device_dim == -1) {
-      // No device_dim for this host_stride; unusual but handle gracefully.
+  // Reset mapped to false for Pass 2
+  std::fill(mapped.begin(), mapped.end(), false);
+
+  // Pass 2: Group device_dims by their host_index, collecting both primaries
+  // and continuations (marked by extent_value).
+  for (int h = host_rank - 1; h >= 0; --h) {
+    std::vector<int> group;
+
+    if (primary_for_host.count(h) == 0) {
+      // No primary for this host_index; collect -1 dimensions
+      for (int j = 0; j < device_rank; ++j) {
+        if (!mapped[j] && stride_map[j] == -1) {
+          group.push_back(j);
+          mapped[j] = true;
+        }
+      }
+      if (!group.empty()) {
+        std::sort(group.begin(), group.end());
+        std::vector<int64_t> key(group.begin(), group.end());
+        valid_elements[key] = host_size[h];
+      }
       continue;
     }
 
-    // Compute the extent value that results from this primary device_dim.
-    // From dim_map_to_stride_map: last_stride[d] = min(stride_map[j] *
-    // device_size[j], host_stride[d] * host_size[d])
-    const int64_t extent_value =
-        std::min(host_stride_val * device_size[primary_device_dim],
-                 host_stride_val * host_size[h]);
+    int primary_j = primary_for_host[h];
+    int64_t extent_val = extent_for_host[h];
 
-    // Find all other device_dims with stride_map == extent_value.
-    // These are continuation device_dims belonging to this host dimension.
+    // Collect primary
+    group.push_back(primary_j);
+    mapped[primary_j] = true;
+
+    // Collect continuations (stride_map == extent_value, but not if extent ==
+    // hst)
+    if (extent_val != host_strides[h]) {
+      for (int j = device_rank - 1; j >= 0; --j) {
+        if (!mapped[j] && stride_map[j] == extent_val) {
+          // Check that this isn't a primary for a different host_index
+          bool is_primary_for_other = false;
+          for (const auto& [other_h, other_primary] : primary_for_host) {
+            if (other_h != h && other_primary == j) {
+              is_primary_for_other = true;
+              break;
+            }
+          }
+          if (!is_primary_for_other) {
+            group.push_back(j);
+            mapped[j] = true;
+          }
+        }
+      }
+    }
+
+    // Collect -1 dimensions
     for (int j = 0; j < device_rank; ++j) {
-      if (!mapped[j] && stride_map[j] == extent_value) {
+      if (!mapped[j] && stride_map[j] == -1) {
         group.push_back(j);
         mapped[j] = true;
       }
     }
 
-    // Add this group to valid_elements.
+    // Add to valid_elements
     if (!group.empty()) {
       std::sort(group.begin(), group.end());
       std::vector<int64_t> key(group.begin(), group.end());
