@@ -2,7 +2,8 @@ name: Checkout pytorch repo
 description: |
   Re-points the pre-cloned pytorch source tree at the release branch that
   matches the torch version pinned in torch-spyre's pyproject.toml, or at
-  an exact commit SHA when the `sha` input is set.
+  an exact commit SHA when the `sha` input is set. Reuses the image's baked
+  tree ($TORCH_ROOT) when it already matches the release branch.
 
 inputs:
   torch_spyre_dir:
@@ -81,6 +82,18 @@ runs:
         fi
         echo "FETCH_REF $FETCH_REF"
         echo "PYTORCH_REPO_URL $PYTORCH_REPO_URL"
+
+        # The torch-spyre-dev image bakes the release tree (no .git, so no submodules) and sets TORCH_ROOT.
+        BAKED_ROOT="${TORCH_ROOT:-}"
+        if [[ -z "$SHA" && -d "$BAKED_ROOT/test" && -f "$BAKED_ROOT/version.txt" ]]; then
+          BAKED_MINOR=$(grep -oE '^[0-9]+\.[0-9]+' "$BAKED_ROOT/version.txt" || true)
+          if [[ "$BAKED_MINOR" == "$VERSION" ]]; then
+            echo "Reusing baked pytorch $(cat "$BAKED_ROOT/version.txt") at $BAKED_ROOT"
+            echo "TORCH_ROOT=${BAKED_ROOT}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "Baked pytorch at $BAKED_ROOT is ${BAKED_MINOR:-unknown}, need $VERSION; cloning"
+        fi
 
         mkdir -p "$PYTORCH_DIR" || exit 1
         cd "$PYTORCH_DIR" || exit 1
