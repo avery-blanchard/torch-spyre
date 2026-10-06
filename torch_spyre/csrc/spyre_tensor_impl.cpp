@@ -149,30 +149,58 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
 
   const int host_rank = host_strides.size();
   const int device_rank = stride_map.size();
-  std::vector<int64_t> max_stride_le(device_rank, -1);
   std::vector<bool> mapped(device_rank, false);
 
-  // Process host strides in order, grouping device dims that match each one
-  for (int i = 0; i < host_rank; i++) {
-    const int64_t hst = host_strides[i];
-    std::vector<int64_t> key;
+  // Reconstruct device dimension groupings by understanding the stride_map
+  // pattern created by dim_map_to_stride_map.
+  for (int h = 0; h < host_rank; ++h) {
+    const int64_t host_stride_val = host_strides[h];
+    std::vector<int> group;
+    int primary_device_dim = -1;
 
-    for (int j = 0; j < device_rank; j++) {
-      const int64_t dst = stride_map[j];
-      if (hst > max_stride_le[j] && hst <= dst) {
-        max_stride_le[j] = hst;
-        key.push_back(j);
+    // Find the primary device_dim for this host dimension.
+    // The primary is the rightmost device_dim with stride_map ==
+    // host_stride_val.
+    for (int j = device_rank - 1; j >= 0; --j) {
+      if (stride_map[j] == host_stride_val) {
+        primary_device_dim = j;
+        group.push_back(j);
+        mapped[j] = true;
+        break;
+      }
+    }
+
+    if (primary_device_dim == -1) {
+      // No device_dim for this host_stride; unusual but handle gracefully.
+      continue;
+    }
+
+    // Compute the extent value that results from this primary device_dim.
+    // From dim_map_to_stride_map: last_stride[d] = min(stride_map[j] *
+    // device_size[j], host_stride[d] * host_size[d])
+    const int64_t extent_value =
+        std::min(host_stride_val * device_size[primary_device_dim],
+                 host_stride_val * host_size[h]);
+
+    // Find all other device_dims with stride_map == extent_value.
+    // These are continuation device_dims belonging to this host dimension.
+    for (int j = 0; j < device_rank; ++j) {
+      if (!mapped[j] && stride_map[j] == extent_value) {
+        group.push_back(j);
         mapped[j] = true;
       }
     }
 
-    if (!key.empty()) {
-      valid_elements[key] = host_size[i];
+    // Add this group to valid_elements.
+    if (!group.empty()) {
+      std::sort(group.begin(), group.end());
+      std::vector<int64_t> key(group.begin(), group.end());
+      valid_elements[key] = host_size[h];
     }
   }
 
-  // Unmapped dims: singletons
-  for (int d = 0; d < device_rank; d++) {
+  // Unmapped dimensions are singletons.
+  for (int d = 0; d < device_rank; ++d) {
     if (!mapped[d]) {
       valid_elements[{static_cast<int64_t>(d)}] = device_size[d];
     }
