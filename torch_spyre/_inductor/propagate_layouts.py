@@ -167,7 +167,7 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     materialize expanded tensors, but it needlessly multiplies the allocation
     and span of compiler-generated overlapping buffers such as coarse-tile read
     copies.  Collapse every such non-stick device dimension to one.  The final
-    device dimension remains a full hardware stick; making its stride sparse is
+    device dimension remains a full hardware stick; making its stride zero is
     enough to represent a broadcast stick.
     """
     device_size = list(stl.device_size)
@@ -176,7 +176,6 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     for dim, stride in enumerate(stride_map):
         if stride != 0:
             continue
-        stride_map[dim] = -1
         if dim != len(device_size) - 1:
             device_size[dim] = 1
         changed = True
@@ -1586,7 +1585,7 @@ def _multi_arg_pointwise_layouts(
         # A device *stick* is a broadcast (carries at most one distinct host
         # element) exactly when it maps to a size-1 / sparse host axis. In an STL
         # the stick is the last device dim and the layout constructor
-        # (spyre_tensor_impl.cpp) sets `stride_map[-1] == -1` precisely in that
+        # (spyre_tensor_impl.cpp) sets `stride_map[-1] == 0` precisely in that
         # case. This is the correct, dim_order-independent test — reading
         # `arg.layout.size[-1]` only works under an identity dim_order (e.g. host
         # size [1, 64, 1] with the stick on a size-1 axis that is not last would
@@ -1604,7 +1603,7 @@ def _multi_arg_pointwise_layouts(
             broadcast: list[SpyreTensorLayout] = []
             non_broadcast: list[SpyreTensorLayout] = []
             for stl in arg.layouts:
-                (broadcast if stl.stride_map[-1] == -1 else non_broadcast).append(stl)
+                (broadcast if stl.stride_map[-1] == 0 else non_broadcast).append(stl)
             return broadcast, non_broadcast
 
         std_split = [
@@ -1644,7 +1643,7 @@ def _multi_arg_pointwise_layouts(
             #
             # ElementArrangement changes only the order of elements *within* a
             # stick. Every candidate retained here has a sparse stick
-            # (stride_map[-1] == -1), so all its logical loads address the same
+            # (stride_map[-1] == 0), so all its logical loads address the same
             # within-stick element and the stagger is unobservable. Its outer
             # device geometry may still be noncanonical (dtype conversion keeps
             # its producer's geometry); that geometry remains on the input and

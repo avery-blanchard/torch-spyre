@@ -151,10 +151,10 @@ class SpyreTensorLayout {
    * rescale_stl_for_dtype now rejects that upstream of the constructor, and
    * get_device_stride_infos checks every divisor before use.
    *
-   * stride_map entries are deliberately not range-checked here: -1 marks a
-   * size-1 or sparse dimension and 0 a broadcast dimension, both legitimate.
-   * Consistency between stride_map and the host strides is only knowable at
-   * use time and is checked in get_device_stride_infos.
+   * stride_map entries are deliberately not range-checked here: 0 marks a
+   * size-1, sparse, or broadcast dimension — all legitimate. Consistency
+   * between stride_map and the host strides is only knowable at use time and
+   * is checked in get_device_stride_infos.
    */
   void validate_shape() const {
     TORCH_CHECK(!device_size.empty(),

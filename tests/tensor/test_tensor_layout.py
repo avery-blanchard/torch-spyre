@@ -93,7 +93,7 @@ class TestSpyreTensorLayout(TestCase):
     def test_default_layout(self):
         stl = SpyreTensorLayout([], torch.float16)
         self.assertEqual(stl.device_size, [1, 64])
-        self.assertEqual(stl.stride_map, [-1, -1])
+        self.assertEqual(stl.stride_map, [0, 0])
 
         stl = SpyreTensorLayout([120], torch.float16)
         self.assertEqual(stl.device_size, [2, 64])
@@ -155,7 +155,7 @@ class TestSpyreTensorLayout(TestCase):
     def test_sparse_dim_order(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1, -1])
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(stl.stride_map, [1, -1, 256, -1])
+        self.assertEqual(stl.stride_map, [1, 0, 256, 0])
 
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
@@ -582,7 +582,7 @@ class TestSpyreTensorLayout(TestCase):
         # without being loose enough to mask a genuine regression.
         self.assertEqual(x, x_dev.cpu(), atol=1e-3, rtol=1e-3)
         self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
-        self.assertEqual(x_stl.stride_map, [1, -1, 256, -1])
+        self.assertEqual(x_stl.stride_map, [1, 0, 256, 0])
 
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
