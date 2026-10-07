@@ -196,11 +196,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     device_strides[i] = prev_size;
     prev_size *= stl.device_size[i];
     // Size 1 dimensions are ignored.
-    if (stl.stride_map[i] == 0) {
-      dcsi_sizes[i] = stl.device_size[i];
-      host_strides[i] = 0;
-      continue;
-    }
+    if (stl.stride_map[i] == 0) continue;
     host_strides[i] = stl.stride_map[i];
   }
 
