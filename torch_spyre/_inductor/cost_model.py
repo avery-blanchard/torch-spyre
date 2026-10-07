@@ -1300,17 +1300,6 @@ def relayout_ns(o: "OpFeatures", params: "CostParams | None" = None) -> float:
     )
 
 
-def _max_traffic(a, b):
-    """``max`` for byte counts that may be sympy expressions of the solver's
-    residency / split symbols (the co-optimizing path): Python's ``max`` compares
-    with ``>`` and raises on a symbolic relational, so fall back to ``sympy.Max``
-    when either side is symbolic. Two structurally equal expressions still collapse
-    to one, and numeric inputs take the plain ``max``."""
-    if isinstance(a, sympy.Basic) or isinstance(b, sympy.Basic):
-        return sympy.Max(a, b)
-    return max(a, b)
-
-
 def _fused_hbm_bytes(ops: list) -> tuple:
     """(read, write) HBM bytes for a FUSED bundle, counting each distinct EXTERNAL graph
     input (``ArgTraffic.is_graph_boundary`` on a read) ONCE even if several fused ops
@@ -1327,7 +1316,7 @@ def _fused_hbm_bytes(ops: list) -> tuple:
             b = a.hbm_elems() * o.dtype_bytes
             if a.role == "input" and a.is_graph_boundary:
                 if a.name in ext_in:
-                    ext_in[a.name] = _max_traffic(ext_in[a.name], b)
+                    ext_in[a.name] = max(ext_in[a.name], b)
                 else:
                     ext_in[a.name] = b
             elif a.role == "input":
@@ -1350,7 +1339,7 @@ def _clone_in_bytes(ops: list):
             b = a.clone_in_elems() * o.dtype_bytes
             if isinstance(b, int) and b == 0:
                 continue
-            ext_in[a.name] = _max_traffic(ext_in[a.name], b) if a.name in ext_in else b
+            ext_in[a.name] = max(ext_in[a.name], b) if a.name in ext_in else b
     return sum(ext_in.values())
 
 
@@ -1379,7 +1368,7 @@ def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
                 continue
             if a.is_graph_boundary:
                 if a.name in ext:
-                    ext[a.name] = (_max_traffic(ext[a.name][0], b), o.cores)
+                    ext[a.name] = (max(ext[a.name][0], b), o.cores)
                 else:
                     ext[a.name] = (b, o.cores)
             else:
@@ -1413,9 +1402,7 @@ def _shared_operand_read_excess(ops: list, p: "CostParams"):
             )
             if arg.is_graph_boundary:
                 external[arg.name] = (
-                    _max_traffic(external[arg.name], excess)
-                    if arg.name in external
-                    else excess
+                    max(external[arg.name], excess) if arg.name in external else excess
                 )
             else:
                 total += excess
@@ -1497,14 +1484,10 @@ def _partitioned_operand_read_excess(ops: list, p: "CostParams"):
             # reciprocal-split variables there, rather than into the Max's wide
             # integerized result, which can pass the solver's product bound.
             b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
-            excess = _max_traffic(
-                0, partitioned * (b / (op.cores * rate) - b / p.bw_peak_gbps)
-            )
+            excess = max(0, partitioned * (b / (op.cores * rate) - b / p.bw_peak_gbps))
             if arg.is_graph_boundary:
                 external[arg.name] = (
-                    _max_traffic(external[arg.name], excess)
-                    if arg.name in external
-                    else excess
+                    max(external[arg.name], excess) if arg.name in external else excess
                 )
             else:
                 total += excess
