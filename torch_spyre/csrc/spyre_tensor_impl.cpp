@@ -21,6 +21,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -67,6 +68,16 @@ static std::vector<int64_t> compute_host_stride(
   return host_stride;
 }
 
+std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
+    const std::vector<int64_t>& device_size) {
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
+
+  for (int64_t d = 0; d < static_cast<int64_t>(device_size.size()); ++d)
+    valid_elements[{d}] = device_size[d];
+
+  return valid_elements;
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
@@ -99,6 +110,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->stride_map.resize(2);
     this->stride_map[0] = -1;
     this->stride_map[1] = -1;
+    this->valid_elements[{0, 1}] = 1;
     return;
   }
 
@@ -139,14 +151,27 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                  host_strides[host_dim] * host_size[host_dim]);
   };
 
-  // Process the trailing within-stick dimension first (finest granularity).
+  std::map<int32_t, std::vector<int64_t>> groups;
+  auto update_valid_elements = [&](int32_t host_dim, int dev_idx) {
+    groups[host_dim].push_back(static_cast<int64_t>(dev_idx));
+  };
+
+  // Process each device dimension: update stride map and group by host dim.
+  // Trailing within-stick dimension first (finest granularity).
   update_stride(stick_dim, host_rank);
+  update_valid_elements(stick_dim, host_rank);
 
   // Remaining device dimensions in back-to-front order.
   for (int i = host_rank - 1; i >= 0; --i) {
     int32_t host_dim = dim_order[i];
     int dev_idx = (i == 0) ? (host_rank - 1) : (i - 1);
     update_stride(host_dim, dev_idx);
+    update_valid_elements(host_dim, dev_idx);
+  }
+
+  for (auto& [h, key] : groups) {
+    std::sort(key.begin(), key.end());
+    this->valid_elements[key] = (sparse && h == stick_dim) ? 1 : host_size[h];
   }
 }
 
@@ -173,21 +198,21 @@ std::string SpyreTensorLayout::toString() const {
     ss << ", element_arrangement=ElementArrangement.";
     ss << spyre::elementArrangementToString(this->element_arrangement);
   }
-  if (!this->tile_size.empty()) {
-    ss << ", tile_size={";
-    bool first = true;
-    for (const auto& [dims, size] : this->tile_size) {
-      if (!first) ss << ", ";
-      first = false;
-      ss << "[";
-      for (size_t i = 0; i < dims.size(); i++) {
-        ss << dims[i];
-        if (i + 1 < dims.size()) ss << ", ";
-      }
-      ss << "]: " << size;
+  ss << ", valid_elements={";
+  bool first = true;
+  for (const auto& [dims, size] : this->valid_elements) {
+    if (!first) ss << ", ";
+    first = false;
+    ss << "(";
+    for (size_t i = 0; i < dims.size(); i++) {
+      ss << dims[i];
+      if (i + 1 < dims.size()) ss << ", ";
     }
-    ss << "}";
+    // Single-element tuples need trailing comma in Python
+    if (dims.size() == 1) ss << ",";
+    ss << "): " << size;
   }
+  ss << "}";
   ss << ")";
   return ss.str();
 }
