@@ -237,11 +237,13 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
+    // Include valid_elements in this comparison once all call sites have
+    // migrated away from the deprecated (device_size, stride_map, device_dtype)
+    // constructor, which is incorrect when padding is present.
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement &&
-           this->valid_elements == other.valid_elements;
+           this->element_arrangement == other.element_arrangement;
   }
 };
 
