@@ -29,6 +29,7 @@ from torch_spyre._inductor.pass_utils import (
     reorder_valid_elements,
     restickify_valid_elements,
 )
+from utils_inductor import DEVICE
 
 
 def test_reduction_iteration_space_ignores_weak_dependencies(monkeypatch):
@@ -250,18 +251,18 @@ def test_restickify_valid_elements_unrelated_dims_unchanged():
     assert result == {(0,): 2, (1,): 8, (2, 3): 4}
 
 
-def test_restickify_valid_elements_outer_and_stick_in_separate_groups():
-    """outer_dim and stick_dim each in their own group: both update independently."""
-    _ds = [4, 8, 64]
-    stl = _stl(_ds, [512, 64, 1], {(0,): 4, (1,): 8, (2,): 64})
+def test_restickify_valid_elements_outermost_becomes_new_stick():
+    """Stick moves to the outermost dim; the unrelated middle dim is unchanged."""
+    _ds = [2, 4, 8, 64]
+    stl = _stl(_ds, [2048, 512, 64, 1], {(0,): 2, (1,): 4, (2, 3): 8})
     result = restickify_valid_elements(
         stl,
-        old_sd_outer_dim=1,
+        old_sd_outer_dim=2,
         old_sd_host_size=8,
         new_sd_outer_dim=0,
-        new_sd_host_size=4,
+        new_sd_host_size=2,
     )
-    assert result == {(0,): 8, (1,): 4, (2,): 4}
+    assert result == {(0,): 8, (1,): 4, (2, 3): 2}
 
 
 def test_restickify_valid_elements_preserves_all_keys():
@@ -275,3 +276,91 @@ def test_restickify_valid_elements_preserves_all_keys():
         new_sd_host_size=5,
     )
     assert set(result.keys()) == {(0,), (1,), (2, 3)}
+
+
+# Propagation through compiled ops: send tensors to device, compile the op,
+# check that the output tensor's valid_elements match the input's.
+
+
+def _to_spyre(t: torch.Tensor) -> torch.Tensor:
+    return t.to(DEVICE)
+
+
+def test_compiled_relu_output_valid_elements_match_input():
+    """Compiled relu (stick-aligned input): output valid_elements == input."""
+    x_dev = _to_spyre(torch.randn(40, 128, dtype=torch.float16))
+    inp_ve = x_dev.device_tensor_layout().valid_elements
+
+    out = torch.compile(torch.relu, backend="inductor")(x_dev)
+
+    assert out.device_tensor_layout().valid_elements == inp_ve
+
+
+def test_compiled_relu_padded_output_valid_elements_match_input():
+    """Compiled relu (non-stick-aligned: 60 < 64): output valid_elements == input."""
+    # [40, 60]: last dim 60 is not a multiple of 64, so the stick is partially filled.
+    x_dev = _to_spyre(torch.randn(40, 60, dtype=torch.float16))
+    inp_ve = x_dev.device_tensor_layout().valid_elements
+
+    out = torch.compile(torch.relu, backend="inductor")(x_dev)
+
+    assert out.device_tensor_layout().valid_elements == inp_ve
+
+
+def test_compiled_add_output_valid_elements_match_input():
+    """Compiled add (stick-aligned inputs): output valid_elements == input."""
+    a_dev = _to_spyre(torch.randn(40, 128, dtype=torch.float16))
+    b_dev = _to_spyre(torch.randn(40, 128, dtype=torch.float16))
+    inp_ve = a_dev.device_tensor_layout().valid_elements
+
+    out = torch.compile(torch.add, backend="inductor")(a_dev, b_dev)
+
+    assert out.device_tensor_layout().valid_elements == inp_ve
+
+
+def test_compiled_add_padded_output_valid_elements_match_input():
+    """Compiled add (non-stick-aligned: 60 < 64): output valid_elements == input."""
+    a_dev = _to_spyre(torch.randn(40, 60, dtype=torch.float16))
+    b_dev = _to_spyre(torch.randn(40, 60, dtype=torch.float16))
+    inp_ve = a_dev.device_tensor_layout().valid_elements
+
+    out = torch.compile(torch.add, backend="inductor")(a_dev, b_dev)
+
+    assert out.device_tensor_layout().valid_elements == inp_ve
+
+
+def test_compiled_transpose_restickify_valid_elements():
+    """Transpose moving the stick dim triggers restickify; output valid_elements
+    must reflect the new stick host size.
+
+    Input:  [2, 256, 128] fp16 — stick on H=128 (last host dim).
+    After transpose(1, 2): [2, 128, 256] — stick now covers S=256.
+    Output stick group valid count must be S=256, not H=128.
+    """
+    B, S, H = 2, 256, 128
+    x_dev = _to_spyre(torch.randn(B, S, H, dtype=torch.float16))
+
+    out = torch.compile(lambda x: x.transpose(1, 2).clone(), backend="inductor")(x_dev)
+
+    out_stl = out.device_tensor_layout()
+    stick_dim = len(out_stl.device_size) - 1
+    stick_key = next(k for k in out_stl.valid_elements if stick_dim in k)
+    assert out_stl.valid_elements[stick_key] == S
+
+
+def test_compiled_transpose_restickify_padded_valid_elements():
+    """Same as above with a non-stick-aligned S=60; stick group valid count must
+    be 60, not the padded device size of 64.
+
+    Input:  [2, 60, 128] fp16 — stick on H=128.
+    After transpose(1, 2): [2, 128, 60] — stick now covers S=60.
+    """
+    B, S, H = 2, 60, 128
+    x_dev = _to_spyre(torch.randn(B, S, H, dtype=torch.float16))
+
+    out = torch.compile(lambda x: x.transpose(1, 2).clone(), backend="inductor")(x_dev)
+
+    out_stl = out.device_tensor_layout()
+    stick_dim = len(out_stl.device_size) - 1
+    stick_key = next(k for k in out_stl.valid_elements if stick_dim in k)
+    assert out_stl.valid_elements[stick_key] == S
