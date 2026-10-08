@@ -127,11 +127,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->device_size[host_rank] = this->elems_per_stick();
 
   this->stride_map.assign(dev_rank, 0);
-  std::vector<int64_t> last_stride(host_size.size(), 0);
+  std::vector<int64_t> last_stride(host_size.size(), -1);
 
   auto update_stride = [&](int32_t host_dim, int dev_idx) {
     if (host_dim == -1 || host_size[host_dim] == 1) return;
-    this->stride_map[dev_idx] = last_stride[host_dim] == 0
+    this->stride_map[dev_idx] = last_stride[host_dim] == -1
                                     ? host_strides[host_dim]
                                     : last_stride[host_dim];
     last_stride[host_dim] =
