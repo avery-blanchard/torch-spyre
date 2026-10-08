@@ -233,10 +233,12 @@ def _dma_to_spyre_indirect_access(
         )
         return None
 
+    _device_size_emb = [rows, d // eps, eps]
     layout = SpyreTensorLayout(
-        [rows, d // eps, eps],  # device_size: vocab dim outermost
+        _device_size_emb,  # device_size: vocab dim outermost
         [d, eps, 1],  # stride_map
         get_device_dtype(dev_dtype),
+        {(i,): _device_size_emb[i] for i in range(len(_device_size_emb))},
     )
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
@@ -321,10 +323,12 @@ def dma_moe_expert_weight_to_spyre(
         )
         return None
 
+    _device_size_moe = [experts, contract, free // eps, eps]
     layout = SpyreTensorLayout(
-        [experts, contract, free // eps, eps],
+        _device_size_moe,
         [contract * free, free, eps, 1],
         get_device_dtype(dev_dtype),
+        {(i,): _device_size_moe[i] for i in range(len(_device_size_moe))},
     )
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
@@ -356,10 +360,12 @@ def dma_moe_per_expert_scale_to_spyre(
 
     widened = scale[:, None].expand(-1, eps).contiguous()
 
+    _device_size_scale = [experts, 1, eps]
     layout = SpyreTensorLayout(
-        [experts, 1, eps],
+        _device_size_scale,
         [eps, eps, 1],
         get_device_dtype(dev_dtype),
+        {(i,): _device_size_scale[i] for i in range(len(_device_size_scale))},
     )
     dst = spyre_empty_with_layout(
         widened.size(), widened.stride(), dev_dtype, layout, device=device

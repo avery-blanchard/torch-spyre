@@ -1096,10 +1096,12 @@ class _GatherMulticoreScenarios:
         V, E = 262144, 2816
         eps = get_elem_in_stick(torch.float16)
         stick_count = (E + eps - 1) // eps
+        _stl_ds = [V, stick_count, eps]
         stl = SpyreTensorLayout(
-            device_size=[V, stick_count, eps],
+            device_size=_stl_ds,
             stride_map=[E, eps, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _stl_ds[i] for i in range(len(_stl_ds))},
         )
         table = torch.rand(V, E, dtype=torch.float16).to("spyre", device_layout=stl)
         token_ids = torch.randint(0, V, (2, 128), dtype=torch.int64).to("spyre")

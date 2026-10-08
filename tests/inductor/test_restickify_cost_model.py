@@ -253,15 +253,19 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
 
 
 def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypatch):
+    _src_ds = [33280, 8, 2, 64]
     src = SpyreTensorLayout(
-        device_size=[33280, 8, 2, 64],
+        device_size=_src_ds,
         stride_map=[1024, 128, 64, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(i,): _src_ds[i] for i in range(len(_src_ds))},
     )
+    _dst_ds = [8, 16, 128, 64]
     dst = SpyreTensorLayout(
-        device_size=[8, 16, 128, 64],
+        device_size=_dst_ds,
         stride_map=[131072, 64, 1024, 1],
         device_dtype=DataFormats.SEN169_FP16,
+        valid_elements={(i,): _dst_ds[i] for i in range(len(_dst_ds))},
     )
     read = MemoryDep("input", N * 1024 + B * 128 + X, (B, X, N), (8, 128, 1024))
     write = MemoryDep("output", B * 131072 + X * 1024 + N, (B, X, N), (8, 128, 1024))
@@ -306,6 +310,7 @@ def staged_transport_graph():
                 device_size=device_size,
                 stride_map=stride_map,
                 device_dtype=DataFormats.SEN169_FP16,
+                valid_elements={(i,): device_size[i] for i in range(len(device_size))},
             ),
         )
 

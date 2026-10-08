@@ -2565,10 +2565,12 @@ def test_size1_grow_prepends_size64_gap_dim():
     # _C.SpyreTensorLayout takes device_size LITERALLY (unlike torch.spyre's
     # SpyreTensorLayout, which treats the first arg as a host shape and re-derives
     # the device layout); we assert on exact device dims here.
+    _stl_ds = list(_SIZE1_COLLAPSED_DEVICE_SIZE)
     stl = _CSpyreTensorLayout(
-        list(_SIZE1_COLLAPSED_DEVICE_SIZE),
+        _stl_ds,
         list(_SIZE1_COLLAPSED_STRIDE_MAP),
         DataFormats.SEN169_FP16,
+        {(i,): _stl_ds[i] for i in range(len(_stl_ds))},
         ElementArrangement.STANDARD,
     )
     layout = FixedTiledLayout(

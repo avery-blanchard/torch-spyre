@@ -40,6 +40,7 @@ class TestScatterCopyInsertion(unittest.TestCase):
             device_size=device_size,
             stride_map=stride_map,
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): device_size[i] for i in range(len(device_size))},
         )
 
     def test_scatter_dim0_slot_major_no_unnecessary_copy(self):

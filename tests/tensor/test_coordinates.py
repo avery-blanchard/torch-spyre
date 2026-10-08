@@ -605,8 +605,18 @@ class TestUnrepresentableStickCandidates(TestCase):
         dev = self._dtype()
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         dep = MemoryDep("buf", 4096 * d0 + d2, (d0, d1, d2), (512, 4096, 4096))
-        bad = SpyreTensorLayout([512, 128, 1, 1, 64], [4096, 1, 8192, -1, 128], dev)
-        good = SpyreTensorLayout([512, 1, 1, 64], [4096, -1, -1, 1], dev)
+        bad = SpyreTensorLayout(
+            [512, 128, 1, 1, 64],
+            [4096, 1, 8192, -1, 128],
+            dev,
+            {(0,): 512, (1,): 128, (2,): 1, (3,): 1, (4,): 64},
+        )
+        good = SpyreTensorLayout(
+            [512, 1, 1, 64],
+            [4096, -1, -1, 1],
+            dev,
+            {(0,): 512, (1,): 1, (2,): 1, (3,): 64},
+        )
         return dep, bad, good
 
     def test_device_coordinates_raises_try_returns_none(self):
@@ -724,6 +734,7 @@ class TestFactorizedMatmulCandidates(TestCase):
                 [64, 2, 32, 64],
                 [4096, 64, 128, 1],
                 get_device_dtype(torch.float16),
+                {(0,): 64, (1,): 2, (2,): 32, (3,): 64},
             )
         else:
             source = SpyreTensorLayout(
@@ -737,7 +748,12 @@ class TestFactorizedMatmulCandidates(TestCase):
     def test_canonicalization_is_independent_of_candidate_order(self):
         """Canonical layout is returned regardless of candidate list order."""
         dtype = get_device_dtype(torch.float16)
-        factorized = SpyreTensorLayout([8, 2, 32, 64], [4096, 64, 128, 1], dtype)
+        factorized = SpyreTensorLayout(
+            [8, 2, 32, 64],
+            [4096, 64, 128, 1],
+            dtype,
+            {(0,): 8, (1,): 2, (2,): 32, (3,): 64},
+        )
         canonical = SpyreTensorLayout(
             [1, 8, 4096], [32768, 4096, 1], torch.float16, [0, 1, 2]
         )
@@ -799,6 +815,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [8, 2, 32, 64],
             [4096, 64, 128, 1],
             dtype,
+            {(0,): 8, (1,): 2, (2,): 32, (3,): 64},
             ElementArrangement.QFP8WT,
         )
         arg, contraction = self._scenario([qfp8wt])
@@ -833,11 +850,13 @@ class TestFactorizedMatmulCandidates(TestCase):
             [512, 12, 1, 4, 64],
             [768, 64, 64, 393216, 1],
             get_device_dtype(torch.float16),
+            {(0,): 512, (1,): 12, (2,): 1, (3,): 4, (4,): 64},
         )
         weight = SpyreTensorLayout(
             [12, 768, 64],
             [49152, 1, 768],
             get_device_dtype(torch.float16),
+            {(0,): 12, (1,): 768, (2,): 64},
         )
         x = PropArg(x_dep, x_host, [source])
         y = PropArg(y_dep, y_host, [weight])
@@ -890,6 +909,7 @@ class TestFactorizedMatmulCandidates(TestCase):
             [512, 24, 1, 4, 32],
             [768, 32, 32, 393216, 1],
             get_device_dtype(torch.float32),
+            {(0,): 512, (1,): 24, (2,): 1, (3,): 4, (4,): 32},
         )
         self.assertIsNone(
             _flat_dense_projection_x_layout(
@@ -950,11 +970,13 @@ class TestFactorizedMatmulCandidates(TestCase):
             [12, M, B, 64],
             [64, K, M * K, 1],
             get_device_dtype(torch.float16),
+            {(0,): 12, (1,): M, (2,): B, (3,): 64},
         )
         weight = SpyreTensorLayout(
             [12, K, B, 64],
             [64, N, K * N, 1],
             get_device_dtype(torch.float16),
+            {(0,): 12, (1,): K, (2,): B, (3,): 64},
         )
 
         result = _flat_dense_projection_x_layout(

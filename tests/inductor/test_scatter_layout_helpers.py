@@ -44,10 +44,12 @@ class TestDimOrderCompliance(unittest.TestCase):
 
     def test_indirect_at_position_0_is_compliant(self):
         """Indirect dim at device position 0 (outermost): compliant."""
+        _ds = [8, 2, 64, 1]
         stl = SpyreTensorLayout(
-            device_size=[8, 2, 64, 1],
+            device_size=_ds,
             stride_map=[128, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
         )
         # stride_idx from right: 3 (rightmost coordinate)
         # device_pos = 4 - 1 - 3 = 0 ✓
@@ -55,10 +57,12 @@ class TestDimOrderCompliance(unittest.TestCase):
 
     def test_indirect_at_position_1_non_compliant(self):
         """Indirect dim at device position 1: non-compliant."""
+        _ds = [2, 8, 64, 1]
         stl = SpyreTensorLayout(
-            device_size=[2, 8, 64, 1],
+            device_size=_ds,
             stride_map=[512, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
         )
         # stride_idx from right: 2
         # device_pos = 4 - 1 - 2 = 1 ✗
@@ -66,10 +70,12 @@ class TestDimOrderCompliance(unittest.TestCase):
 
     def test_indirect_at_position_2_non_compliant(self):
         """Indirect dim at device position 2: non-compliant."""
+        _ds = [2, 4, 64, 1]
         stl = SpyreTensorLayout(
-            device_size=[2, 4, 64, 1],
+            device_size=_ds,
             stride_map=[256, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
         )
         # stride_idx from right: 1
         # device_pos = 4 - 1 - 1 = 2 ✗
@@ -138,10 +144,12 @@ class TestIaRotateStl(unittest.TestCase):
 
     def test_rotate_indirect_to_position_0(self):
         """Rotates indirect dim from position 2 to position 0."""
+        _ds = [2, 4, 8, 1]
         original_stl = SpyreTensorLayout(
-            device_size=[2, 4, 8, 1],
+            device_size=_ds,
             stride_map=[256, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
         )
         required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=2)
 
@@ -154,10 +162,12 @@ class TestIaRotateStl(unittest.TestCase):
 
     def test_already_at_position_0_unchanged(self):
         """Returns same STL when indirect already at position 0."""
+        _ds = [8, 2, 64, 1]
         original_stl = SpyreTensorLayout(
-            device_size=[8, 2, 64, 1],
+            device_size=_ds,
             stride_map=[128, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
         )
         required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=0)
 
@@ -166,10 +176,12 @@ class TestIaRotateStl(unittest.TestCase):
 
     def test_rotate_indirect_from_position_1(self):
         """Rotates indirect dim from position 1 to position 0."""
+        _ds = [2, 8, 64, 1]
         original_stl = SpyreTensorLayout(
-            device_size=[2, 8, 64, 1],
+            device_size=_ds,
             stride_map=[512, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
+            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
         )
         required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=1)
 
@@ -185,10 +197,12 @@ class TestDenseScatterSourceStl(unittest.TestCase):
     def test_preserves_logical_dtype_and_element_arrangement(self):
         host_size = [1, 64, 8, 2, 1, 128]
         host_stride = [131072, 2048, 256, 128, 128, 1]
+        _ds = [128, 8, 4, 1, 64]
         source_stl = SpyreTensorLayout(
-            [128, 8, 4, 1, 64],
+            _ds,
             [256, 32768, 64, 262144, 1],
             get_device_dtype(torch.bfloat16),
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.FP32_TO_DL16,
         )
         layout = FixedTiledLayout(

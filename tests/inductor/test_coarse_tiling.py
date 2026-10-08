@@ -2041,6 +2041,7 @@ class TestDivideRanges(unittest.TestCase):
             [1, 256, 64],
             [64, 64, 1],
             expected.device_dtype,
+            {(0,): 1, (1,): 256, (2,): 64},
             expected.element_arrangement,
         )
         self.assertNotEqual(layout.device_layout, buggy)
@@ -2188,7 +2189,13 @@ class TestDivideRanges(unittest.TestCase):
         dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
         # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
         # is a non-stick dim of the same size (512), so they collide by size.
-        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        _ds_stl = [32, 512, 8, 1, 64]
+        stl = SpyreTensorLayout(
+            _ds_stl,
+            [512, 16384, 64, -1, 1],
+            dev,
+            {(i,): _ds_stl[i] for i in range(len(_ds_stl))},
+        )
         host_size = [1, 32, 512, 512]
 
         # Fallback (no identity): size-based elimination is ambiguous -> raise.
@@ -9969,8 +9976,13 @@ class TestValidateTiling(unittest.TestCase):
         spec = TileSpec((TileAxis(1, 2),))
         self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
         dl = op.layout.device_layout
+        _ds = [64, 80, 1, 64]
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+            _ds,
+            [5120, 64, -1, 1],
+            dl.device_dtype,
+            {(i,): _ds[i] for i in range(len(_ds))},
+            dl.element_arrangement,
         )
         self.assertIsNone(predict_frame(op, spec))
 

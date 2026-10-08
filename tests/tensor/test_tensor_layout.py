@@ -57,7 +57,10 @@ class TestSpyreTensorLayout(TestCase):
             # Both normal and shortened/sparse trailing extents occupy full
             # sticks. Empty outer geometry remains empty after FP8 rescaling.
             for outer, inner in [(3, eps), (3, 1), (0, eps)]:
-                stl = SpyreTensorLayout([outer, inner], [eps, 1], df, ea)
+                _ds = [outer, inner]
+                stl = SpyreTensorLayout(
+                    _ds, [eps, 1], df, {(i,): _ds[i] for i in range(len(_ds))}, ea
+                )
                 expected = outer * eps * bits // 8
                 self.assertEqual(get_device_size_in_bytes(stl), expected)
                 self.assertEqual(
@@ -85,7 +88,10 @@ class TestSpyreTensorLayout(TestCase):
         # Explicit transfer encodings differ from default compute storage.
         x = torch.arange(64, dtype=dtype)
         eps = df.elems_per_stick()
-        stl = SpyreTensorLayout([64 // eps, eps], [eps, 1], df)
+        _ds = [64 // eps, eps]
+        stl = SpyreTensorLayout(
+            _ds, [eps, 1], df, {(i,): _ds[i] for i in range(len(_ds))}
+        )
         y = x.to("spyre", device_layout=stl)
         self.assertEqual(y.device_tensor_layout().device_dtype, df)
         self.assertEqual(y.cpu(), x)
@@ -147,7 +153,10 @@ class TestSpyreTensorLayout(TestCase):
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
         stl_y = SpyreTensorLayout(
-            [4, 512, 64], [64, 256, 1], get_device_dtype(torch.float16)
+            [4, 512, 64],
+            [64, 256, 1],
+            get_device_dtype(torch.float16),
+            {(0,): 4, (1,): 512, (2,): 64},
         )
         self.assertEqual(stl_x.stride_map, stl_y.stride_map)
         self.assertEqual(stl_x.device_size, stl_y.device_size)
@@ -226,7 +235,10 @@ class TestSpyreTensorLayout(TestCase):
 
         y = torch.rand([512, 512], dtype=torch.float16)
         y_stl = SpyreTensorLayout(
-            [8, 512, 64], [64, 512, 1], get_device_dtype(torch.float16)
+            [8, 512, 64],
+            [64, 512, 1],
+            get_device_dtype(torch.float16),
+            {(0,): 8, (1,): 512, (2,): 64},
         )
         y_dev = y.to(device_layout=y_stl)
         self.assertEqual(y, y_dev.cpu(), atol=1e-3, rtol=1e-3)
@@ -285,7 +297,10 @@ class TestSpyreTensorLayout(TestCase):
     def test_to_spyre_layout_explicit(self, sizes, strides, device_size, stride_map):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -312,7 +327,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -328,7 +346,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -344,7 +365,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -363,7 +387,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -382,7 +409,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -408,7 +438,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -428,7 +461,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -446,7 +482,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -468,7 +507,10 @@ class TestSpyreTensorLayout(TestCase):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[sizes[0] // 2 :]
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x_sliced.to(device_layout=x_stl)
         self.assertEqual(x_sliced, x_dev.cpu())
@@ -526,7 +568,10 @@ class TestSpyreTensorLayout(TestCase):
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
+            device_size,
+            stride_map,
+            get_device_dtype(torch.float16),
+            {(i,): device_size[i] for i in range(len(device_size))},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -675,10 +720,12 @@ class TestSpyreTensorLayout(TestCase):
         def project(x, weight, residual):
             return torch.nn.functional.linear(x, weight) + residual
 
+        _fact_ds = [L, D // 64, H, 64]
         factorized_layout = SpyreTensorLayout(
-            [L, D // 64, H, 64],
+            _fact_ds,
             [hidden, 64, D, 1],
             get_device_dtype(torch.float16),
+            {(i,): _fact_ds[i] for i in range(len(_fact_ds))},
         )
         flattened = x.to(device_layout=factorized_layout)
         self.assertEqual(flattened.device_tensor_layout(), factorized_layout)
@@ -744,14 +791,22 @@ class TestSpyreTensorLayout(TestCase):
         fp32 = get_device_dtype(torch.float32)
         # One fp32 stick (32 elements): 1 * 32 // 64 == 0 going to fp16.
         one_stick = SpyreTensorLayout(
-            [1, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+            [1, 4, 32],
+            [32, 32, 1],
+            fp32,
+            {(0,): 1, (1,): 4, (2,): 32},
+            ElementArrangement.STANDARD,
         )
         with self.assertRaisesRegex(Unsupported, "not a whole number of 64-element"):
             rescale_stl_for_dtype(one_stick, torch.float16, ElementArrangement.STANDARD)
         # Three fp32 sticks (96 elements): flooring to one fp16 stick would
         # silently drop 32 elements.
         three_sticks = SpyreTensorLayout(
-            [3, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+            [3, 4, 32],
+            [32, 32, 1],
+            fp32,
+            {(0,): 3, (1,): 4, (2,): 32},
+            ElementArrangement.STANDARD,
         )
         with self.assertRaisesRegex(Unsupported, "3 stick\\(s\\) of 32 elements"):
             rescale_stl_for_dtype(
@@ -759,7 +814,11 @@ class TestSpyreTensorLayout(TestCase):
             )
         # An exact ratio rescales as before.
         two_sticks = SpyreTensorLayout(
-            [2, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+            [2, 4, 32],
+            [32, 32, 1],
+            fp32,
+            {(0,): 2, (1,): 4, (2,): 32},
+            ElementArrangement.STANDARD,
         )
         rescaled = rescale_stl_for_dtype(
             two_sticks, torch.float16, ElementArrangement.STANDARD
@@ -778,21 +837,33 @@ class TestSpyreTensorLayout(TestCase):
 
         fp16 = get_device_dtype(torch.float16)
         one_stick = SpyreTensorLayout(
-            [1, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
+            [1, 4, 64],
+            [64, 64, 1],
+            fp16,
+            {(0,): 1, (1,): 4, (2,): 64},
+            ElementArrangement.STANDARD,
         )
         out = _qfp8ch_stl(one_stick, torch.float8_e4m3fn)
         self.assertEqual(list(out.device_size), [1, 4, 128])
         self.assertEqual(list(out.stride_map), [128, 64, 1])
         self.assertEqual(out.element_arrangement, ElementArrangement.QFP8CH)
         three_sticks = SpyreTensorLayout(
-            [3, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
+            [3, 4, 64],
+            [64, 64, 1],
+            fp16,
+            {(0,): 3, (1,): 4, (2,): 64},
+            ElementArrangement.STANDARD,
         )
         self.assertEqual(
             list(_qfp8ch_stl(three_sticks, torch.float8_e4m3fn).device_size),
             [2, 4, 128],
         )
         two_sticks = SpyreTensorLayout(
-            [2, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
+            [2, 4, 64],
+            [64, 64, 1],
+            fp16,
+            {(0,): 2, (1,): 4, (2,): 64},
+            ElementArrangement.STANDARD,
         )
         self.assertEqual(
             list(_qfp8ch_stl(two_sticks, torch.float8_e4m3fn).device_size), [1, 4, 128]
@@ -812,18 +883,36 @@ class TestSpyreTensorLayout(TestCase):
             RuntimeError, "device dimension 0 has negative size -1"
         ):
             SpyreTensorLayout(
-                [-1, 4, 64], [64, 32, 1], fp16, ElementArrangement.STANDARD
+                [-1, 4, 64],
+                [64, 32, 1],
+                fp16,
+                {(0,): -1, (1,): 4, (2,): 64},
+                ElementArrangement.STANDARD,
             )
         empty = SpyreTensorLayout(
-            [0, 4, 64], [64, 32, 1], fp16, ElementArrangement.STANDARD
+            [0, 4, 64],
+            [64, 32, 1],
+            fp16,
+            {(0,): 0, (1,): 4, (2,): 64},
+            ElementArrangement.STANDARD,
         )
         self.assertEqual(list(empty.device_size), [0, 4, 64])
         self.assertEqual(get_device_size_in_bytes(empty), 0)
         with self.assertRaisesRegex(RuntimeError, "stride_map has 2 entries for 3"):
-            SpyreTensorLayout([1, 4, 64], [64, 1], fp16, ElementArrangement.STANDARD)
+            SpyreTensorLayout(
+                [1, 4, 64],
+                [64, 1],
+                fp16,
+                {(0,): 1, (1,): 4, (2,): 64},
+                ElementArrangement.STANDARD,
+            )
         # -1 (size-1 / sparse) and 0 (broadcast) stride entries stay legal.
         ok = SpyreTensorLayout(
-            [1, 4, 64], [-1, 0, 1], fp16, ElementArrangement.STANDARD
+            [1, 4, 64],
+            [-1, 0, 1],
+            fp16,
+            {(0,): 1, (1,): 4, (2,): 64},
+            ElementArrangement.STANDARD,
         )
         self.assertEqual(list(ok.device_size), [1, 4, 64])
 

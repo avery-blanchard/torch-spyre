@@ -550,16 +550,17 @@ class TestBuildingBlocks(unittest.TestCase):
         # Match the factorized physical layout emitted by Granite's compiled
         # Q projection and RoPE path while retaining logical BHLD strides.
         elems_per_stick = SpyreTensorLayout(query.shape, dtype).elems_per_stick()
+        _query_ds = [
+            head_dim // elems_per_stick,
+            1,
+            1,
+            1,
+            1,
+            query_heads,
+            elems_per_stick,
+        ]
         query_layout = SpyreTensorLayout(
-            device_size=[
-                head_dim // elems_per_stick,
-                1,
-                1,
-                1,
-                1,
-                query_heads,
-                elems_per_stick,
-            ],
+            device_size=_query_ds,
             stride_map=[
                 elems_per_stick,
                 -1,
@@ -570,6 +571,7 @@ class TestBuildingBlocks(unittest.TestCase):
                 1,
             ],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={(i,): _query_ds[i] for i in range(len(_query_ds))},
         )
 
         expected = sdpa(query, key, value, mask)

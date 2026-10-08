@@ -370,10 +370,12 @@ class TestEmptyLxEligibility(unittest.TestCase):
         empty = _fixed_tiled_layout((0, 64))
         nonempty = _fixed_tiled_layout((64, 64))
         zero_extent = _fixed_tiled_layout((64, 64))
+        _ds = [1, 0, 64]
         zero_extent.device_layout = SpyreTensorLayout(
-            [1, 0, 64],
+            _ds,
             [64, 64, 1],
             DataFormats.SEN169_FP16,
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.STANDARD,
         )
         self.assertEqual(
@@ -1818,13 +1820,23 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
         fp16 = get_device_dtype(torch.float16)
         x = torch.randn(self._X_SHAPE, dtype=torch.float16)
         w = torch.randn(self._W_SHAPE, dtype=torch.float16)
+        _x_ds = [32, 32, 1, 1, 64]
         x_dev = x.to(
             device_layout=SpyreTensorLayout(
-                [32, 32, 1, 1, 64], [1, 32, -1, 65536, 1024], fp16
+                _x_ds,
+                [1, 32, -1, 65536, 1024],
+                fp16,
+                {(i,): _x_ds[i] for i in range(len(_x_ds))},
             )
         )
+        _w_ds = [3, 3, 1, 1, 64]
         w_dev = w.to(
-            device_layout=SpyreTensorLayout([3, 3, 1, 1, 64], [1, 3, -1, 9, 9], fp16)
+            device_layout=SpyreTensorLayout(
+                _w_ds,
+                [1, 3, -1, 9, 9],
+                fp16,
+                {(i,): _w_ds[i] for i in range(len(_w_ds))},
+            )
         )
         return x, w, x_dev, w_dev
 

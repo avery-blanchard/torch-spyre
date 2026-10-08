@@ -9662,9 +9662,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+        x_layout = SpyreTensorLayout(
+            dev_layout[0],
+            dev_stride[0],
+            device_dtype_fp16,
+            {(i,): dev_layout[0][i] for i in range(len(dev_layout[0]))},
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            {(i,): dev_layout[1][i] for i in range(len(dev_layout[1]))},
         )
 
         x_dev = x.to(device_layout=x_layout)

@@ -96,6 +96,7 @@ def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
         device_size=device_size,
         stride_map=stride_map,
         device_dtype=get_device_dtype(dtype),
+        valid_elements={(i,): device_size[i] for i in range(len(device_size))},
     )
 
 

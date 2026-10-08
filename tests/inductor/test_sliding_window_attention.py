@@ -142,8 +142,9 @@ def _to_cache_position_first(tensor):
 
     batch, kvheads, capacity, head_dim = tensor.shape
     eps = SpyreTensorLayout(list(tensor.shape), tensor.dtype).elems_per_stick()
+    _ds = [capacity, kvheads, (head_dim + eps - 1) // eps, batch, eps]
     layout = SpyreTensorLayout(
-        device_size=[capacity, kvheads, (head_dim + eps - 1) // eps, batch, eps],
+        device_size=_ds,
         stride_map=[
             head_dim,
             capacity * head_dim,
@@ -152,6 +153,7 @@ def _to_cache_position_first(tensor):
             1,
         ],
         device_dtype=get_device_dtype(tensor.dtype),
+        valid_elements={(i,): _ds[i] for i in range(len(_ds))},
     )
     return tensor.to("spyre", device_layout=layout)
 
