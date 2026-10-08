@@ -274,9 +274,10 @@ def prepend_dim_valid_elements(
     stl: SpyreTensorLayout,
     new_dim_size: int,
 ) -> dict[tuple[int, ...], int]:
-    """Add a new outermost device dimension at index 0, shifting all existing dim indices by +1.
+    """Add a new outermost device dimension at index 0.
 
-    The new dim at index 0 has new_dim_size valid elements.
+    Shifts all existing dim indices by +1. The new dim at index 0 has
+    new_dim_size valid elements.
     """
     shifted = {
         tuple(d + 1 for d in key): val for key, val in stl.valid_elements.items()

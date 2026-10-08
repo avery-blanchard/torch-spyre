@@ -237,11 +237,26 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
-    return this->device_size == other.device_size &&
-           this->stride_map == other.stride_map &&
-           this->device_dtype == other.device_dtype &&
-           this->element_arrangement == other.element_arrangement &&
-           this->valid_elements == other.valid_elements;
+    if (this->device_size != other.device_size ||
+        this->stride_map != other.stride_map ||
+        this->device_dtype != other.device_dtype ||
+        this->element_arrangement != other.element_arrangement) {
+      return false;
+    }
+    return valid_elements_per_dim() == other.valid_elements_per_dim();
+  }
+
+  // Flatten valid_elements to a per-dim map so layouts built with the
+  // device_size/stride_map constructor (singleton groups) compare equal to
+  // those built with the host constructor (stick dims grouped together).
+  std::map<int64_t, int64_t> valid_elements_per_dim() const {
+    std::map<int64_t, int64_t> result;
+    for (const auto& [dims, val] : this->valid_elements) {
+      for (int64_t d : dims) {
+        result[d] = val;
+      }
+    }
+    return result;
   }
 };
 
@@ -311,10 +326,8 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
-    for (const auto& [dims, size] : layout.valid_elements) {
-      seed = c10::hash_combine(seed, std::hash<size_t>{}(dims.size()));
-      for (int64_t d : dims)
-        seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
+    for (const auto& [d, size] : layout.valid_elements_per_dim()) {
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
       seed = c10::hash_combine(seed, std::hash<int64_t>{}(size));
     }
     return seed;
