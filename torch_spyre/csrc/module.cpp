@@ -290,7 +290,7 @@ PYBIND11_MODULE(_C, m) {
       [](const std::map<std::vector<int64_t>, int64_t>& ve) {
         py::dict result;
         for (const auto& [dims, count] : ve) {
-          result[py::cast(dims)] = count;
+          result[py::tuple(py::cast(dims))] = count;
         }
         return result;
       };
@@ -398,7 +398,9 @@ PYBIND11_MODULE(_C, m) {
               // cast Python tuple keys directly to std::vector<int64_t>.
               std::map<std::vector<int64_t>, int64_t> valid_elements_map;
               for (auto item : t[5].cast<py::dict>()) {
-                auto key = item.first.cast<std::vector<int64_t>>();
+                std::vector<int64_t> key;
+                for (auto elem : item.first.cast<py::tuple>())
+                  key.push_back(elem.cast<int64_t>());
                 valid_elements_map[std::move(key)] =
                     item.second.cast<int64_t>();
               }
@@ -412,19 +414,6 @@ PYBIND11_MODULE(_C, m) {
                   std::to_string(version));
             }
           }));
-
-  m.def(
-      "compute_valid_elements",
-      [valid_elements_to_pydict](
-          const std::vector<int64_t>& host_size,
-          const std::vector<int64_t>& host_strides,
-          const std::vector<int64_t>& stride_map,
-          const std::vector<int64_t>& device_size) -> py::dict {
-        return valid_elements_to_pydict(spyre::compute_valid_elements(
-            host_size, host_strides, stride_map, device_size));
-      },
-      py::arg("host_size"), py::arg("host_strides"), py::arg("stride_map"),
-      py::arg("device_size"));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),

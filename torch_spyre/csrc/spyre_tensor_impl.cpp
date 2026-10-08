@@ -138,56 +138,25 @@ static std::vector<int64_t> dim_map_to_stride_map(
 
 std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& host_size,
-    const std::vector<int64_t>& host_strides,
-    const std::vector<int64_t>& stride_map,
-    const std::vector<int64_t>& device_size) {
-  TORCH_CHECK(stride_map.size() == device_size.size(),
-              "compute_valid_elements: stride_map.size() (", stride_map.size(),
-              ") != device_size.size() (", device_size.size(), ")");
-  TORCH_CHECK(host_size.size() == host_strides.size(),
-              "compute_valid_elements: host_size.size() (", host_size.size(),
-              ") != host_strides.size() (", host_strides.size(), ")");
+    const std::vector<int32_t>& dim_order) {
+  const int host_rank = static_cast<int>(host_size.size());
+  bool sparse = dim_order.back() == -1;
+  int32_t stick_dim = dim_order[host_rank - 1];
 
-  const int host_rank = static_cast<int>(host_strides.size());
-  const int device_rank = static_cast<int>(stride_map.size());
-  const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
+  // Device layout: [dim_order[1], ..., dim_order[N-1], dim_order[0],
+  //                 dim_order[N-1]]
+  // Group device dims by their host dim and emit valid counts.
+  std::map<int32_t, std::vector<int64_t>> groups;
+  for (int i = 1; i < host_rank; ++i)
+    groups[dim_order[i]].push_back(static_cast<int64_t>(i - 1));
+  groups[dim_order[0]].push_back(static_cast<int64_t>(host_rank - 1));
+  groups[stick_dim].push_back(static_cast<int64_t>(host_rank));
 
-  // Assign each device dim to a host dim, writing directly into groups.
-  // Guard on host_size[i]==1 prevents spurious matches when host strides
-  // repeat; assigned[] prevents double-assignment.
-  // stick_host_h tracks which host dim owns device_rank-1 for the fixup below.
-  std::vector<bool> assigned(device_rank, false);
-  std::map<int, std::vector<int64_t>> groups;
-  int stick_host_h = -1;
-
-  for (int i = 0; i < host_rank; ++i) {
-    if (host_strides[i] == 0 || host_size[i] == 1) continue;
-    for (int j = 0; j < device_rank; ++j) {
-      if (device_size[j] == 1 || assigned[j]) continue;
-      if (j == stick_dim_index) continue;  // assigned by fixup below
-      if (host_strides[i] <= stride_map[j]) {
-        groups[i].push_back(static_cast<int64_t>(j));
-        assigned[j] = true;
-        if (j == device_rank - 1) stick_host_h = i;
-      }
-    }
-  }
-
-  // stick_dim_index and device_rank-1 always share a group.
-  // Use host_rank as sentinel when the stick host dim has size 1 (value = 1).
-  if (device_rank > 1)
-    groups[(stick_host_h == -1) ? host_rank : stick_host_h].push_back(
-        static_cast<int64_t>(stick_dim_index));
-
-  // Emit grouped dims and singletons for unassigned dims.
   std::map<std::vector<int64_t>, int64_t> valid_elements;
-  for (int j = 0; j < device_rank; ++j) {
-    if (!assigned[j] && j != stick_dim_index)
-      valid_elements[{static_cast<int64_t>(j)}] = device_size[j];
+  for (auto& [h, key] : groups) {
+    std::sort(key.begin(), key.end());
+    valid_elements[key] = (sparse && h == stick_dim) ? 1 : host_size[h];
   }
-  for (auto& [h, key] : groups)
-    valid_elements[key] = (h == host_rank) ? 1 : host_size[h];
-
   return valid_elements;
 }
 
@@ -259,8 +228,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
   this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
                                            this->device_size);
-  this->valid_elements = compute_valid_elements(
-      host_size, host_strides, this->stride_map, this->device_size);
+  this->valid_elements = compute_valid_elements(host_size, dim_order);
 }
 
 std::string SpyreTensorLayout::toString() const {

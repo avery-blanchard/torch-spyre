@@ -35,9 +35,7 @@ int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
 std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& host_size,
-    const std::vector<int64_t>& host_strides,
-    const std::vector<int64_t>& stride_map,
-    const std::vector<int64_t>& device_size);
+    const std::vector<int32_t>& dim_order);
 std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& device_size);
 /* Describes how device coordinates are arranged in memory.
