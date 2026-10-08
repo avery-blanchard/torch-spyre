@@ -135,12 +135,15 @@ def _resize_device_layout(
       ``element_arrangement``) is propagated verbatim so both buffers agree on
       physical layout and scatter-copy address arithmetic is correct.
 
-    ``stride_map`` semantics: a value of ``0`` means "this device dimension has
-    extent 1 and is never stepped through; its stride is undefined."  When
-    growing back from a singleton (``orig_sm[j] == 0``), the stride is
-    recomputed from the new host stride (the rescue arm in Passes 2–4).  For
-    non-contiguous (transposed / col-major) dims, the *physical* stride on
-    device is invariant to resizing, so it is left unchanged.
+    ``stride_map`` semantics: a value of ``0`` means "every access lands at
+    host coordinate zero along this dimension; its stride is undefined."  This
+    covers size-1 dims (broadcast collapsed to one element), broadcast dims
+    with device_size > 1 (every device coordinate reads the same host element),
+    and gap dims inserted by padding.  When growing back from such a dim
+    (``orig_sm[j] == 0``), the stride is recomputed from the new host stride
+    (the rescue arm in Passes 2–4).  For non-contiguous (transposed / col-major)
+    dims, the *physical* stride on device is invariant to resizing, so it is
+    left unchanged.
 
     Device-dim classification (as produced by ``get_generic_stick_layout``):
 

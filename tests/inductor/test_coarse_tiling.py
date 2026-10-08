@@ -9587,9 +9587,9 @@ class TestPredictFrame(unittest.TestCase):
         size-1 host dim by size alone (ir.py:236) -- no stride tiebreak, no
         one-to-one constraint -- so once level 1 puts host dim 0 at extent 1,
         level 2 re-matches the one-stick tile-count dim onto it and collapses
-        its stride to the ``-1`` sentinel.  A single resize never sees that
-        intermediate state and leaves the real stride there, predicting
-        stride_map [64, 64, -1, 1] against an applied [64, -1, -1, 1].
+        its stride to ``0``.  A single resize never sees that intermediate
+        state and leaves the real stride there, predicting stride_map
+        [64, 64, 0, 1] against an applied [64, 0, 0, 1].
 
         Needs all three: a dim tiled to extent 1, at a non-final level, with a
         stick host dim of exactly one stick (64 elems at fp16) so a second
