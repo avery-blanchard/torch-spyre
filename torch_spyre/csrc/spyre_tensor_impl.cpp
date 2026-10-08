@@ -141,8 +141,6 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& host_strides,
     const std::vector<int64_t>& stride_map,
     const std::vector<int64_t>& device_size) {
-  std::map<std::vector<int64_t>, int64_t> valid_elements;
-
   TORCH_CHECK(stride_map.size() == device_size.size(),
               "compute_valid_elements: stride_map.size() (", stride_map.size(),
               ") != device_size.size() (", device_size.size(), ")");
@@ -150,98 +148,45 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
               "compute_valid_elements: host_size.size() (", host_size.size(),
               ") != host_strides.size() (", host_strides.size(), ")");
 
-  const int host_rank = host_strides.size();
-  const int device_rank = stride_map.size();
+  const int host_rank = static_cast<int>(host_strides.size());
+  const int device_rank = static_cast<int>(stride_map.size());
   const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
 
-  // Group device dim indices that map to the same host dim.
-  // Each device dim is assigned to exactly one host dim; the mapped flag
-  // prevents re-assignment. Since we iterate host dims from outermost (largest
-  // stride) to innermost, the first match is always the correct host dim.
-  std::vector<bool> mapped(device_rank, false);
-  std::map<int, std::vector<int>> groups_by_host;
+  // Assign each device dim to a host dim, writing directly into groups.
+  // Guard on host_size[i]==1 prevents spurious matches when host strides
+  // repeat; assigned[] prevents double-assignment.
+  // stick_host_h tracks which host dim owns device_rank-1 for the fixup below.
+  std::vector<bool> assigned(device_rank, false);
+  std::map<int, std::vector<int64_t>> groups;
+  int stick_host_h = -1;
 
   for (int i = 0; i < host_rank; ++i) {
-    int64_t hst = host_strides[i];
-
-    if (hst == 0) continue;
-    if (host_size[i] == 1) {
-      // Size-1 host dims map to device dims with stride_map==-1 and
-      // device_size==1. Without device_dim_map we can't pair each host dim
-      // to its specific device dim, so we emit each such device dim as its
-      // own singleton {j}:1 entry via the unmapped sweep below rather than
-      // grouping them here. Just skip without marking anything mapped.
-      continue;
-    }
-
+    if (host_strides[i] == 0 || host_size[i] == 1) continue;
     for (int j = 0; j < device_rank; ++j) {
-      if (device_size[j] == 1 || mapped[j]) continue;
-      int64_t dst = stride_map[j];
-      if (hst <= dst) {
-        groups_by_host[i].push_back(j);
-        mapped[j] = true;
+      if (device_size[j] == 1 || assigned[j]) continue;
+      if (j == stick_dim_index) continue;  // assigned by fixup below
+      if (host_strides[i] <= stride_map[j]) {
+        groups[i].push_back(static_cast<int64_t>(j));
+        assigned[j] = true;
+        if (j == device_rank - 1) stick_host_h = i;
       }
     }
   }
 
-  // stick_dim_index (stick-count) and device_rank-1 (stick-elements) must
-  // always share a group — they represent the same host dimension from two
-  // device-side perspectives.
-  //
-  // Case 1: device_rank-1 is already grouped (normal path). Find that group
-  // and append stick_dim_index if it isn't there yet.
-  //
-  // Case 2: device_rank-1 is unmapped (the stick host dim has size 1, so
-  // stride_map[device_rank-1]==-1 was never picked up by the main loop).
-  // Create a synthetic group {stick_dim_index, device_rank-1} with value 1.
-  if (device_rank > 1) {
-    if (!mapped[device_rank - 1]) {
-      // Stick host dim has size 1: both stick dims go together with value 1.
-      std::vector<int64_t> key = {static_cast<int64_t>(stick_dim_index),
-                                  static_cast<int64_t>(device_rank - 1)};
-      std::sort(key.begin(), key.end());
-      valid_elements[key] = 1;
-      mapped[stick_dim_index] = true;
-      mapped[device_rank - 1] = true;
-    } else {
-      // Normal path: device_rank-1 is in some group; move stick_dim_index
-      // into that same group (whether it was unmapped or in the wrong group).
-      int last_dev_host = -1;
-      int stick_host = -1;
-      for (auto& [h, group] : groups_by_host) {
-        for (int d : group) {
-          if (d == device_rank - 1) last_dev_host = h;
-          if (d == stick_dim_index) stick_host = h;
-        }
-      }
-      if (stick_host == -1) {
-        // Unmapped: append to the correct group.
-        groups_by_host[last_dev_host].push_back(stick_dim_index);
-        mapped[stick_dim_index] = true;
-      } else if (stick_host != last_dev_host) {
-        // Wrong group: move it.
-        auto& src = groups_by_host[stick_host];
-        src.erase(std::remove(src.begin(), src.end(), stick_dim_index),
-                  src.end());
-        if (src.empty()) groups_by_host.erase(stick_host);
-        groups_by_host[last_dev_host].push_back(stick_dim_index);
-      }
-    }
-  }
+  // stick_dim_index and device_rank-1 always share a group.
+  // Use host_rank as sentinel when the stick host dim has size 1 (value = 1).
+  if (device_rank > 1)
+    groups[(stick_host_h == -1) ? host_rank : stick_host_h].push_back(
+        static_cast<int64_t>(stick_dim_index));
 
-  // Create valid_elements for the groups
-  for (auto& [h, group] : groups_by_host) {
-    std::sort(group.begin(), group.end());
-    std::vector<int64_t> key(group.begin(), group.end());
-    valid_elements[key] = host_size[h];
-  }
-
-  // Handle unmapped dimensions
+  // Emit grouped dims and singletons for unassigned dims.
+  std::map<std::vector<int64_t>, int64_t> valid_elements;
   for (int j = 0; j < device_rank; ++j) {
-    if (!mapped[j]) {
+    if (!assigned[j] && j != stick_dim_index)
       valid_elements[{static_cast<int64_t>(j)}] = device_size[j];
-    }
   }
+  for (auto& [h, key] : groups)
+    valid_elements[key] = (h == host_rank) ? 1 : host_size[h];
 
   return valid_elements;
 }
@@ -250,12 +195,12 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     const std::vector<int64_t>& device_size) {
   std::map<std::vector<int64_t>, int64_t> valid_elements;
 
-  for (int d = 0; d < static_cast<int>(device_size.size()); d++) {
-    valid_elements[{static_cast<int64_t>(d)}] = device_size[d];
-  }
+  for (int64_t d = 0; d < static_cast<int64_t>(device_size.size()); ++d)
+    valid_elements[{d}] = device_size[d];
 
   return valid_elements;
 }
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
@@ -279,6 +224,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
   this->device_dtype = sen_dtype_dev;
+
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(2);
@@ -340,23 +286,21 @@ std::string SpyreTensorLayout::toString() const {
     ss << ", element_arrangement=ElementArrangement.";
     ss << spyre::elementArrangementToString(this->element_arrangement);
   }
-  if (!this->valid_elements.empty()) {
-    ss << ", valid_elements={";
-    bool first = true;
-    for (const auto& [dims, size] : this->valid_elements) {
-      if (!first) ss << ", ";
-      first = false;
-      ss << "(";
-      for (size_t i = 0; i < dims.size(); i++) {
-        ss << dims[i];
-        if (i + 1 < dims.size()) ss << ", ";
-      }
-      // Single-element tuples need trailing comma in Python
-      if (dims.size() == 1) ss << ",";
-      ss << "): " << size;
+  ss << ", valid_elements={";
+  bool first = true;
+  for (const auto& [dims, size] : this->valid_elements) {
+    if (!first) ss << ", ";
+    first = false;
+    ss << "(";
+    for (size_t i = 0; i < dims.size(); i++) {
+      ss << dims[i];
+      if (i + 1 < dims.size()) ss << ", ";
     }
-    ss << "}";
+    // Single-element tuples need trailing comma in Python
+    if (dims.size() == 1) ss << ",";
+    ss << "): " << size;
   }
+  ss << "}";
   ss << ")";
   return ss.str();
 }

@@ -34,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "job_plan.h"
@@ -285,6 +286,15 @@ PYBIND11_MODULE(_C, m) {
       .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
+  auto valid_elements_to_pydict =
+      [](const std::map<std::vector<int64_t>, int64_t>& ve) {
+        py::dict result;
+        for (const auto& [dims, count] : ve) {
+          result[py::cast(dims)] = count;
+        }
+        return result;
+      };
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
@@ -294,15 +304,8 @@ PYBIND11_MODULE(_C, m) {
                     &spyre::SpyreTensorLayout::element_arrangement)
       .def_property_readonly(
           "valid_elements",
-          [](const spyre::SpyreTensorLayout& stl) {
-            // Convert vector keys to tuple keys for Python
-            // hashability
-            py::dict result;
-            for (const auto& [dims, count] : stl.valid_elements) {
-              py::tuple key = py::cast(dims);
-              result[key] = count;
-            }
-            return result;
+          [valid_elements_to_pydict](const spyre::SpyreTensorLayout& stl) {
+            return valid_elements_to_pydict(stl.valid_elements);
           })
       .def("with_element_arrangement",
            &spyre::SpyreTensorLayout::with_element_arrangement,
@@ -339,21 +342,17 @@ PYBIND11_MODULE(_C, m) {
            py::arg("device_dtype"), py::arg("valid_elements"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(py::pickle(
-          [](const spyre::SpyreTensorLayout& p) {  // __getstate__
+          [valid_elements_to_pydict](
+              const spyre::SpyreTensorLayout& p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
             // If the pickle format changes, then update
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
-            // Convert valid_elements vector keys to tuple keys for pickling
-            py::dict valid_elements_tupled;
-            for (const auto& [dims, count] : p.valid_elements) {
-              py::tuple key = py::cast(dims);
-              valid_elements_tupled[key] = count;
-            }
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
                                   p.device_size, p.stride_map, p.device_dtype,
-                                  p.element_arrangement, valid_elements_tupled);
+                                  p.element_arrangement,
+                                  valid_elements_to_pydict(p.valid_elements));
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -400,8 +399,8 @@ PYBIND11_MODULE(_C, m) {
               std::map<std::vector<int64_t>, int64_t> valid_elements_map;
               for (auto item : t[5].cast<py::dict>()) {
                 auto key = item.first.cast<std::vector<int64_t>>();
-                auto val = item.second.cast<int64_t>();
-                valid_elements_map[key] = val;
+                valid_elements_map[std::move(key)] =
+                    item.second.cast<int64_t>();
               }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
@@ -416,17 +415,13 @@ PYBIND11_MODULE(_C, m) {
 
   m.def(
       "compute_valid_elements",
-      [](const std::vector<int64_t>& host_size,
-         const std::vector<int64_t>& host_strides,
-         const std::vector<int64_t>& stride_map,
-         const std::vector<int64_t>& device_size) -> py::dict {
-        auto result = spyre::compute_valid_elements(host_size, host_strides,
-                                                    stride_map, device_size);
-        py::dict py_result;
-        for (const auto& [dims, size] : result) {
-          py_result[py::tuple(py::cast(dims))] = size;
-        }
-        return py_result;
+      [valid_elements_to_pydict](
+          const std::vector<int64_t>& host_size,
+          const std::vector<int64_t>& host_strides,
+          const std::vector<int64_t>& stride_map,
+          const std::vector<int64_t>& device_size) -> py::dict {
+        return valid_elements_to_pydict(spyre::compute_valid_elements(
+            host_size, host_strides, stride_map, device_size));
       },
       py::arg("host_size"), py::arg("host_strides"), py::arg("stride_map"),
       py::arg("device_size"));

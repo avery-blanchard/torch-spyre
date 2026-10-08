@@ -317,6 +317,7 @@ struct hash<spyre::SpyreTensorLayout> {
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
     for (const auto& [dims, size] : layout.valid_elements) {
+      seed = c10::hash_combine(seed, std::hash<size_t>{}(dims.size()));
       for (int64_t d : dims)
         seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
       seed = c10::hash_combine(seed, std::hash<int64_t>{}(size));
