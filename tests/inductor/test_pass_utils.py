@@ -138,8 +138,8 @@ def test_forward_valid_elements_returns_copy():
 
 def test_forward_valid_elements_independent_groups():
     _ds = [8, 4, 64]
-    stl = _stl(_ds, [256, 64, 1], {(0,): 8, (1,): 4, (2,): 64})
-    assert forward_valid_elements(stl) == {(0,): 8, (1,): 4, (2,): 64}
+    stl = _stl(_ds, [256, 64, 1], {(0,): 8, (1, 2): 4})
+    assert forward_valid_elements(stl) == {(0,): 8, (1, 2): 4}
 
 
 def test_forward_valid_elements_padded_valid_count_unchanged():
@@ -158,45 +158,36 @@ def test_reorder_valid_elements_swap_two_outer_dims():
 
 def test_reorder_valid_elements_identity_permutation():
     _ds = [4, 8, 64]
-    stl = _stl(_ds, [512, 64, 1], {(0,): 4, (1,): 8, (2,): 64})
-    assert reorder_valid_elements(stl, new_order=[0, 1, 2]) == {
-        (0,): 4,
-        (1,): 8,
-        (2,): 64,
-    }
+    stl = _stl(_ds, [512, 64, 1], {(0,): 4, (1, 2): 8})
+    assert reorder_valid_elements(stl, new_order=[0, 1, 2]) == {(0,): 4, (1, 2): 8}
 
 
 def test_reorder_valid_elements_cyclic_rotation():
-    """new_order=[1,2,0,3]: old dim 0→new 2, old 1→new 0, old 2→new 1."""
+    """new_order=[1,2,0,3]: old dim 0→new 2, old 1→new 0, old dim (2,3)→new (1,3)."""
     _ds = [2, 3, 5, 64]
-    stl = _stl(_ds, [960, 320, 64, 1], {(0,): 2, (1,): 3, (2,): 5, (3,): 64})
+    stl = _stl(_ds, [960, 320, 64, 1], {(0,): 2, (1,): 3, (2, 3): 5})
     assert reorder_valid_elements(stl, new_order=[1, 2, 0, 3]) == {
         (2,): 2,
         (0,): 3,
-        (1,): 5,
-        (3,): 64,
+        (1, 3): 5,
     }
 
 
 def test_reorder_valid_elements_grouped_dims_remapped():
-    """Multi-dim group (0,2): swap dims 0↔1 → group becomes (1,2)."""
+    """Multi-dim group (2,3): swap dims 0↔1 → group stays (2,3), outer dims swap."""
     _ds = [2, 4, 3, 64]
-    stl = _stl(_ds, [768, 192, 64, 1], {(0, 2): 6, (1,): 4, (3,): 64})
+    stl = _stl(_ds, [768, 192, 64, 1], {(0,): 2, (1,): 4, (2, 3): 3})
     assert reorder_valid_elements(stl, new_order=[1, 0, 2, 3]) == {
-        (1, 2): 6,
+        (1,): 2,
         (0,): 4,
-        (3,): 64,
+        (2, 3): 3,
     }
 
 
 def test_prepend_dim_valid_elements_shifts_existing_indices():
     _ds = [4, 64]
-    stl = _stl(_ds, [64, 1], {(0,): 4, (1,): 64})
-    assert prepend_dim_valid_elements(stl, new_dim_size=1) == {
-        (0,): 1,
-        (1,): 4,
-        (2,): 64,
-    }
+    stl = _stl(_ds, [64, 1], {(0, 1): 4})
+    assert prepend_dim_valid_elements(stl, new_dim_size=1) == {(0,): 1, (1, 2): 4}
 
 
 def test_prepend_dim_valid_elements_grouped_dims_shift():
