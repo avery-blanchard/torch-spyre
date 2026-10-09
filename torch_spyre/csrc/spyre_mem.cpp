@@ -31,6 +31,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -95,7 +96,17 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
   std::vector<int64_t> dcsi_sizes(device_rank, 1);
   std::vector<bool> set_by_group(device_rank, false);
 
-  // First pass: handle grouped keys.
+  // Remainder info: at most one partial-stick-row DCSI can arise (enforced by
+  // TORCH_CHECK below).  Stored as an optional to avoid heap allocation.
+  struct RemainderInfo {
+    std::vector<int64_t> size_overrides;  // device_rank entries, reversed later
+    int64_t host_off;
+    int64_t dev_off;
+  };
+  std::optional<RemainderInfo> remainder_opt;
+
+  // First pass: grouped {outer, inner} stick-pair keys.
+  // Computes dcsi_sizes for both dims and captures any partial-row remainder.
   for (const auto& [dims, valid_count] : stl.valid_elements) {
     if (dims.size() < 2) continue;
     TORCH_CHECK(dims.size() == 2, "valid_elements key with ", dims.size(),
@@ -107,10 +118,21 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
     const int64_t inner_size = stl.device_size[inner];
     TORCH_CHECK(inner_size > 0, "Invalid device size ", inner_size,
                 " for device dimension ", inner);
+    const int64_t tiled = valid_count / inner_size;
     dcsi_sizes[inner] = std::min(valid_count, inner_size);
-    dcsi_sizes[outer] = valid_count / inner_size;
+    dcsi_sizes[outer] = tiled;
     set_by_group[inner] = true;
     set_by_group[outer] = true;
+
+    const int64_t leftover = valid_count % inner_size;
+    if (leftover != 0) {
+      std::vector<int64_t> overrides(device_rank, 0);
+      overrides[inner] = leftover;
+      overrides[outer] = 1;
+      remainder_opt =
+          RemainderInfo{std::move(overrides), tiled * host_strides[outer],
+                        tiled * device_strides[outer]};
+    }
   }
 
   // Second pass: singleton groups and broadcast/sparse dims.
@@ -122,45 +144,14 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
     if (stl.stride_map[i] == 0) {
       dcsi_sizes[i] = stl.device_size[i];
     } else if (stl.stride_map[i] > 0) {
-      // Not set by a grouped key: use valid_elements_per_dim() singleton value.
       const auto it = ve.find(static_cast<int64_t>(i));
       dcsi_sizes[i] = it != ve.end() ? std::min(it->second, stl.device_size[i])
                                      : stl.device_size[i];
     }
   }
 
-  // Remainder DCSIs: for each grouped key where valid_count is not a multiple
-  // of the inner device extent, emit a second DCSI for the leftover partial
-  // row.
-  std::vector<std::vector<int64_t>> remainders;
-  std::vector<int64_t> host_offsets;
-  std::vector<int64_t> device_offsets;
-
-  for (const auto& [dims, valid_count] : stl.valid_elements) {
-    if (dims.size() < 2) continue;
-
-    const int inner = static_cast<int>(dims.back());
-    const int outer = static_cast<int>(dims[dims.size() - 2]);
-    const int64_t inner_size = stl.device_size[inner];
-
-    if (inner_size <= 1) continue;
-
-    const int64_t tiled_elements = dcsi_sizes[outer];
-    const int64_t leftover = valid_count % inner_size;
-    if (leftover == 0) continue;
-
-    // The remainder DCSI covers the leftover partial row.
-    std::vector<int64_t> remainder(device_rank, 0);
-    remainder[inner] = leftover;
-    remainder[outer] = 1;
-
-    remainders.push_back(remainder);
-    host_offsets.push_back(tiled_elements * host_strides[outer]);
-    device_offsets.push_back(tiled_elements * device_strides[outer]);
-  }
-
   // Build the template DCSI (strides, offsets) used for both the full-row DCSI
-  // and as the base from which remainder DCSIs are derived.
+  // and as the base from which any remainder DCSI is derived.
   DataConversionStrideInfo dcsi_template;
   dcsi_template.size_ = dcsi_sizes;
   dcsi_template.stride_src_ = host2device ? host_strides : device_strides;
@@ -173,48 +164,29 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
   std::reverse(dcsi_template.stride_dst_.begin(),
                dcsi_template.stride_dst_.end());
 
-  // Emit the full-row DCSI only when dcsi_sizes[outer] > 0.  When
+  // Emit the full-row DCSI only when no dcsi_sizes entry is zero.  When
   // valid_count < inner_size all valid elements fit in a single partial stick
   // row; in that case the only DCSI needed is the remainder one below.
   const bool has_full_rows = std::none_of(dcsi_sizes.begin(), dcsi_sizes.end(),
                                           [](int64_t s) { return s == 0; });
 
   std::vector<DataConversionStrideInfo> stride_infos;
-  if (has_full_rows) {
-    stride_infos.push_back(dcsi_template);
-  }
+  if (has_full_rows) stride_infos.push_back(dcsi_template);
 
-  TORCH_CHECK(remainders.size() <= 1, "Multiple remainder DCSIs (",
-              remainders.size(),
-              ") not supported;"
-              " at most one grouped valid_elements key may produce a partial"
-              " stick row");
-
-  // Emit a remainder DCSI for each partial stick row.
-  // When has_full_rows is false, stride_infos is empty and we derive the
-  // remainder directly from dcsi_template (no cross-product needed since there
-  // is at most one remainder per the TORCH_CHECK above).
-  for (size_t i = 0; i < remainders.size(); i++) {
-    std::reverse(remainders[i].begin(), remainders[i].end());
-    const int64_t offset_src =
-        host2device ? host_offsets[i] : device_offsets[i];
-    const int64_t offset_dst =
-        host2device ? device_offsets[i] : host_offsets[i];
-
-    const std::vector<DataConversionStrideInfo>& bases =
-        stride_infos.empty()
-            ? std::vector<DataConversionStrideInfo>{dcsi_template}
-            : stride_infos;
-    const size_t num_bases = bases.size();
-    for (size_t j = 0; j < num_bases; j++) {
-      DataConversionStrideInfo info = bases[j];
-      for (int k = 0; k < device_rank; k++) {
-        if (remainders[i][k] != 0) info.size_[k] = remainders[i][k];
-      }
-      info.offset_src_ += offset_src;
-      info.offset_dst_ += offset_dst;
-      stride_infos.push_back(info);
+  // Emit at most one remainder DCSI for the partial stick row (if any).
+  if (remainder_opt) {
+    auto& rem = *remainder_opt;
+    std::reverse(rem.size_overrides.begin(), rem.size_overrides.end());
+    const int64_t offset_src = host2device ? rem.host_off : rem.dev_off;
+    const int64_t offset_dst = host2device ? rem.dev_off : rem.host_off;
+    DataConversionStrideInfo info =
+        stride_infos.empty() ? dcsi_template : stride_infos[0];
+    for (int k = 0; k < device_rank; k++) {
+      if (rem.size_overrides[k] != 0) info.size_[k] = rem.size_overrides[k];
     }
+    info.offset_src_ += offset_src;
+    info.offset_dst_ += offset_dst;
+    stride_infos.push_back(info);
   }
 
   return stride_infos;
@@ -286,7 +258,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   int64_t dev_offset = dev_tensor->storage_offset();
   int64_t device_offset = 0;
 
-  const int device_rank = stl.stride_map.size();
+  const int device_rank = static_cast<int>(stl.stride_map.size());
 
   // Compute device_offset (element offset into the device_size coordinate
   // space) from dev_offset (the tensor's element storage offset).
@@ -341,28 +313,30 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // (cpu_stride==0) are excluded — their device dim handling is in the H2D
   // block below.
   {
-    // Build the set of strides that appear in the allocation's stride_map.
-    // A host dim at stride S contributes to capping only when every coarser
-    // host stride (> S) is also an allocation stride.  This guards against
-    // views that introduce extra dimensions above an allocation stride (e.g.
-    // b.view(64,8,512) adds a stride-4096 dim above stride-512), which must
-    // not cap the allocation's valid_count for the stride-512 group.  A true
-    // slice of the outer dimension has no extra coarser strides, so it caps
-    // correctly.
-    const int device_rank_local = static_cast<int>(stl.stride_map.size());
+    // Build alloc_strides: the set of positive stride_map values for the
+    // allocation. Used to determine whether a dev_strides value corresponds to
+    // an allocation dimension.
     std::set<int64_t> alloc_strides;
-    for (int i = 0; i < device_rank_local; i++) {
+    for (int i = 0; i < device_rank; i++) {
       const int64_t sm = stl.stride_map[i];
       if (sm > 0) alloc_strides.insert(sm);
     }
 
     const int host_rank = static_cast<int>(dev_sizes.size());
+    // In a single pass over dev_strides, build:
+    //   dev_stride_set: all positive dev strides (for absent-stride detection).
+    //   stride_to_host_size: alloc stride → logical size, but only for dims
+    //     whose every coarser dev stride is also an alloc stride.  This guards
+    //     against views that introduce extra outer dims above an alloc stride
+    //     (e.g. b.view(64,8,512) adds stride-4096 above stride-512) and would
+    //     otherwise incorrectly cap the valid_count for the stride-512 group.
+    std::set<int64_t> dev_stride_set;
     std::map<int64_t, int64_t> stride_to_host_size;
     for (int i = 0; i < host_rank; i++) {
       const int64_t s = dev_strides[i];
       if (s <= 0) continue;
+      dev_stride_set.insert(s);
       if (alloc_strides.find(s) == alloc_strides.end()) continue;
-      // Check that all coarser dev strides are also allocation strides.
       bool coarser_all_in_alloc = true;
       for (int j = 0; j < host_rank; j++) {
         if (dev_strides[j] > s &&
@@ -372,13 +346,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
         }
       }
       if (!coarser_all_in_alloc) continue;
-      stride_to_host_size[s] = dev_sizes[i];
-    }
-    // Build the set of strides present in dev_strides for the absent-stride
-    // check.
-    std::set<int64_t> dev_stride_set;
-    for (int i = 0; i < host_rank; i++) {
-      if (dev_strides[i] > 0) dev_stride_set.insert(dev_strides[i]);
+      // Use max to handle duplicate strides (e.g. unsqueeze(-1) adds a size-1
+      // dim with the same stride as the real inner dim); the larger size wins.
+      auto [sit, sinserted] = stride_to_host_size.emplace(s, dev_sizes[i]);
+      if (!sinserted) sit->second = std::max(sit->second, dev_sizes[i]);
     }
 
     for (auto& [dims, valid_count] : stl.valid_elements) {
