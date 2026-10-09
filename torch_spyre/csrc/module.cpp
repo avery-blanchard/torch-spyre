@@ -387,27 +387,15 @@ PYBIND11_MODULE(_C, m) {
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
                   t[4].cast<spyre::ElementArrangement>());
             } else if (version == 4) {
-              // Version 4: (version, device_size, stride_map, device_dtype,
-              // element_arrangement, valid_elements)
               if (t.size() != 6) {
                 throw py::value_error(
                     "Invalid SpyreTensorLayout pickle v4: wrong tuple size");
               }
-              // valid_elements was pickled as a dict with tuple keys; convert
-              // back to map<vector<int64_t>, int64_t> since pybind11 cannot
-              // cast Python tuple keys directly to std::vector<int64_t>.
-              std::map<std::vector<int64_t>, int64_t> valid_elements_map;
-              for (auto item : t[5].cast<py::dict>()) {
-                std::vector<int64_t> key;
-                for (auto elem : item.first.cast<py::tuple>())
-                  key.push_back(elem.cast<int64_t>());
-                valid_elements_map[std::move(key)] =
-                    item.second.cast<int64_t>();
-              }
               return spyre::SpyreTensorLayout(
                   t[1].cast<std::vector<int64_t>>(),
                   t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
-                  valid_elements_map, t[4].cast<spyre::ElementArrangement>());
+                  t[5].cast<std::map<std::vector<int64_t>, int64_t>>(),
+                  t[4].cast<spyre::ElementArrangement>());
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +

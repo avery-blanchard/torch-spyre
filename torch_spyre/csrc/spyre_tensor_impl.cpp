@@ -110,7 +110,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   int32_t stick_dim = dim_order[host_rank - 1];
   int64_t stick_size = sparse ? 1 : this->elems_per_stick();
 
-  // Compute device extent: stick dims split into stick count and stick size
   auto compute_extent = [&](int32_t host_dim) -> int64_t {
     if (host_dim == -1) return 1;
     if (host_dim == stick_dim) {
@@ -119,8 +118,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     return host_size[host_dim];
   };
 
-  // Device layout (generic stick):
-  // [dim_order[1],...,dim_order[-1], dim_order[0], dim_order[-1]]
   this->device_size.resize(dev_rank);
   for (int i = 1; i < host_rank; ++i) {
     this->device_size[i - 1] = compute_extent(dim_order[i]);
@@ -146,12 +143,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     groups[host_dim].push_back(static_cast<int64_t>(dev_idx));
   };
 
-  // Process each device dimension: update stride map and group by host dim.
-  // Trailing within-stick dimension first (finest granularity).
   update_stride(stick_dim, host_rank);
   update_valid_elements(stick_dim, host_rank);
 
-  // Remaining device dimensions in back-to-front order.
   for (int i = host_rank - 1; i >= 0; --i) {
     int32_t host_dim = dim_order[i];
     int dev_idx = (i == 0) ? (host_rank - 1) : (i - 1);
@@ -198,7 +192,6 @@ std::string SpyreTensorLayout::toString() const {
       ss << dims[i];
       if (i + 1 < dims.size()) ss << ", ";
     }
-    // Single-element tuples need trailing comma in Python
     if (dims.size() == 1) ss << ",";
     ss << "): " << size;
   }

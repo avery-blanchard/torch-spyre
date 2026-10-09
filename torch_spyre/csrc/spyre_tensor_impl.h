@@ -94,8 +94,22 @@ class SpyreTensorLayout {
   ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
   /**
-   * Maps device dimension to the number of valid (non-padded)
-   * elements.
+   * Maps groups of device dimensions to their valid (non-padded) element
+   * count. Each entry covers the device dimensions that originate from a
+   * single host dimension: the key is a sorted list of those device-dimension
+   * indices, and the value is the host dimension's extent.
+   *
+   * Example: a 7×100 tensor in fp16 (64 elems/stick) has device_size
+   * [2, 7, 64] and valid_elements {[0,2]:100, [1]:7} — device dims 0 and 2
+   * together hold 100 real elements from the stick dimension (128 allocated),
+   * and device dim 1 holds 7 real elements from the outer dimension.
+   *
+   * Invariants:
+   *   - Keys are pairwise disjoint and together cover every device-dimension
+   *     index exactly once.
+   *   - Each key is sorted in ascending index order. For generic-stick layouts
+   *     this coincides with decreasing-significance order, but custom layouts
+   *     make no such guarantee.
    */
   std::map<std::vector<int64_t>, int64_t> valid_elements;
 
