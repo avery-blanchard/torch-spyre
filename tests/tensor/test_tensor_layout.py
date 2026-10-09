@@ -17,7 +17,6 @@
 import copy
 import pickle
 import unittest
-from collections import defaultdict
 
 import torch
 from torch.testing._internal.common_utils import (
@@ -30,48 +29,15 @@ from torch.spyre import SpyreTensorLayout, get_device_dtype
 from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
 
 
-def _valid_elements_for_explicit_layout(sizes, strides, stride_map):
-    """Build valid_elements for an explicitly-constructed SpyreTensorLayout.
+def _valid_elements_for_explicit_layout(sizes, strides, dim_order, dtype=torch.float16):
+    """Return valid_elements that init() produces for these host sizes/strides/dim_order.
 
-    Groups device dims by the host dim they belong to, using stride_map
-    to match device dims to host dims via host strides.  Device dims whose
-    stride_map value does not appear in strides (outer-count dims) are
-    assigned to the host dim that another device dim in the same logical
-    group already claimed.
+    Constructs a canonical SpyreTensorLayout via the host-based constructor
+    and extracts its valid_elements.  This gives the correct device-dim grouping
+    for whatever dim_order the explicit layout was designed with.
     """
-    # Direct matches: stride_map[d] == some host stride.
-    stride_to_host = {s: (i, sz) for i, (s, sz) in enumerate(zip(strides, sizes))}
-    # host_dim_index -> list of device dims
-    groups: dict[int, list[int]] = defaultdict(list)
-    unmatched: list[int] = []
-    for d, sm in enumerate(stride_map):
-        if sm in stride_to_host:
-            groups[stride_to_host[sm][0]].append(d)
-        elif sm > 0:
-            unmatched.append(d)
-
-    # Assign unmatched dims to their host dim group.  An unmatched "count" dim d
-    # has stride_map[d] == partner_sm * N for some N; the correct partner is the
-    # one with the *largest* dividing stride (to avoid matching the stride-1 dim
-    # that divides everything).
-    for d in unmatched:
-        sm = stride_map[d]
-        best_hdim = None
-        best_partner_sm = 0
-        for hdim, dev_dims in groups.items():
-            for partner in dev_dims:
-                partner_sm = stride_map[partner]
-                if (
-                    partner_sm > 0
-                    and sm % partner_sm == 0
-                    and partner_sm > best_partner_sm
-                ):
-                    best_partner_sm = partner_sm
-                    best_hdim = hdim
-        if best_hdim is not None:
-            groups[best_hdim].append(d)
-
-    return {tuple(sorted(dev_dims)): sizes[hdim] for hdim, dev_dims in groups.items()}
+    canonical = SpyreTensorLayout(sizes, strides, dtype, dim_order)
+    return canonical.valid_elements
 
 
 @instantiate_parametrized_tests
@@ -317,84 +283,86 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(w_slice, w_dev.cpu(), atol=1e-3, rtol=1e-3)
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,dim_order",
         [
-            ([60], [1], [1, 64], [60, 1]),
-            ([64], [1], [1, 64], [64, 1]),
-            ([120], [1], [2, 64], [64, 1]),
-            ([128], [1], [2, 64], [64, 1]),
-            ([240], [1], [4, 64], [64, 1]),
-            ([256], [1], [4, 64], [64, 1]),
-            ([40, 60], [60, 1], [1, 60, 64], [60 * 60, 1, 60]),
-            ([40, 60], [60, 1], [1, 40, 64], [60, 60, 1]),
-            ([40, 64], [64, 1], [1, 64, 64], [60 * 64, 1, 64]),
-            ([40, 64], [64, 1], [1, 40, 64], [64, 64, 1]),
-            ([40, 120], [120, 1], [1, 120, 64], [120 * 64, 1, 120]),
-            ([40, 120], [120, 1], [2, 40, 64], [64, 120, 1]),
-            ([40, 128], [128, 1], [1, 128, 64], [128 * 40, 1, 128]),
-            ([40, 128], [128, 1], [2, 40, 64], [64, 128, 1]),
-            ([40, 240], [240, 1], [1, 240, 64], [240 * 40, 1, 240]),
-            ([40, 240], [240, 1], [4, 40, 64], [64, 240, 1]),
-            ([40, 256], [256, 1], [1, 256, 64], [256 * 40, 1, 256]),
-            ([40, 256], [256, 1], [4, 40, 64], [64, 256, 1]),
+            ([60], [1], [1, 64], [60, 1], [0]),
+            ([64], [1], [1, 64], [64, 1], [0]),
+            ([120], [1], [2, 64], [64, 1], [0]),
+            ([128], [1], [2, 64], [64, 1], [0]),
+            ([240], [1], [4, 64], [64, 1], [0]),
+            ([256], [1], [4, 64], [64, 1], [0]),
+            ([40, 60], [60, 1], [1, 60, 64], [60 * 60, 1, 60], [1, 0]),
+            ([40, 60], [60, 1], [1, 40, 64], [60, 60, 1], [0, 1]),
+            ([40, 64], [64, 1], [1, 64, 64], [60 * 64, 1, 64], [1, 0]),
+            ([40, 64], [64, 1], [1, 40, 64], [64, 64, 1], [0, 1]),
+            ([40, 120], [120, 1], [1, 120, 64], [120 * 64, 1, 120], [1, 0]),
+            ([40, 120], [120, 1], [2, 40, 64], [64, 120, 1], [0, 1]),
+            ([40, 128], [128, 1], [1, 128, 64], [128 * 40, 1, 128], [1, 0]),
+            ([40, 128], [128, 1], [2, 40, 64], [64, 128, 1], [0, 1]),
+            ([40, 240], [240, 1], [1, 240, 64], [240 * 40, 1, 240], [1, 0]),
+            ([40, 240], [240, 1], [4, 40, 64], [64, 240, 1], [0, 1]),
+            ([40, 256], [256, 1], [1, 256, 64], [256 * 40, 1, 256], [1, 0]),
+            ([40, 256], [256, 1], [4, 40, 64], [64, 256, 1], [0, 1]),
         ],
     )
-    def test_to_spyre_layout_explicit(self, sizes, strides, device_size, stride_map):
+    def test_to_spyre_layout_explicit(
+        self, sizes, strides, device_size, stride_map, dim_order
+    ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_for_explicit_layout(sizes, strides, stride_map),
+            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,dim_order",
         [
-            ([40, 60], [60, 1], [1, 512, 64], [60 * 60, 1, 60]),
-            ([40, 60], [60, 1], [1, 512, 64], [60, 60, 1]),
-            ([40, 64], [64, 1], [1, 512, 64], [64 * 40, 1, 64]),
-            ([40, 64], [64, 1], [1, 512, 64], [64, 64, 1]),
-            ([40, 120], [120, 1], [1, 512, 64], [120 * 40, 1, 120]),
-            ([40, 120], [120, 1], [2, 512, 64], [64, 120, 1]),
-            ([40, 128], [128, 1], [1, 512, 64], [128 * 40, 1, 128]),
-            ([40, 128], [128, 1], [2, 512, 64], [64, 128, 1]),
-            ([40, 240], [240, 1], [1, 512, 64], [240 * 40, 1, 240]),
-            ([40, 240], [240, 1], [4, 512, 64], [64, 240, 1]),
-            ([40, 256], [256, 1], [1, 512, 64], [256 * 40, 1, 256]),
-            ([40, 256], [256, 1], [4, 512, 64], [64, 256, 1]),
+            ([40, 60], [60, 1], [1, 512, 64], [60 * 60, 1, 60], [1, 0]),
+            ([40, 60], [60, 1], [1, 512, 64], [60, 60, 1], [0, 1]),
+            ([40, 64], [64, 1], [1, 512, 64], [64 * 40, 1, 64], [1, 0]),
+            ([40, 64], [64, 1], [1, 512, 64], [64, 64, 1], [0, 1]),
+            ([40, 120], [120, 1], [1, 512, 64], [120 * 40, 1, 120], [1, 0]),
+            ([40, 120], [120, 1], [2, 512, 64], [64, 120, 1], [0, 1]),
+            ([40, 128], [128, 1], [1, 512, 64], [128 * 40, 1, 128], [1, 0]),
+            ([40, 128], [128, 1], [2, 512, 64], [64, 128, 1], [0, 1]),
+            ([40, 240], [240, 1], [1, 512, 64], [240 * 40, 1, 240], [1, 0]),
+            ([40, 240], [240, 1], [4, 512, 64], [64, 240, 1], [0, 1]),
+            ([40, 256], [256, 1], [1, 512, 64], [256 * 40, 1, 256], [1, 0]),
+            ([40, 256], [256, 1], [4, 512, 64], [64, 256, 1], [0, 1]),
         ],
     )
     def test_to_spyre_layout_explicit_padding(
-        self, sizes, strides, device_size, stride_map
+        self, sizes, strides, device_size, stride_map, dim_order
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_for_explicit_layout(sizes, strides, stride_map),
+            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides,device_size,stride_map,dim_order",
         [
-            ([60], [1], [1, 512, 64], [60, 0, 1]),
+            ([60], [1], [1, 512, 64], [60, 0, 1], [0]),
         ],
     )
     def test_to_spyre_layout_explicit_expanding(
-        self, sizes, strides, device_size, stride_map
+        self, sizes, strides, device_size, stride_map, dim_order
     ):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_stl = SpyreTensorLayout(
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_for_explicit_layout(sizes, strides, stride_map),
+            _valid_elements_for_explicit_layout(sizes, strides, dim_order),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
