@@ -24,10 +24,24 @@ import torch._dynamo as dynamo
 
 import torch_spyre._inductor.passes as _passes
 from torch._inductor.virtualized import V
-from torch_spyre._C import get_spyre_tensor_sizes, get_spyre_tensor_strides
 from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
+
+
+def _dma_geometry(t):
+    """Return (sizes, strides) for the physical allocation of a Spyre tensor.
+
+    Equivalent to the C++ reconstruct_dma_geometry: collects unique positive
+    stride_map entries (taking max device_size on collision), sorted descending.
+    """
+    stl = t.device_tensor_layout()
+    stride_to_size: dict[int, int] = {}
+    for sm, ds in zip(stl.stride_map, stl.device_size):
+        if sm > 0:
+            stride_to_size[sm] = max(stride_to_size.get(sm, 0), ds)
+    strides = sorted(stride_to_size, reverse=True)
+    return [stride_to_size[s] for s in strides], strides
 
 
 # -------- Helpers --------
@@ -137,6 +151,7 @@ def _make_cpu_input(shape, dtype, seed):
 
 def _tensor_layout_snapshot(t):
     """All comparable tensor/device-layout attributes, excluding pointers."""
+    dma_sizes, dma_strides = _dma_geometry(t)
     return {
         "shape": tuple(t.shape),
         "stride": t.stride(),
@@ -148,8 +163,8 @@ def _tensor_layout_snapshot(t):
         "contiguous": t.is_contiguous(),
         "device": t.device,
         "dev_layout": t.device_tensor_layout(),
-        "dma_sizes": get_spyre_tensor_sizes(t),
-        "dma_strides": get_spyre_tensor_strides(t),
+        "dma_sizes": dma_sizes,
+        "dma_strides": dma_strides,
     }
 
 

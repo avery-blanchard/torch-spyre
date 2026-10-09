@@ -694,11 +694,9 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
   SpyreStream stream;
+  bool needs_staging = false;
   at::Tensor alloc_view;
   at::Tensor cpu_alloc;
-  const at::Tensor* copy_from = &self;
-  const at::Tensor* copy_to = &dst;
-  bool non_overlapping_and_dense = true;
 
   if (dst.is_privateuseone()) {
     stream = getCurrentStream(dst.device());
@@ -723,112 +721,89 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
       const auto [alloc_sizes, alloc_strides] =
           reconstruct_dma_geometry(spyre_impl->spyre_layout);
       const int64_t alloc_numel = c10::multiply_integers(alloc_sizes);
-      if (expanded || alloc_numel < self.numel()) {
-        non_overlapping_and_dense = false;
-        alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
-                                    /*storage_offset=*/0);
-        cpu_alloc = at::empty(alloc_sizes, dst.options());
-        copy_from = &alloc_view;
-        copy_to = &cpu_alloc;
+      TORCH_CHECK(alloc_numel >= self.numel(), "Reconstructed DMA allocation (",
+                  alloc_numel, " elements) is smaller than tensor numel (",
+                  self.numel(), "); layout is inconsistent");
+      if (expanded) {
+        needs_staging = true;
       } else if (alloc_numel > self.numel()) {
-        auto stl = spyre_impl->spyre_layout;
-        // Build a map from alloc_stride -> sorted list of device dims with
-        // that stride (innermost first), for tile boundary detection below.
+        // alloc_numel == self.numel(): tensor fills the allocation exactly;
+        // DMA can proceed directly without staging.
+        const auto stl = spyre_impl->spyre_layout;
         const int device_rank = static_cast<int>(stl.stride_map.size());
         const int alloc_rank = static_cast<int>(alloc_strides.size());
-        // For each alloc dim j (keyed by alloc_strides[j]), collect the device
-        // dims whose stride_map values fall within [alloc_strides[j],
-        // alloc_strides[j]*alloc_sizes[j]), sorted by ascending stride_map.
-        std::vector<std::vector<std::pair<int64_t, int>>> alloc_tile_dims(
-            alloc_rank);
+        // For each alloc dim j, collect the host strides of device dims that
+        // fall within that alloc dim's extent, sorted ascending (innermost
+        // first). Used below to detect cross-tile-boundary slices.
+        std::vector<std::vector<int64_t>> alloc_tile_dims(alloc_rank);
         for (int j = 0; j < alloc_rank; j++) {
           const int64_t lo = alloc_strides[j];
           const int64_t hi = alloc_sizes[j] * lo;
           for (int k = 0; k < device_rank; k++) {
             const int64_t sm = stl.stride_map[k];
             if (sm >= lo && sm < hi) {
-              alloc_tile_dims[j].push_back({sm, k});
+              alloc_tile_dims[j].push_back(sm);
             }
           }
           std::sort(alloc_tile_dims[j].begin(), alloc_tile_dims[j].end());
         }
 
-        // Iterate through each dimension in self and ensure it either is found
-        // in alloc_strides or is a valid view of a stride in alloc_strides.
-        //
-        // Dimensions that are not views will be found in alloc_strides and the
-        // alloc_tile_dims. These dimensions are also checked to ensure they are
-        // valid slices within the tile(s) they reside.
-        //
-        // Dimensions that are views will not be found in alloc_strides or the
-        // alloc_tile_dims. These dimensions are also checked to ensure all
-        // views of alloc_sizes[n] have a product equal to alloc_sizes[n].
+        // For each logical dim, check whether the slice crosses a tile
+        // boundary. A dimension whose stride matches an alloc stride exactly
+        // is not tiled and never crosses a boundary. A dimension whose stride
+        // falls strictly inside an alloc dim's extent is a tiled sub-dim;
+        // check that [offset, offset+size) stays within one tile.
         const int self_rank = self.dim();
-        std::vector<bool> is_view(alloc_rank, false);
-        std::vector<int64_t> view_sizes(alloc_rank, 1);
-        for (int i = 0; i < self_rank; i++) {
+        const int64_t storage_off = self.storage_offset();
+        for (int i = 0; i < self_rank && !needs_staging; i++) {
           const int64_t stride = self.strides()[i];
           const int64_t size = self.sizes()[i];
           if (size == 1) continue;
           for (int j = 0; j < alloc_rank; j++) {
-            const int64_t alloc_size = alloc_sizes[j];
-            if (alloc_size == 1) continue;
             const int64_t alloc_stride = alloc_strides[j];
-            const int64_t next_stride = alloc_size * alloc_stride;
+            const int64_t next_stride = alloc_sizes[j] * alloc_stride;
             if (stride < alloc_stride || stride >= next_stride) continue;
-            if (size != alloc_size) {
-              // Try to find the stride in alloc_tile_dims[j].
-              const auto& tile_dims = alloc_tile_dims[j];
-              size_t index = 0;
-              for (; index < tile_dims.size(); index++) {
-                if (tile_dims[index].first == stride) break;
-              }
-              if (index < tile_dims.size()) {
-                // Stride found in the tile dims: check that the slice is fully
-                // within a single tile (not crossing a tile boundary).
-                const int64_t next_tile_stride =
-                    index + 1 < tile_dims.size() ? tile_dims[index + 1].first
+            if (stride == alloc_stride) break;  // exact match, no tiling
+            // stride falls inside alloc dim j: locate it in alloc_tile_dims[j]
+            const auto& tile_dims = alloc_tile_dims[j];
+            const auto it =
+                std::find(tile_dims.begin(), tile_dims.end(), stride);
+            TORCH_INTERNAL_ASSERT(it != tile_dims.end(), "Tensor stride ",
+                                  stride, " not found in alloc_tile_dims[", j,
+                                  "]");
+            const size_t index = static_cast<size_t>(it - tile_dims.begin());
+            const int64_t next_tile_stride = index + 1 < tile_dims.size()
+                                                 ? tile_dims[index + 1]
                                                  : next_stride;
-                const int64_t tile_size = next_tile_stride / stride;
-                const int64_t offset = self.storage_offset() % next_stride;
-                const int64_t dim_offset = offset / stride;
-                const int64_t tile_offset = dim_offset % tile_size;
-                if (tile_offset != 0 && tile_offset + size > tile_size) {
-                  non_overlapping_and_dense = false;
-                  break;
-                }
-              } else {
-                // Stride not found: this size is a view of alloc_sizes[j].
-                is_view[j] = true;
-              }
+            const int64_t tile_size = next_tile_stride / stride;
+            const int64_t dim_offset = (storage_off % next_stride) / stride;
+            const int64_t tile_offset = dim_offset % tile_size;
+            if (tile_offset != 0 && tile_offset + size > tile_size) {
+              needs_staging = true;
             }
-            view_sizes[j] *= size;
             break;
           }
         }
-        for (int i = 0; i < alloc_rank; i++) {
-          if (is_view[i] && view_sizes[i] != alloc_sizes[i]) {
-            non_overlapping_and_dense = false;
-            break;
-          }
-        }
-        if (!non_overlapping_and_dense) {
-          alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
-                                      /*storage_offset=*/0);
-          cpu_alloc = at::empty(alloc_sizes, dst.options());
-          copy_from = &alloc_view;
-          copy_to = &cpu_alloc;
-        }
+      }
+
+      if (needs_staging) {
+        alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
+                                    /*storage_offset=*/0);
+        cpu_alloc = at::empty(alloc_sizes, dst.options());
       }
     }
   }
 
-  stream.copyAsync(*copy_from, *copy_to);
+  if (needs_staging) {
+    stream.copyAsync(alloc_view, cpu_alloc);
+  } else {
+    stream.copyAsync(self, dst);
+  }
   if (!non_blocking) {
     stream.synchronize();
   }
 
-  if (!non_overlapping_and_dense) {
+  if (needs_staging) {
     at::Tensor cpu_view = cpu_alloc.as_strided(self.sizes(), self.strides(),
                                                self.storage_offset());
     dst.copy_(cpu_view);
