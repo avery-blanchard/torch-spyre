@@ -82,31 +82,83 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
 std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
     const SpyreTensorLayout& stl) {
   // Rebuild (dma_sizes, dma_strides) from stride_map and valid_elements.
-  // Each unique positive stride_map value represents one host dimension; the
-  // corresponding valid element count is looked up via valid_elements_per_dim.
-  // Results are sorted in descending stride order to match the original DMA
-  // geometry stored at allocation time.
+  //
+  // The result matches what SpyreTensorImpl::dma_sizes/dma_strides held at
+  // allocation time: one entry per original host dimension, sorted in
+  // descending stride order.
+  //
+  // The stick inner dim (device_rank - 1) and the stick outer dim share a
+  // single host dimension. The stick outer is the device dim d < device_rank-1
+  // where stride_map[d] == device_size[device_rank-1] *
+  // stride_map[device_rank-1]. For the stick group the DMA stride is
+  // stride_map[stick_inner] and the DMA size is the product of valid elements
+  // for both dims.
+  //
+  // All other device dims (d < device_rank-1, excluding stick outer) map
+  // one-to-one to a host dimension: DMA stride = stride_map[d], DMA size =
+  // valid_elements_per_dim()[d].
   const std::map<int64_t, int64_t> ve_flat = stl.valid_elements_per_dim();
   const int device_rank = static_cast<int>(stl.stride_map.size());
 
-  // Map from host stride -> valid element count, descending.
-  std::map<int64_t, int64_t, std::greater<int64_t>> stride_to_count;
-  for (int d = 0; d < device_rank; ++d) {
+  // Identify the stick inner and stick outer device dims.
+  const int stick_inner = device_rank - 1;
+  const int64_t stick_inner_sm = stl.stride_map[stick_inner];
+  const int64_t stick_size = stl.device_size[stick_inner];
+
+  int stick_outer = -1;
+  for (int d = 0; d < device_rank - 1; ++d) {
+    if (stl.stride_map[d] == stick_size * stick_inner_sm) {
+      stick_outer = d;
+      break;
+    }
+  }
+
+  // Map from DMA stride -> DMA size, sorted descending.
+  std::map<int64_t, int64_t, std::greater<int64_t>> stride_to_size;
+
+  if (stick_outer != -1 && stick_inner_sm > 0) {
+    // Stick group: DMA stride = stride_map[stick_inner].
+    // DMA size = the host size of the stick dimension.
+    //
+    // When valid_elements is grouped (stick_outer and stick_inner share a key),
+    // the value is already the full host-dimension size.  When it is singleton
+    // (each device dim has its own key, e.g. from compute_valid_elements), the
+    // product of the two values reconstructs the host-dimension size.
+    int64_t stick_dma_size = 0;
+    const std::vector<int64_t> grouped_key = {
+        static_cast<int64_t>(std::min(stick_outer, stick_inner)),
+        static_cast<int64_t>(std::max(stick_outer, stick_inner))};
+    if (stl.valid_elements.count(grouped_key)) {
+      stick_dma_size = stl.valid_elements.at(grouped_key);
+    } else {
+      const int64_t outer_valid = ve_flat.count(stick_outer)
+                                      ? ve_flat.at(stick_outer)
+                                      : stl.device_size[stick_outer];
+      const int64_t inner_valid = ve_flat.count(stick_inner)
+                                      ? ve_flat.at(stick_inner)
+                                      : stl.device_size[stick_inner];
+      stick_dma_size = outer_valid * inner_valid;
+    }
+    stride_to_size[stick_inner_sm] = stick_dma_size;
+  }
+
+  // All non-stick device dims map one-to-one to a host dimension.
+  for (int d = 0; d < device_rank - 1; ++d) {
+    if (d == stick_outer) continue;
     const int64_t sm = stl.stride_map[d];
     if (sm <= 0) continue;
-    if (stride_to_count.contains(sm)) continue;
-    auto it = ve_flat.find(static_cast<int64_t>(d));
-    if (it == ve_flat.end()) continue;
-    stride_to_count[sm] = it->second;
+    if (stride_to_size.contains(sm)) continue;
+    const int64_t valid = ve_flat.count(d) ? ve_flat.at(d) : stl.device_size[d];
+    stride_to_size[sm] = valid;
   }
 
   std::vector<int64_t> dma_sizes;
   std::vector<int64_t> dma_strides;
-  dma_sizes.reserve(stride_to_count.size());
-  dma_strides.reserve(stride_to_count.size());
-  for (const auto& [stride, count] : stride_to_count) {
+  dma_sizes.reserve(stride_to_size.size());
+  dma_strides.reserve(stride_to_size.size());
+  for (const auto& [stride, size] : stride_to_size) {
     dma_strides.push_back(stride);
-    dma_sizes.push_back(count);
+    dma_sizes.push_back(size);
   }
   return {dma_sizes, dma_strides};
 }
