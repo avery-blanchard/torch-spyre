@@ -92,11 +92,15 @@ def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
     stick_count = (last + eps - 1) // eps
     device_size = [*lead, stick_count, eps]
     stride_map = [math.prod(shape[k + 1 :]) for k in range(len(lead))] + [eps, 1]
+    n = len(device_size)
     return SpyreTensorLayout(
         device_size=device_size,
         stride_map=stride_map,
         device_dtype=get_device_dtype(dtype),
-        valid_elements={(i,): device_size[i] for i in range(len(device_size))},
+        valid_elements={
+            **{(i,): lead[i] for i in range(len(lead))},
+            (n - 2, n - 1): last,
+        },
     )
 
 

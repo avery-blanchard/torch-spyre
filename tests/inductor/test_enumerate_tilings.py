@@ -279,7 +279,8 @@ class TestApplyRefusals(unittest.TestCase):
         dl = op.layout.device_layout
         device_size = [64, 80, 1, 64]
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64][5120, 64, -1, 1],
+            [64, 80, 1, 64],
+            [5120, 64, -1, 1],
             dl.device_dtype,
             {(i,): device_size[i] for i in range(len(device_size))},
             dl.element_arrangement,

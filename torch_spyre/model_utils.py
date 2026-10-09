@@ -238,7 +238,7 @@ def _dma_to_spyre_indirect_access(
         _device_size_emb,  # device_size: vocab dim outermost
         [d, eps, 1],  # stride_map
         get_device_dtype(dev_dtype),
-        {(i,): _device_size_emb[i] for i in range(len(_device_size_emb))},
+        {(0,): rows, (1, 2): d},
     )
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
@@ -328,7 +328,7 @@ def dma_moe_expert_weight_to_spyre(
         _device_size_moe,
         [contract * free, free, eps, 1],
         get_device_dtype(dev_dtype),
-        {(i,): _device_size_moe[i] for i in range(len(_device_size_moe))},
+        {(0,): experts, (1,): contract, (2, 3): free},
     )
     dst = spyre_empty_with_layout(
         weight.size(), weight.stride(), dev_dtype, layout, device=device
@@ -365,7 +365,7 @@ def dma_moe_per_expert_scale_to_spyre(
         _device_size_scale,
         [eps, eps, 1],
         get_device_dtype(dev_dtype),
-        {(i,): _device_size_scale[i] for i in range(len(_device_size_scale))},
+        {(0,): experts, (1, 2): eps},
     )
     dst = spyre_empty_with_layout(
         widened.size(), widened.stride(), dev_dtype, layout, device=device
