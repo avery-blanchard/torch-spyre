@@ -727,8 +727,8 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
       if (expanded) {
         needs_staging = true;
       } else if (alloc_numel > self.numel()) {
-        // alloc_numel == self.numel(): tensor fills the allocation exactly;
-        // DMA can proceed directly without staging.
+        // alloc_numel == self.numel() (the else branch): tensor fills the
+        // allocation exactly; DMA can proceed without staging.
         const auto stl = spyre_impl->spyre_layout;
         const int device_rank = static_cast<int>(stl.stride_map.size());
         const int alloc_rank = static_cast<int>(alloc_strides.size());
@@ -751,10 +751,14 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         // For each logical dim, check whether the slice crosses a tile
         // boundary. A dimension whose stride matches an alloc stride exactly
         // is not tiled and never crosses a boundary. A dimension whose stride
-        // falls strictly inside an alloc dim's extent is a tiled sub-dim;
-        // check that [offset, offset+size) stays within one tile.
+        // falls strictly inside an alloc dim's extent is either a tiled
+        // sub-dim (stride present in alloc_tile_dims) or a strided-slice /
+        // view of that alloc dim (stride not present). The latter requires
+        // staging only if it doesn't cover the full alloc extent.
         const int self_rank = self.dim();
         const int64_t storage_off = self.storage_offset();
+        std::vector<bool> is_view(alloc_rank, false);
+        std::vector<int64_t> view_sizes(alloc_rank, 1);
         for (int i = 0; i < self_rank && !needs_staging; i++) {
           const int64_t stride = self.strides()[i];
           const int64_t size = self.sizes()[i];
@@ -763,14 +767,19 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
             const int64_t alloc_stride = alloc_strides[j];
             const int64_t next_stride = alloc_sizes[j] * alloc_stride;
             if (stride < alloc_stride || stride >= next_stride) continue;
+            view_sizes[j] *= size;
             if (stride == alloc_stride) break;  // exact match, no tiling
             // stride falls inside alloc dim j: locate it in alloc_tile_dims[j]
             const auto& tile_dims = alloc_tile_dims[j];
             const auto it =
                 std::find(tile_dims.begin(), tile_dims.end(), stride);
-            TORCH_INTERNAL_ASSERT(it != tile_dims.end(), "Tensor stride ",
-                                  stride, " not found in alloc_tile_dims[", j,
-                                  "]");
+            if (it == tile_dims.end()) {
+              // Stride not in tile_map: strided-slice or view of
+              // alloc_sizes[j]. Staging needed if it doesn't cover the full
+              // alloc extent (checked after the loop).
+              is_view[j] = true;
+              break;
+            }
             const size_t index = static_cast<size_t>(it - tile_dims.begin());
             const int64_t next_tile_stride = index + 1 < tile_dims.size()
                                                  ? tile_dims[index + 1]
@@ -782,6 +791,11 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
               needs_staging = true;
             }
             break;
+          }
+        }
+        for (int j = 0; j < alloc_rank && !needs_staging; j++) {
+          if (is_view[j] && view_sizes[j] != alloc_sizes[j]) {
+            needs_staging = true;
           }
         }
       }
