@@ -428,7 +428,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            _valid_elements_from_host(sizes, strides, device_size, stride_map),
+            {(0, 1): sizes[0] * sizes[1]},
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
