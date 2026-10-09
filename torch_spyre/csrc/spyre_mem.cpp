@@ -31,6 +31,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -340,24 +341,19 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // (cpu_stride==0) are excluded — their device dim handling is in the H2D
   // block below.
   {
-    // Build stride → logical_size map from dev_strides/dev_sizes, but only for
-    // host dims whose stride×size span equals the corresponding allocation
-    // span. This guards against views (e.g. b.view(64,8,512)) that produce a
-    // stride coincidentally equal to a stride_map value but with a smaller size
-    // than the allocation — such dims should not cap the allocation's
-    // valid_count.
-    //
-    // Allocation span for stride S: the total element range covered by the
-    // device dims whose stride_map value equals S.  For the standard two-dim
-    // stick layout this is device_size[outer] * stride_map[outer].
+    // Build the set of strides that appear in the allocation's stride_map.
+    // A host dim at stride S contributes to capping only when every coarser
+    // host stride (> S) is also an allocation stride.  This guards against
+    // views that introduce extra dimensions above an allocation stride (e.g.
+    // b.view(64,8,512) adds a stride-4096 dim above stride-512), which must
+    // not cap the allocation's valid_count for the stride-512 group.  A true
+    // slice of the outer dimension has no extra coarser strides, so it caps
+    // correctly.
     const int device_rank_local = static_cast<int>(stl.stride_map.size());
-    std::map<int64_t, int64_t> alloc_span;  // stride → alloc span in elements
+    std::set<int64_t> alloc_strides;
     for (int i = 0; i < device_rank_local; i++) {
       const int64_t sm = stl.stride_map[i];
-      if (sm <= 0) continue;
-      const int64_t span = sm * stl.device_size[i];
-      auto [it, inserted] = alloc_span.emplace(sm, span);
-      if (!inserted) it->second = std::max(it->second, span);
+      if (sm > 0) alloc_strides.insert(sm);
     }
 
     const int host_rank = static_cast<int>(dev_sizes.size());
@@ -365,10 +361,17 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     for (int i = 0; i < host_rank; i++) {
       const int64_t s = dev_strides[i];
       if (s <= 0) continue;
-      const int64_t span = s * dev_sizes[i];
-      const auto it = alloc_span.find(s);
-      if (it == alloc_span.end()) continue;
-      if (span != it->second) continue;  // view with different granularity
+      if (alloc_strides.find(s) == alloc_strides.end()) continue;
+      // Check that all coarser dev strides are also allocation strides.
+      bool coarser_all_in_alloc = true;
+      for (int j = 0; j < host_rank; j++) {
+        if (dev_strides[j] > s &&
+            alloc_strides.find(dev_strides[j]) == alloc_strides.end()) {
+          coarser_all_in_alloc = false;
+          break;
+        }
+      }
+      if (!coarser_all_in_alloc) continue;
       stride_to_host_size[s] = dev_sizes[i];
     }
     for (auto& [dims, valid_count] : stl.valid_elements) {
