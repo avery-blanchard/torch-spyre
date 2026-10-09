@@ -2629,13 +2629,8 @@ def compute_restickify_needed(
             y_ds[k_chunk_dim] = ds[k_chunk_dim] * stick_size
             y_sm[k_chunk_dim] = elem_stride
             y_sm[-1] = -1
-            stick_dim = len(ds) - 1
             y_ve = {
-                key: (
-                    y_ds[k_chunk_dim]
-                    if k_chunk_dim in key
-                    else (1 if stick_dim in key else val)
-                )
+                key: (1 if k_chunk_dim in key else val)
                 for key, val in in_stl.valid_elements.items()
             }
             return True, SpyreTensorLayout(y_ds, y_sm, in_stl.device_dtype, y_ve)

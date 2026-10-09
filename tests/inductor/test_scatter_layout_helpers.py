@@ -49,7 +49,7 @@ class TestDimOrderCompliance(unittest.TestCase):
             device_size=_ds,
             stride_map=[128, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
-            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
+            valid_elements={(0,): 8, (1, 2): 2, (3,): 1},
         )
         # stride_idx from right: 3 (rightmost coordinate)
         # device_pos = 4 - 1 - 3 = 0 ✓
@@ -62,7 +62,7 @@ class TestDimOrderCompliance(unittest.TestCase):
             device_size=_ds,
             stride_map=[512, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
-            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
+            valid_elements={(0,): 2, (1, 2): 8, (3,): 1},
         )
         # stride_idx from right: 2
         # device_pos = 4 - 1 - 2 = 1 ✗
@@ -75,7 +75,7 @@ class TestDimOrderCompliance(unittest.TestCase):
             device_size=_ds,
             stride_map=[256, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
-            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
+            valid_elements={(0,): 2, (1, 2): 4, (3,): 1},
         )
         # stride_idx from right: 1
         # device_pos = 4 - 1 - 1 = 2 ✗
@@ -149,7 +149,7 @@ class TestIaRotateStl(unittest.TestCase):
             device_size=_ds,
             stride_map=[256, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
-            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
+            valid_elements={(0,): 2, (1, 2): 4, (3,): 1},
         )
         required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=2)
 
@@ -167,7 +167,7 @@ class TestIaRotateStl(unittest.TestCase):
             device_size=_ds,
             stride_map=[128, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
-            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
+            valid_elements={(0,): 8, (1, 2): 2, (3,): 1},
         )
         required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=0)
 
@@ -181,7 +181,7 @@ class TestIaRotateStl(unittest.TestCase):
             device_size=_ds,
             stride_map=[512, 64, 1, 1],
             device_dtype=get_device_dtype(torch.float16),
-            valid_elements={(i,): _ds[i] for i in range(len(_ds))},
+            valid_elements={(0,): 2, (1, 2): 8, (3,): 1},
         )
         required_stl = _ia_rotate_stl(original_stl, indirect_device_pos=1)
 
@@ -202,7 +202,7 @@ class TestDenseScatterSourceStl(unittest.TestCase):
             _ds,
             [256, 32768, 64, 262144, 1],
             get_device_dtype(torch.bfloat16),
-            {(i,): _ds[i] for i in range(len(_ds))},
+            {(0,): 128, (1,): 8, (2, 4): 4, (3,): 1},
             ElementArrangement.FP32_TO_DL16,
         )
         layout = FixedTiledLayout(
