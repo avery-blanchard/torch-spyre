@@ -299,6 +299,7 @@ def restickify_valid_elements(
     the new-stick group (its outer dim) exchange their host-size values.  All
     other dim groups are forwarded unchanged.  Parallel to restickify_device_size
     and restickify_stride_map.
+
     """
     stick_dim = len(stl.device_size) - 1
     result = {}
@@ -2631,7 +2632,9 @@ def compute_restickify_needed(
             stick_dim = len(ds) - 1
             y_ve = {
                 key: (
-                    y_ds[k_chunk_dim] if k_chunk_dim in key or stick_dim in key else val
+                    y_ds[k_chunk_dim]
+                    if k_chunk_dim in key
+                    else (1 if stick_dim in key else val)
                 )
                 for key, val in in_stl.valid_elements.items()
             }
