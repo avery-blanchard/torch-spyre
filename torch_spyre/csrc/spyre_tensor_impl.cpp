@@ -79,29 +79,105 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
   return valid_elements;
 }
 
-std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
-    const SpyreTensorLayout& stl) {
-  // Returns (sizes, strides) for the physical allocation described by stl:
-  // one entry per unique positive stride_map value, sorted descending by
-  // stride.  Each entry's size is the corresponding device_size extent.
+// Returns the physical allocation geometry (sizes, strides) if D2H staging is
+// needed for this tensor, or nullopt if the tensor fills its allocation exactly
+// and DMA can proceed directly.
+//
+// Staging is needed when:
+//   (a) the tensor is expanded/broadcast (any stride < 1)
+//   (b) the tensor is a slice that crosses a tile boundary
+//   (c) the tensor is a strided-slice or view that doesn't cover the full
+//       alloc extent of an allocation dim
+std::optional<std::pair<std::vector<int64_t>, std::vector<int64_t>>>
+staging_geometry(const SpyreTensorLayout& stl, c10::IntArrayRef sizes,
+                 c10::IntArrayRef strides, int64_t storage_offset) {
+  // Build alloc geometry from stl: one entry per unique positive stride_map
+  // value, sorted descending (coarsest first), with max device_size on
+  // collision.
   const int device_rank = static_cast<int>(stl.stride_map.size());
   std::map<int64_t, int64_t, std::greater<int64_t>> stride_to_size;
-  for (int i = 0; i < device_rank; ++i) {
-    const int64_t sm = stl.stride_map[i];
+  for (int k = 0; k < device_rank; k++) {
+    const int64_t sm = stl.stride_map[k];
     if (sm <= 0) continue;
-    auto [it, inserted] = stride_to_size.emplace(sm, stl.device_size[i]);
-    if (!inserted) {
-      it->second = std::max(it->second, stl.device_size[i]);
+    auto [it, inserted] = stride_to_size.emplace(sm, stl.device_size[k]);
+    if (!inserted) it->second = std::max(it->second, stl.device_size[k]);
+  }
+
+  // Extract alloc_sizes / alloc_strides — needed for as_strided if staging.
+  std::vector<int64_t> alloc_strides, alloc_sizes;
+  alloc_strides.reserve(stride_to_size.size());
+  alloc_sizes.reserve(stride_to_size.size());
+  for (const auto& [s, sz] : stride_to_size) {
+    alloc_strides.push_back(s);
+    alloc_sizes.push_back(sz);
+  }
+  const int alloc_rank = static_cast<int>(alloc_strides.size());
+
+  // Expanded/broadcast: any stride < 1 means staging is needed immediately.
+  if (std::any_of(strides.begin(), strides.end(),
+                  [](int64_t s) { return s < 1; })) {
+    return std::make_pair(alloc_sizes, alloc_strides);
+  }
+
+  // For each alloc dim, collect sub-strides from stride_map that tile within
+  // its extent, sorted ascending.
+  struct AllocDim {
+    int64_t stride;
+    int64_t size;
+    std::vector<int64_t> tile_strides;
+  };
+  std::vector<AllocDim> alloc_dims;
+  alloc_dims.reserve(alloc_rank);
+  for (int j = 0; j < alloc_rank; j++) {
+    const int64_t lo = alloc_strides[j];
+    const int64_t hi = alloc_sizes[j] * lo;
+    AllocDim dim{lo, alloc_sizes[j], {}};
+    for (int k = 0; k < device_rank; k++) {
+      const int64_t sm = stl.stride_map[k];
+      if (sm >= lo && sm < hi) dim.tile_strides.push_back(sm);
+    }
+    std::sort(dim.tile_strides.begin(), dim.tile_strides.end());
+    alloc_dims.push_back(std::move(dim));
+  }
+
+  const int tensor_rank = static_cast<int>(sizes.size());
+  std::vector<bool> is_view(alloc_rank, false);
+  std::vector<int64_t> view_sizes(alloc_rank, 1);
+  bool needs_staging = false;
+  for (int i = 0; i < tensor_rank && !needs_staging; i++) {
+    const int64_t stride = strides[i];
+    const int64_t size = sizes[i];
+    if (size == 1) continue;
+    for (int j = 0; j < alloc_rank; j++) {
+      const int64_t lo = alloc_dims[j].stride;
+      const int64_t next_stride = alloc_dims[j].size * lo;
+      if (stride < lo || stride >= next_stride) continue;
+      view_sizes[j] *= size;
+      if (stride == lo) break;  // exact match, no tiling
+      const auto& tile_strides = alloc_dims[j].tile_strides;
+      const auto it =
+          std::find(tile_strides.begin(), tile_strides.end(), stride);
+      if (it == tile_strides.end()) {
+        is_view[j] = true;
+        break;
+      }
+      const size_t index = static_cast<size_t>(it - tile_strides.begin());
+      const int64_t next_tile_stride = index + 1 < tile_strides.size()
+                                           ? tile_strides[index + 1]
+                                           : next_stride;
+      const int64_t tile_size = next_tile_stride / stride;
+      const int64_t dim_offset = (storage_offset % next_stride) / stride;
+      const int64_t tile_offset = dim_offset % tile_size;
+      if (tile_offset != 0 && tile_offset + size > tile_size)
+        needs_staging = true;
+      break;
     }
   }
-  std::vector<int64_t> sizes, strides;
-  sizes.reserve(stride_to_size.size());
-  strides.reserve(stride_to_size.size());
-  for (const auto& [stride, size] : stride_to_size) {
-    strides.push_back(stride);
-    sizes.push_back(size);
+  for (int j = 0; j < alloc_rank && !needs_staging; j++) {
+    if (is_view[j] && view_sizes[j] != alloc_dims[j].size) needs_staging = true;
   }
-  return {sizes, strides};
+  if (needs_staging) return std::make_pair(alloc_sizes, alloc_strides);
+  return std::nullopt;
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,

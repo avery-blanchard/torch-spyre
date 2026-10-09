@@ -299,8 +299,12 @@ class SpyreTensorImpl : public at::TensorImpl {
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
 
-std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
-    const SpyreTensorLayout& stl);
+// Returns the physical allocation geometry (sizes, strides) if D2H staging is
+// needed for this tensor view, or nullopt if DMA can proceed directly.
+std::optional<std::pair<std::vector<int64_t>, std::vector<int64_t>>>
+staging_geometry(const SpyreTensorLayout& stl, c10::IntArrayRef sizes,
+                 c10::IntArrayRef strides, int64_t storage_offset);
+
 uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl);
 uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
                                   const DataFormats& device_dtype);

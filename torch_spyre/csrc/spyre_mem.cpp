@@ -716,94 +716,28 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     if (self.is_privateuseone()) {
       auto* spyre_impl =
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-      const bool expanded = std::ranges::any_of(
-          self.strides(), [](const int64_t& stride) { return stride < 1; });
-      const auto [alloc_sizes, alloc_strides] =
-          reconstruct_dma_geometry(spyre_impl->spyre_layout);
-      const int64_t alloc_numel = c10::multiply_integers(alloc_sizes);
-      TORCH_CHECK(alloc_numel >= self.numel(), "Reconstructed DMA allocation (",
-                  alloc_numel, " elements) is smaller than tensor numel (",
-                  self.numel(), "); layout is inconsistent");
-      if (expanded) {
-        needs_staging = true;
-      } else if (alloc_numel > self.numel()) {
-        // alloc_numel == self.numel() (the else branch): tensor fills the
-        // allocation exactly; DMA can proceed without staging.
-        const auto stl = spyre_impl->spyre_layout;
-        const int device_rank = static_cast<int>(stl.stride_map.size());
-        const int alloc_rank = static_cast<int>(alloc_strides.size());
-        // For each alloc dim j, collect the host strides of device dims that
-        // fall within that alloc dim's extent, sorted ascending (innermost
-        // first). Used below to detect cross-tile-boundary slices.
-        std::vector<std::vector<int64_t>> alloc_tile_dims(alloc_rank);
-        for (int j = 0; j < alloc_rank; j++) {
-          const int64_t lo = alloc_strides[j];
-          const int64_t hi = alloc_sizes[j] * lo;
-          for (int k = 0; k < device_rank; k++) {
-            const int64_t sm = stl.stride_map[k];
-            if (sm >= lo && sm < hi) {
-              alloc_tile_dims[j].push_back(sm);
-            }
-          }
-          std::sort(alloc_tile_dims[j].begin(), alloc_tile_dims[j].end());
+      const auto& stl = spyre_impl->spyre_layout;
+      // alloc_numel: product of valid_elements values — the full allocation
+      // extent before any slicing. Used to fast-path tensors that fill their
+      // allocation exactly (no staging needed).
+      int64_t alloc_numel = 1;
+      for (const auto& [dims, count] : stl.valid_elements) alloc_numel *= count;
+      TORCH_CHECK(alloc_numel >= self.numel() ||
+                      std::ranges::any_of(self.strides(),
+                                          [](int64_t s) { return s < 1; }),
+                  "Spyre layout alloc_numel (", alloc_numel,
+                  ") < tensor numel (", self.numel(),
+                  "); layout is inconsistent");
+      const bool expanded =
+          std::ranges::any_of(self.strides(), [](int64_t s) { return s < 1; });
+      if (expanded || alloc_numel > self.numel()) {
+        if (auto geom = staging_geometry(stl, self.sizes(), self.strides(),
+                                         self.storage_offset())) {
+          needs_staging = true;
+          alloc_view = at::as_strided(self, geom->first, geom->second,
+                                      /*storage_offset=*/0);
+          cpu_alloc = at::empty(geom->first, dst.options());
         }
-
-        // For each logical dim, check whether the slice crosses a tile
-        // boundary. A dimension whose stride matches an alloc stride exactly
-        // is not tiled and never crosses a boundary. A dimension whose stride
-        // falls strictly inside an alloc dim's extent is either a tiled
-        // sub-dim (stride present in alloc_tile_dims) or a strided-slice /
-        // view of that alloc dim (stride not present). The latter requires
-        // staging only if it doesn't cover the full alloc extent.
-        const int self_rank = self.dim();
-        const int64_t storage_off = self.storage_offset();
-        std::vector<bool> is_view(alloc_rank, false);
-        std::vector<int64_t> view_sizes(alloc_rank, 1);
-        for (int i = 0; i < self_rank && !needs_staging; i++) {
-          const int64_t stride = self.strides()[i];
-          const int64_t size = self.sizes()[i];
-          if (size == 1) continue;
-          for (int j = 0; j < alloc_rank; j++) {
-            const int64_t alloc_stride = alloc_strides[j];
-            const int64_t next_stride = alloc_sizes[j] * alloc_stride;
-            if (stride < alloc_stride || stride >= next_stride) continue;
-            view_sizes[j] *= size;
-            if (stride == alloc_stride) break;  // exact match, no tiling
-            // stride falls inside alloc dim j: locate it in alloc_tile_dims[j]
-            const auto& tile_dims = alloc_tile_dims[j];
-            const auto it =
-                std::find(tile_dims.begin(), tile_dims.end(), stride);
-            if (it == tile_dims.end()) {
-              // Stride not in tile_map: strided-slice or view of
-              // alloc_sizes[j]. Staging needed if it doesn't cover the full
-              // alloc extent (checked after the loop).
-              is_view[j] = true;
-              break;
-            }
-            const size_t index = static_cast<size_t>(it - tile_dims.begin());
-            const int64_t next_tile_stride = index + 1 < tile_dims.size()
-                                                 ? tile_dims[index + 1]
-                                                 : next_stride;
-            const int64_t tile_size = next_tile_stride / stride;
-            const int64_t dim_offset = (storage_off % next_stride) / stride;
-            const int64_t tile_offset = dim_offset % tile_size;
-            if (tile_offset != 0 && tile_offset + size > tile_size) {
-              needs_staging = true;
-            }
-            break;
-          }
-        }
-        for (int j = 0; j < alloc_rank && !needs_staging; j++) {
-          if (is_view[j] && view_sizes[j] != alloc_sizes[j]) {
-            needs_staging = true;
-          }
-        }
-      }
-
-      if (needs_staging) {
-        alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
-                                    /*storage_offset=*/0);
-        cpu_alloc = at::empty(alloc_sizes, dst.options());
       }
     }
   }

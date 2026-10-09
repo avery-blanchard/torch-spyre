@@ -32,8 +32,8 @@ DEVICE = torch.device("spyre")
 def _dma_geometry(t):
     """Return (sizes, strides) for the physical allocation of a Spyre tensor.
 
-    Equivalent to the C++ reconstruct_dma_geometry: collects unique positive
-    stride_map entries (taking max device_size on collision), sorted descending.
+    Collects unique positive stride_map entries (taking max device_size on
+    collision), sorted descending by stride.
     """
     stl = t.device_tensor_layout()
     stride_to_size: dict[int, int] = {}
