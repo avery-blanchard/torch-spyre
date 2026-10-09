@@ -89,7 +89,10 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
   for (int i = 0; i < device_rank; ++i) {
     const int64_t sm = stl.stride_map[i];
     if (sm <= 0) continue;
-    stride_to_size.emplace(sm, stl.device_size[i]);
+    auto [it, inserted] = stride_to_size.emplace(sm, stl.device_size[i]);
+    if (!inserted) {
+      it->second = std::max(it->second, stl.device_size[i]);
+    }
   }
   std::vector<int64_t> sizes, strides;
   sizes.reserve(stride_to_size.size());

@@ -340,12 +340,36 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // (cpu_stride==0) are excluded — their device dim handling is in the H2D
   // block below.
   {
+    // Build stride → logical_size map from dev_strides/dev_sizes, but only for
+    // host dims whose stride×size span equals the corresponding allocation
+    // span. This guards against views (e.g. b.view(64,8,512)) that produce a
+    // stride coincidentally equal to a stride_map value but with a smaller size
+    // than the allocation — such dims should not cap the allocation's
+    // valid_count.
+    //
+    // Allocation span for stride S: the total element range covered by the
+    // device dims whose stride_map value equals S.  For the standard two-dim
+    // stick layout this is device_size[outer] * stride_map[outer].
+    const int device_rank_local = static_cast<int>(stl.stride_map.size());
+    std::map<int64_t, int64_t> alloc_span;  // stride → alloc span in elements
+    for (int i = 0; i < device_rank_local; i++) {
+      const int64_t sm = stl.stride_map[i];
+      if (sm <= 0) continue;
+      const int64_t span = sm * stl.device_size[i];
+      auto [it, inserted] = alloc_span.emplace(sm, span);
+      if (!inserted) it->second = std::max(it->second, span);
+    }
+
     const int host_rank = static_cast<int>(dev_sizes.size());
     std::map<int64_t, int64_t> stride_to_host_size;
     for (int i = 0; i < host_rank; i++) {
-      if (dev_strides[i] > 0) {
-        stride_to_host_size[dev_strides[i]] = dev_sizes[i];
-      }
+      const int64_t s = dev_strides[i];
+      if (s <= 0) continue;
+      const int64_t span = s * dev_sizes[i];
+      const auto it = alloc_span.find(s);
+      if (it == alloc_span.end()) continue;
+      if (span != it->second) continue;  // view with different granularity
+      stride_to_host_size[s] = dev_sizes[i];
     }
     for (auto& [dims, valid_count] : stl.valid_elements) {
       int64_t min_pos_stride = INT64_MAX;
