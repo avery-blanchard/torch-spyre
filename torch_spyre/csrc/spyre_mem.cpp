@@ -374,6 +374,13 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       if (!coarser_all_in_alloc) continue;
       stride_to_host_size[s] = dev_sizes[i];
     }
+    // Build the set of strides present in dev_strides for the absent-stride
+    // check.
+    std::set<int64_t> dev_stride_set;
+    for (int i = 0; i < host_rank; i++) {
+      if (dev_strides[i] > 0) dev_stride_set.insert(dev_strides[i]);
+    }
+
     for (auto& [dims, valid_count] : stl.valid_elements) {
       int64_t min_pos_stride = INT64_MAX;
       for (int64_t d : dims) {
@@ -381,6 +388,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
         if (sm > 0) min_pos_stride = std::min(min_pos_stride, sm);
       }
       if (min_pos_stride == INT64_MAX) continue;
+      // If this allocation stride is entirely absent from dev_strides, the
+      // logical view has been rank-reduced (indexed) along that dimension.
+      // The tensor is fixed at one position in that dimension, so only 1
+      // element (or 1 row for a grouped key) is valid.
+      if (dev_stride_set.find(min_pos_stride) == dev_stride_set.end()) {
+        valid_count = 1;
+        continue;
+      }
       const auto it = stride_to_host_size.find(min_pos_stride);
       if (it == stride_to_host_size.end()) continue;
       valid_count = std::min(valid_count, it->second);
