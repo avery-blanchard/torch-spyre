@@ -33,8 +33,6 @@ namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
-std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
-    const std::vector<int64_t>& device_size);
 /* Describes how device coordinates are arranged in memory.
  * Certain on-device type conversions result in non-sequential device
  * coordinates and some stick reduction operations (e.g., exx2) result in
@@ -156,9 +154,7 @@ class SpyreTensorLayout {
         stride_map(stride_map),
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
-        valid_elements(valid_elements.empty()
-                           ? compute_valid_elements(device_size)
-                           : std::move(valid_elements)) {
+        valid_elements(std::move(valid_elements)) {
     validate_shape();
   }
 
@@ -237,9 +233,8 @@ class SpyreTensorLayout {
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
-    // Include valid_elements in this comparison once all call sites have
-    // migrated away from the deprecated (device_size, stride_map, device_dtype)
-    // constructor, which is incorrect when padding is present.
+    // Include valid_elements (and update std::hash) after deprecated
+    // constructor call sites have migrated to the valid_elements overload.
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype &&
@@ -313,12 +308,6 @@ struct hash<spyre::SpyreTensorLayout> {
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
     seed = c10::hash_combine(
         seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
-    for (const auto& [dims, size] : layout.valid_elements) {
-      seed = c10::hash_combine(seed, std::hash<size_t>{}(dims.size()));
-      for (int64_t d : dims)
-        seed = c10::hash_combine(seed, std::hash<int64_t>{}(d));
-      seed = c10::hash_combine(seed, std::hash<int64_t>{}(size));
-    }
     return seed;
   }
 };

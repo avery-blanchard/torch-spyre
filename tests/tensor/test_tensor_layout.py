@@ -202,7 +202,9 @@ class TestSpyreTensorLayout(TestCase):
             torch.float16,
             [1, 0],
         )
-        self.assertEqual(stl, pickle.loads(pickle.dumps(stl)))
+        loaded = pickle.loads(pickle.dumps(stl))
+        self.assertEqual(stl, loaded)
+        self.assertEqual(stl.valid_elements, loaded.valid_elements)
 
     def test_stl_copyable(self):
         stl = SpyreTensorLayout(
@@ -211,7 +213,9 @@ class TestSpyreTensorLayout(TestCase):
             torch.float16,
             [1, 0],
         )
-        self.assertEqual(stl, copy.deepcopy(stl))
+        copied = copy.deepcopy(stl)
+        self.assertEqual(stl, copied)
+        self.assertEqual(stl.valid_elements, copied.valid_elements)
 
     def test_to_spyre_layout(self):
         x = torch.rand([512, 256], dtype=torch.float16)

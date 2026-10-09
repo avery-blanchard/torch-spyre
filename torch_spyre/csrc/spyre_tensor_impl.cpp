@@ -68,16 +68,6 @@ static std::vector<int64_t> compute_host_stride(
   return host_stride;
 }
 
-std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
-    const std::vector<int64_t>& device_size) {
-  std::map<std::vector<int64_t>, int64_t> valid_elements;
-
-  for (int64_t d = 0; d < static_cast<int64_t>(device_size.size()); ++d)
-    valid_elements[{d}] = device_size[d];
-
-  return valid_elements;
-}
-
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
