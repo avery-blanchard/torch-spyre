@@ -92,10 +92,15 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
   //   dcsi_sizes[inner] = min(inner_size, V)  (full inner row)
   //   dcsi_sizes[outer] = V / inner_size       (number of full rows)
   std::vector<int64_t> dcsi_sizes(device_rank, 1);
+  std::vector<bool> set_by_group(device_rank, false);
 
   // First pass: handle grouped keys.
   for (const auto& [dims, valid_count] : stl.valid_elements) {
     if (dims.size() < 2) continue;
+    TORCH_CHECK(dims.size() == 2, "valid_elements key with ", dims.size(),
+                " dims is not supported"
+                "; only singleton {j} and stick-pair {outer, inner} keys are"
+                " valid");
     const int inner = static_cast<int>(dims.back());
     const int outer = static_cast<int>(dims[dims.size() - 2]);
     const int64_t inner_size = stl.device_size[inner];
@@ -103,6 +108,8 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
                 " for device dimension ", inner);
     dcsi_sizes[inner] = std::min(valid_count, inner_size);
     dcsi_sizes[outer] = valid_count / inner_size;
+    set_by_group[inner] = true;
+    set_by_group[outer] = true;
   }
 
   // Second pass: singleton groups and broadcast/sparse dims.
@@ -110,9 +117,10 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
   for (int i = 0; i < device_rank; i++) {
     TORCH_CHECK(stl.device_size[i] >= 0, "Invalid device size ",
                 stl.device_size[i], " for device dimension ", i);
+    if (set_by_group[i]) continue;
     if (stl.stride_map[i] == 0) {
       dcsi_sizes[i] = stl.device_size[i];
-    } else if (stl.stride_map[i] > 0 && dcsi_sizes[i] == 1) {
+    } else if (stl.stride_map[i] > 0) {
       // Not set by a grouped key: use valid_elements_per_dim() singleton value.
       const auto it = ve.find(static_cast<int64_t>(i));
       dcsi_sizes[i] = it != ve.end() ? std::min(it->second, stl.device_size[i])
@@ -146,25 +154,45 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
     remainder[outer] = 1;
 
     remainders.push_back(remainder);
-    host_offsets.push_back(tiled_elements * host_strides[inner]);
-    device_offsets.push_back(tiled_elements * device_strides[inner]);
+    host_offsets.push_back(tiled_elements * host_strides[outer]);
+    device_offsets.push_back(tiled_elements * device_strides[outer]);
   }
 
-  // Create the first DataConversionStrideInfo.
-  DataConversionStrideInfo stride_info;
-  stride_info.size_ = dcsi_sizes;
-  stride_info.stride_src_ = host2device ? host_strides : device_strides;
-  stride_info.stride_dst_ = host2device ? device_strides : host_strides;
-  stride_info.offset_src_ = host2device ? cpu_offset : device_offset;
-  stride_info.offset_dst_ = host2device ? device_offset : cpu_offset;
+  // Build the template DCSI (strides, offsets) used for both the full-row DCSI
+  // and as the base from which remainder DCSIs are derived.
+  DataConversionStrideInfo dcsi_template;
+  dcsi_template.size_ = dcsi_sizes;
+  dcsi_template.stride_src_ = host2device ? host_strides : device_strides;
+  dcsi_template.stride_dst_ = host2device ? device_strides : host_strides;
+  dcsi_template.offset_src_ = host2device ? cpu_offset : device_offset;
+  dcsi_template.offset_dst_ = host2device ? device_offset : cpu_offset;
+  std::reverse(dcsi_template.size_.begin(), dcsi_template.size_.end());
+  std::reverse(dcsi_template.stride_src_.begin(),
+               dcsi_template.stride_src_.end());
+  std::reverse(dcsi_template.stride_dst_.begin(),
+               dcsi_template.stride_dst_.end());
 
-  std::reverse(stride_info.size_.begin(), stride_info.size_.end());
-  std::reverse(stride_info.stride_src_.begin(), stride_info.stride_src_.end());
-  std::reverse(stride_info.stride_dst_.begin(), stride_info.stride_dst_.end());
+  // Emit the full-row DCSI only when dcsi_sizes[outer] > 0.  When
+  // valid_count < inner_size all valid elements fit in a single partial stick
+  // row; in that case the only DCSI needed is the remainder one below.
+  const bool has_full_rows = std::none_of(dcsi_sizes.begin(), dcsi_sizes.end(),
+                                          [](int64_t s) { return s == 0; });
 
-  std::vector<DataConversionStrideInfo> stride_infos = {stride_info};
+  std::vector<DataConversionStrideInfo> stride_infos;
+  if (has_full_rows) {
+    stride_infos.push_back(dcsi_template);
+  }
+
+  TORCH_CHECK(remainders.size() <= 1, "Multiple remainder DCSIs (",
+              remainders.size(),
+              ") not supported;"
+              " at most one grouped valid_elements key may produce a partial"
+              " stick row");
 
   // Emit a remainder DCSI for each partial stick row.
+  // When has_full_rows is false, stride_infos is empty and we derive the
+  // remainder directly from dcsi_template (no cross-product needed since there
+  // is at most one remainder per the TORCH_CHECK above).
   for (size_t i = 0; i < remainders.size(); i++) {
     std::reverse(remainders[i].begin(), remainders[i].end());
     const int64_t offset_src =
@@ -172,9 +200,13 @@ auto get_device_stride_infos(int64_t cpu_offset, int64_t device_offset,
     const int64_t offset_dst =
         host2device ? device_offsets[i] : host_offsets[i];
 
-    const size_t num_infos = stride_infos.size();
-    for (size_t j = 0; j < num_infos; j++) {
-      DataConversionStrideInfo info = stride_infos[j];
+    const std::vector<DataConversionStrideInfo>& bases =
+        stride_infos.empty()
+            ? std::vector<DataConversionStrideInfo>{dcsi_template}
+            : stride_infos;
+    const size_t num_bases = bases.size();
+    for (size_t j = 0; j < num_bases; j++) {
+      DataConversionStrideInfo info = bases[j];
       for (int k = 0; k < device_rank; k++) {
         if (remainders[i][k] != 0) info.size_[k] = remainders[i][k];
       }
@@ -334,6 +366,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     if (cpu_strides != dev_strides) {
       // Update the local copy of stride_map to reflect cpu_strides.
       // The SpyreTensorImpl for the dev_tensor is not modified.
+      //
+      // NOTE: stl.valid_elements is intentionally NOT updated here.
+      // get_device_stride_infos only consults valid_elements for the sizes of
+      // dims with positive stride_map entries.  Expanded dims have their
+      // stride_map entries zeroed below, so get_device_stride_infos will use
+      // the full device_size for those dims regardless of valid_elements — the
+      // valid_elements group membership for the original allocation is harmless
+      // because it is only read for dims that remain positive in stride_map.
       const int host_rank = cpu_sizes.size();
 
       std::vector<int64_t> dst_stride_map = stl.stride_map;
