@@ -432,8 +432,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   std::vector<int64_t> cpu_strides = cpu_tensor->strides().vec();
   std::vector<int64_t> dev_sizes = dev_tensor->sizes().vec();
   std::vector<int64_t> dev_strides = dev_tensor->strides().vec();
-  const std::vector<int64_t> dma_sizes = spyre_tensor_impl->dma_sizes;
-  const std::vector<int64_t> dma_strides = spyre_tensor_impl->dma_strides;
+  const auto [dma_sizes, dma_strides] = reconstruct_dma_geometry(stl);
   std::vector<int64_t> device_sizes = stl.device_size;
 
   // While the source strides may differ from the destination strides when the
@@ -877,8 +876,6 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->set_sizes_contiguous(size);
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = tensor.strides().vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -932,8 +929,6 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   spyre_tensor_impl->set_sizes_and_strides(size, stride);
 
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = stride.vec();
 
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
@@ -971,8 +966,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->set_sizes_and_strides(size, stride);
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = stride.vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -1004,8 +997,8 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   } else {
     stream = getCurrentStream(self.device());
     // D2H staging path: DMA the full physical allocation into a CPU buffer
-    // using dma_sizes/dma_strides/spyre_layout (the layout the data was
-    // written with), then apply the logical view on the CPU side.
+    // using the original allocation geometry (reconstructed from spyre_layout),
+    // then apply the logical view on the CPU side.
     //
     // This path is taken when:
     //   (a) the tensor is expanded/repeated, where we transfer the minimal
@@ -1019,11 +1012,13 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
       const bool expanded = std::ranges::any_of(
           self.strides(), [](const int64_t& stride) { return stride < 1; });
-      const int64_t dma_numel = c10::multiply_integers(spyre_impl->dma_sizes);
+      const auto [dma_sizes, dma_strides] =
+          reconstruct_dma_geometry(spyre_impl->spyre_layout);
+      const int64_t dma_numel = c10::multiply_integers(dma_sizes);
       if (expanded || dma_numel < self.numel()) {
         non_overlapping_and_dense = false;
-        c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
-        c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+        c10::IntArrayRef alloc_sizes(dma_sizes);
+        c10::IntArrayRef alloc_strides(dma_strides);
         alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
                                     /*storage_offset=*/0);
         cpu_alloc = at::empty(alloc_sizes, dst.options());
@@ -1031,9 +1026,8 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         copy_to = &cpu_alloc;
       } else if (dma_numel > self.numel()) {
         auto stl = spyre_impl->spyre_layout;
-        const std::vector<std::vector<int>> tile_map =
-            get_tile_map(spyre_impl->dma_sizes, spyre_impl->dma_strides,
-                         stl.device_size, stl.stride_map);
+        const std::vector<std::vector<int>> tile_map = get_tile_map(
+            dma_sizes, dma_strides, stl.device_size, stl.stride_map);
         // Iterate through each dimension in self and ensure it either is found
         // in dma_strides or is a valid view of a stride in dma_strides.
         //
@@ -1045,7 +1039,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         // tile_map. These dimensions are also checked to ensure all views of
         // dma_sizes[n] have a product equal to dma_sizes[n] (no slice).
         const int self_rank = self.dim();
-        const int dma_rank = spyre_impl->dma_strides.size();
+        const int dma_rank = static_cast<int>(dma_strides.size());
         std::vector<bool> is_view(dma_rank, false);
         std::vector<int64_t> view_sizes(dma_rank, 1);
         for (int i = 0; i < self_rank; i++) {
@@ -1053,9 +1047,9 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
           const int64_t size = self.sizes()[i];
           if (size == 1) continue;
           for (int j = 0; j < dma_rank; j++) {
-            const int64_t dma_size = spyre_impl->dma_sizes[j];
+            const int64_t dma_size = dma_sizes[j];
             if (dma_size == 1) continue;
-            const int64_t dma_stride = spyre_impl->dma_strides[j];
+            const int64_t dma_stride = dma_strides[j];
             const int64_t next_stride = dma_size * dma_stride;
             if (stride < dma_stride || stride >= next_stride) continue;
             if (size != dma_size) {
@@ -1095,14 +1089,14 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
           }
         }
         for (int i = 0; i < dma_rank; i++) {
-          if (is_view[i] && view_sizes[i] != spyre_impl->dma_sizes[i]) {
+          if (is_view[i] && view_sizes[i] != dma_sizes[i]) {
             non_overlapping_and_dense = false;
             break;
           }
         }
         if (!non_overlapping_and_dense) {
-          c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
-          c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+          c10::IntArrayRef alloc_sizes(dma_sizes);
+          c10::IntArrayRef alloc_strides(dma_strides);
           alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
                                       /*storage_offset=*/0);
           cpu_alloc = at::empty(alloc_sizes, dst.options());
@@ -1168,8 +1162,6 @@ at::Tensor empty_with_layout(
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   spyre_tensor_impl->set_sizes_contiguous(size);
   spyre_tensor_impl->spyre_layout = device_layout;
-  spyre_tensor_impl->dma_sizes = size.vec();
-  spyre_tensor_impl->dma_strides = tensor.strides().vec();
   SPYRE_RUNTIME_DEBUG() << "SpyreTensorLayout: " << device_layout.toString();
   return tensor;
 }
@@ -1219,8 +1211,6 @@ const at::Tensor& spyre_resize_(
       last_dim_ok) {
     self_impl->set_sizes_contiguous(size_int);
     self_impl->spyre_layout = new_layout;
-    self_impl->dma_sizes = size_int.vec();
-    self_impl->dma_strides = self_impl->strides().vec();
     SPYRE_RUNTIME_DEBUG() << "to shape=" << size_int
                           << " layout=" << self_impl->spyre_layout.toString();
     return self;
@@ -1237,8 +1227,6 @@ const at::Tensor& spyre_resize_(
   self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
   self_impl->set_sizes_contiguous(size_int);
   self_impl->spyre_layout = new_layout;
-  self_impl->dma_sizes = size_int.vec();
-  self_impl->dma_strides = self_impl->strides().vec();
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
   SPYRE_RUNTIME_DEBUG() << "expand to shape=" << size_int
                         << " layout=" << self_impl->spyre_layout.toString();

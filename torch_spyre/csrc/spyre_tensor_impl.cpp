@@ -21,6 +21,7 @@
 #include <util/sendefs/dataType.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <string>
 #include <utility>
@@ -76,6 +77,38 @@ std::map<std::vector<int64_t>, int64_t> compute_valid_elements(
     valid_elements[{d}] = device_size[d];
 
   return valid_elements;
+}
+
+std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
+    const SpyreTensorLayout& stl) {
+  // Rebuild (dma_sizes, dma_strides) from stride_map and valid_elements.
+  // Each unique positive stride_map value represents one host dimension; the
+  // corresponding valid element count is looked up via valid_elements_per_dim.
+  // Results are sorted in descending stride order to match the original DMA
+  // geometry stored at allocation time.
+  const std::map<int64_t, int64_t> ve_flat = stl.valid_elements_per_dim();
+  const int device_rank = static_cast<int>(stl.stride_map.size());
+
+  // Map from host stride -> valid element count, descending.
+  std::map<int64_t, int64_t, std::greater<int64_t>> stride_to_count;
+  for (int d = 0; d < device_rank; ++d) {
+    const int64_t sm = stl.stride_map[d];
+    if (sm <= 0) continue;
+    if (stride_to_count.contains(sm)) continue;
+    auto it = ve_flat.find(static_cast<int64_t>(d));
+    if (it == ve_flat.end()) continue;
+    stride_to_count[sm] = it->second;
+  }
+
+  std::vector<int64_t> dma_sizes;
+  std::vector<int64_t> dma_strides;
+  dma_sizes.reserve(stride_to_count.size());
+  dma_strides.reserve(stride_to_count.size());
+  for (const auto& [stride, count] : stride_to_count) {
+    dma_strides.push_back(stride);
+    dma_sizes.push_back(count);
+  }
+  return {dma_sizes, dma_strides};
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -263,8 +296,6 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   }
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
-  impl->dma_sizes = this->dma_sizes;
-  impl->dma_strides = this->dma_strides;
   copy_tensor_metadata(
       /*src_impl=*/this,
       /*dest_impl=*/impl.get(),
@@ -294,8 +325,6 @@ void SpyreTensorImpl::shallow_copy_from(
     const at::intrusive_ptr<at::TensorImpl>& impl) {
   auto spyre_impl = static_cast<SpyreTensorImpl*>(impl.get());
   at::TensorImpl::shallow_copy_from(impl);
-  this->dma_sizes = spyre_impl->dma_sizes;
-  this->dma_strides = spyre_impl->dma_strides;
   this->spyre_layout = spyre_impl->spyre_layout;
 }
 
@@ -349,7 +378,7 @@ std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    return impl->dma_sizes;
+    return reconstruct_dma_geometry(impl->spyre_layout).first;
   }
   TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
 }
@@ -358,7 +387,7 @@ std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    return impl->dma_strides;
+    return reconstruct_dma_geometry(impl->spyre_layout).second;
   }
   TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
 }

@@ -270,8 +270,6 @@ class SpyreTensorImpl : public at::TensorImpl {
   ~SpyreTensorImpl() = default;
 
   SpyreTensorLayout spyre_layout;
-  std::vector<int64_t> dma_sizes;
-  std::vector<int64_t> dma_strides;
 
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
@@ -301,6 +299,8 @@ class SpyreTensorImpl : public at::TensorImpl {
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
 
+std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
+    const SpyreTensorLayout& stl);
 uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl);
 uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
                                   const DataFormats& device_dtype);
