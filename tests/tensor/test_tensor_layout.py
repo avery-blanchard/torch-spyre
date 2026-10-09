@@ -40,6 +40,53 @@ def _valid_elements_for_explicit_layout(sizes, strides, dim_order, dtype=torch.f
     return canonical.valid_elements
 
 
+def _valid_elements_from_host(sizes, strides, device_size, stride_map):
+    """Compute valid_elements by applying get_dim_map logic in Python.
+
+    Use this when the host-based constructor cannot reproduce the layout
+    (e.g. multi-dim tiling, compiler-generated viewing/folding layouts) and
+    no dim_order is available.  Mirrors the C++ get_dim_map / get_tile_map
+    logic: maps each device dim to the host dim with the largest host stride
+    ≤ stride_map[j], then groups device dims by their host dim.
+
+    The resulting valid_elements carries the host dimension's element count
+    for each device-dim group, which is what reconstruct_dma_geometry requires
+    to correctly reconstruct dma_sizes and dma_strides.
+    """
+    host_rank = len(sizes)
+    device_rank = len(stride_map)
+    stick_dim_index = max(0, device_rank - 3)
+
+    max_stride_le = [0] * device_rank
+    dim_map = [-1] * device_rank
+
+    for i in range(host_rank):
+        if sizes[i] == 1:
+            continue
+        hst = strides[i]
+        if hst == 0:
+            continue
+        for j in range(device_rank):
+            if device_size[j] == 1:
+                continue
+            dst = stride_map[j]
+            if hst > max_stride_le[j] and hst <= dst:
+                max_stride_le[j] = hst
+                dim_map[j] = i
+
+    if dim_map[stick_dim_index] != -1:
+        dim_map[stick_dim_index] = dim_map[device_rank - 1]
+
+    groups: dict[int, list[int]] = {}
+    for j in range(device_rank):
+        h = dim_map[j]
+        if h == -1:
+            continue
+        groups.setdefault(h, []).append(j)
+
+    return {tuple(sorted(dims)): sizes[h] for h, dims in groups.items()}
+
+
 @instantiate_parametrized_tests
 class TestSpyreTensorLayout(TestCase):
     def setUp(self):
@@ -381,7 +428,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -403,7 +450,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -425,7 +472,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -454,7 +501,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -477,7 +524,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -498,7 +545,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
@@ -523,7 +570,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x_sliced.to(device_layout=x_stl)
         self.assertEqual(x_sliced, x_dev.cpu())
@@ -584,7 +631,7 @@ class TestSpyreTensorLayout(TestCase):
             device_size,
             stride_map,
             get_device_dtype(torch.float16),
-            {(i,): device_size[i] for i in range(len(device_size))},
+            _valid_elements_from_host(sizes, strides, device_size, stride_map),
         )
         x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
