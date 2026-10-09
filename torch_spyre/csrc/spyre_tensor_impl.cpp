@@ -88,11 +88,10 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
   // descending stride order.
   //
   // The stick inner dim (device_rank - 1) and the stick outer dim share a
-  // single host dimension. The stick outer is the device dim d < device_rank-1
-  // where stride_map[d] == device_size[device_rank-1] *
-  // stride_map[device_rank-1]. For the stick group the DMA stride is
-  // stride_map[stick_inner] and the DMA size is the product of valid elements
-  // for both dims.
+  // single host dimension. The stick outer is identified by searching
+  // valid_elements for a grouped key containing stick_inner, with a fallback
+  // to the stride_map arithmetic heuristic. For the stick group the DMA stride
+  // is stride_map[stick_inner] and the DMA size is the host-dim element count.
   //
   // All other device dims (d < device_rank-1, excluding stick outer) map
   // one-to-one to a host dimension: DMA stride = stride_map[d], DMA size =
@@ -101,15 +100,39 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
   const int device_rank = static_cast<int>(stl.stride_map.size());
 
   // Identify the stick inner and stick outer device dims.
+  //
+  // Prefer searching valid_elements for a key that contains stick_inner:
+  // for grouped keys the other element in the key is stick_outer.  Fall back
+  // to the stride_map arithmetic heuristic (stride_map[d] == stick_size *
+  // stride_map[stick_inner]) for layouts whose valid_elements were produced by
+  // compute_valid_elements (singleton keys, one per device dim).
   const int stick_inner = device_rank - 1;
   const int64_t stick_inner_sm = stl.stride_map[stick_inner];
   const int64_t stick_size = stl.device_size[stick_inner];
 
   int stick_outer = -1;
-  for (int d = 0; d < device_rank - 1; ++d) {
-    if (stl.stride_map[d] == stick_size * stick_inner_sm) {
-      stick_outer = d;
+  for (const auto& [key, val] : stl.valid_elements) {
+    bool has_inner = false;
+    int candidate = -1;
+    for (int64_t d : key) {
+      if (d == stick_inner) {
+        has_inner = true;
+      } else {
+        candidate = static_cast<int>(d);
+      }
+    }
+    if (has_inner && candidate >= 0) {
+      stick_outer = candidate;
       break;
+    }
+  }
+  // Fallback: stride_map arithmetic (covers singleton valid_elements).
+  if (stick_outer == -1) {
+    for (int d = 0; d < device_rank - 1; ++d) {
+      if (stl.stride_map[d] == stick_size * stick_inner_sm) {
+        stick_outer = d;
+        break;
+      }
     }
   }
 
