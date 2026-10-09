@@ -127,9 +127,17 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
     }
   }
   // Fallback: stride_map arithmetic (covers singleton valid_elements).
-  if (stick_outer == -1) {
+  // stick_outer is the unique device dim d < device_rank-1 whose stride_map
+  // value is in (0, stick_size * stick_inner_sm].  Non-stick host dims always
+  // have stride_map > stick_size * stick_inner_sm because they span at least
+  // one full stick; stick_outer is ≤ stick_size * stick_inner_sm because it
+  // measures the host-dim element count (which may be less than stick_size for
+  // a partial-stick tensor).
+  if (stick_outer == -1 && stick_inner_sm > 0) {
+    const int64_t stick_span = stick_size * stick_inner_sm;
     for (int d = 0; d < device_rank - 1; ++d) {
-      if (stl.stride_map[d] == stick_size * stick_inner_sm) {
+      const int64_t sm = stl.stride_map[d];
+      if (sm > 0 && sm <= stick_span) {
         stick_outer = d;
         break;
       }
@@ -152,15 +160,32 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> reconstruct_dma_geometry(
         static_cast<int64_t>(std::min(stick_outer, stick_inner)),
         static_cast<int64_t>(std::max(stick_outer, stick_inner))};
     if (stl.valid_elements.count(grouped_key)) {
+      // Grouped key: value is the host-dimension element count directly.
       stick_dma_size = stl.valid_elements.at(grouped_key);
     } else {
-      const int64_t outer_valid = ve_flat.count(stick_outer)
-                                      ? ve_flat.at(stick_outer)
-                                      : stl.device_size[stick_outer];
-      const int64_t inner_valid = ve_flat.count(stick_inner)
-                                      ? ve_flat.at(stick_inner)
-                                      : stl.device_size[stick_inner];
-      stick_dma_size = outer_valid * inner_valid;
+      // Singleton keys (e.g. from compute_valid_elements or the explicit
+      // device_size/stride_map constructor).
+      //
+      // For partial-stick tensors (host_size < stick_size), init() sets
+      // stride_map[stick_outer] = host_size, so it is the authoritative count.
+      //
+      // For full-stick tensors (host_size >= stick_size),
+      // stride_map[stick_outer]
+      // == stick_size * stride_map[stick_inner] — that is the per-stick stride,
+      // not the total host-dim size.  In that case the product of the singleton
+      // valid counts gives the correct total.
+      const int64_t stick_span = stick_size * stick_inner_sm;
+      if (stl.stride_map[stick_outer] < stick_span) {
+        stick_dma_size = stl.stride_map[stick_outer];
+      } else {
+        const int64_t outer_valid = ve_flat.count(stick_outer)
+                                        ? ve_flat.at(stick_outer)
+                                        : stl.device_size[stick_outer];
+        const int64_t inner_valid = ve_flat.count(stick_inner)
+                                        ? ve_flat.at(stick_inner)
+                                        : stl.device_size[stick_inner];
+        stick_dma_size = outer_valid * inner_valid;
+      }
     }
     stride_to_size[stick_inner_sm] = stick_dma_size;
   }
