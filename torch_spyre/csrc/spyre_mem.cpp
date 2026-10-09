@@ -754,13 +754,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
       stl.stride_map = dst_stride_map;
     }
-  } else {
-    // If the device tensors is not sliced we use the original dma_sizes and
-    // dma_strides.
-    if (!dev_sliced) {
-      cpu_sizes = dma_sizes;
-      cpu_strides = dma_strides;
-    }
   }
   // FP8 multi-dim stick layout uses specialized DCI generation
   if (stl.element_arrangement == ElementArrangement::QFP8WT) {
