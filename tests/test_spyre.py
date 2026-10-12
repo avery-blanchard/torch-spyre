@@ -14,6 +14,7 @@
 
 # Owner(s): ["module: cpp"]
 
+import functools
 import os
 import warnings
 from contextlib import contextmanager
@@ -48,10 +49,26 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     reason="Support scalar eager add with to_dtype lowering in Spyre"
 )
+
+
+def _expect_raise(match):
+    """Decorator: the test passes only if it raises with a message matching ``match``."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with pytest.raises(Exception, match=match):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-_SCALAR_ADD_XFAIL_FP8 = pytest.mark.xfail(
-    reason="Support scalar eager add for DataFormats.SEN143_FP8 in Spyre"
-)
+# A missing feature, not a design limit: scalar eager add is rejected for SEN143_FP8
+# today; when #1474 lands this fails and the case has to go back to a normal one.
+_SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
     reason="Spyre backend does not support int32/int16 dtype - causes segfault/crash in data format converter"
@@ -325,7 +342,7 @@ class TestSpyre(TestCase):
                     None,
                 ),
                 name="float8_e4m3fn",
-                decorators=[_SCALAR_ADD_XFAIL_FP8],
+                decorators=[_SCALAR_ADD_RAISES_FP8],
             ),
             subtest(
                 (
@@ -921,6 +938,131 @@ class TestSpyre(TestCase):
             ElementArrangement.STANDARD,
         )
         torch.testing.assert_close(actual.cpu(), source_cpu.to(torch.float16))
+
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    def test_h2d_copy_to_sliced_destination(self, sizes):
+        """H2D to a slice (e.g. t[:2]) must write to the slice's logical
+        value."""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
+
+        slice_sizes = [2, sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[:2] = y
+        self.assertEqual(x.cpu()[:2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[2:3] = y
+        self.assertEqual(x.cpu()[2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[1], sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3] = y
+        self.assertEqual(x.cpu()[3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2, sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, :2] = y
+        self.assertEqual(x.cpu()[3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[2], sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3] = y
+        self.assertEqual(x.cpu()[3, 3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2, sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, :2] = y
+        self.assertEqual(x.cpu()[3, 3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1, sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [sizes[3]]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3] = y
+        self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [2]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, :2] = y
+        self.assertEqual(x.cpu()[3, 3, 3, :2], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = [1]
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, 2:3] = y
+        self.assertEqual(x.cpu()[3, 3, 3, 2:3], y, atol=1e-3, rtol=1e-3)
+
+        slice_sizes = []
+        y = torch.rand(
+            slice_sizes,
+            dtype=torch.float16,
+            device="cpu",
+        )
+        x[3, 3, 3, 3] = y
+        self.assertEqual(x.cpu()[3, 3, 3, 3], y, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":

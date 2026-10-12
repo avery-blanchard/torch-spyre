@@ -23,18 +23,26 @@ import sys
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 
 import sympy
 from unittest import TestCase
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    ScratchpadAllocator,
+    _lx_planning_size,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    BufferType,
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    TileAxis,
+    TileSpec,
     solved_bindings,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -48,6 +56,7 @@ try:
         _MAX_PRODUCT_BOUND,
         CpSatLayoutSolver,
         _SympyExprToCpSat,
+        _simplify_eq_conjunction,
     )
 
     _HAS_ORTOOLS = True
@@ -140,7 +149,35 @@ class TestExhaustiveSearchResidency(TestCase):
 
         self.assertIsNone(result["producer"].address)
         self.assertIsNotNone(result["consumer"].address)
-        self.assertEqual(solver.spill_reasons["producer"], "core div mismatch")
+        self.assertEqual(result["producer"].spill_reason, "core div mismatch")
+
+
+class TestAllocatorSpillReasons(TestCase):
+    """The allocator reports spill reasons from the solved buffers alone."""
+
+    def _solve(self, *extra):
+        barred = LifetimeBoundBuffer(
+            "barred", 64, [0, 1], residency_reason="op not allowed"
+        )
+        first = LifetimeBoundBuffer("first", 128, [0, 2])
+        return GreedyLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
+
+    def test_placement_allocator(self):
+        # "late" is live while "first" fills the scratchpad.
+        allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        reasons = ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+            allocation
+        )
+        self.assertEqual(set(reasons), {"barred", "late"})
+        self.assertEqual(reasons["barred"], "op not allowed")
+        self.assertIn("no room on scratchpad", reasons["late"])
+
+    def test_joint_allocator_reports_only_what_the_solver_said(self):
+        allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+            allocation
+        )
+        self.assertEqual(reasons, {"barred": "op not allowed"})
 
 
 class TestLxPlanningContract(TestCase):
@@ -162,6 +199,48 @@ class TestLxPlanningContract(TestCase):
                         ValueError, "DXP_LX_FRAC_AVAIL must be >=0 and <=1"
                     ):
                         _lx_planning_size()
+
+
+class TestDrainLifetimeBoundary(TestCase):
+    """The post-loop drain storage must stay live to the graph exit.
+
+    All solver intervals are on pre-insertion operation indices with a
+    half-open ``[start, end)`` convention.  The drain reads the storage after
+    the whole counted loop, so the storage's end is extended to
+    ``N = len(graph.operations)``; the failing boundary case is exactly a
+    buffer whose start equals the loop's textual end (``s_B = loop_end + 1``):
+    against the un-extended ``end = uses[-1] + 1`` it does not overlap and
+    could legally take the same address, clobbering the value.  These tests
+    pin the half-open arithmetic and the extension's effect.
+    """
+
+    def test_extended_end_excludes_the_loop_end_boundary_sharer(self):
+        # Storage fill at tick 0, tagged update read/write at tick 5
+        # (loop_end = 5, so N = 7 with the post-loop drain op's slot).
+        storage = LifetimeBoundBuffer("carry", 100, [0, 5], lifetime_end_override=7)
+        self.assertEqual(storage.end_time, 7)
+        sharer = LifetimeBoundBuffer("sharer", 100, [6])
+        self.assertTrue(
+            storage.overlaps_in_time(sharer),
+            "end=7 must overlap a buffer born at the loop's textual end",
+        )
+
+    def test_unextended_end_would_allow_the_boundary_sharer(self):
+        """Un-extended, the same pair shares: this is the bug the plan fix closes."""
+        storage = LifetimeBoundBuffer("carry", 100, [0, 5])
+        self.assertEqual(storage.end_time, 6)
+        sharer = LifetimeBoundBuffer("sharer", 100, [6])
+        self.assertFalse(storage.overlaps_in_time(sharer))
+
+    def test_override_extending_beyond_nominal_end_is_kept(self):
+        storage = LifetimeBoundBuffer("carry", 100, [0, 9], lifetime_end_override=12)
+        self.assertEqual(storage.end_time, 12)
+
+    def test_override_below_nominal_end_is_rejected(self):
+        # The extension helper takes a max(), so it can never build this; the
+        # constructor is the backstop for any other caller.
+        with self.assertRaises(AssertionError):
+            LifetimeBoundBuffer("bad", 100, [0, 9], lifetime_end_override=9)
 
 
 def _two_gap_buffers():
@@ -349,8 +428,8 @@ class BaseLayoutSolverTests:
 
         self.assertIsNone(result["barred"].address)
         self.assertIsNotNone(result["free"].address)
-        self.assertEqual(self.last_solver.spill_reasons["barred"], reason)
-        self.assertNotIn("free", self.last_solver.spill_reasons)
+        self.assertEqual(result["barred"].spill_reason, reason)
+        self.assertIsNone(result["free"].spill_reason)
 
     def test_barred_in_place_parent_does_not_orphan_its_child(self):
         # A barred parent leaves a dangling in_place_parents name once it is
@@ -1159,7 +1238,7 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         solver = self.solver_class([leaf], size=256, alignment=1)
         result = solver.plan_layout_and_core_divisions()
         self.assertIsNone(result[0].address)
-        self.assertEqual(solver.spill_reasons["leaf"], "no consumer reads it from LX")
+        self.assertEqual(result[0].spill_reason, "no consumer reads it from LX")
 
     def test_oversized_min_footprint_is_spilled(self):
         # Even the smallest candidate footprint (total/4 = 250) exceeds the
@@ -1321,15 +1400,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         solver = self.solver_class([leaf, big, C], size=200, alignment=1)
         result = {b.name: b for b in solver.plan_layout_and_core_divisions()}
 
-        # All three spill; each carries a reason keyed by buffer name.
+        # All three spill; each carries its reason.
         self.assertIsNone(result["big"].address)
-        self.assertIn("big", solver.spill_reasons)
-        self.assertIn("capacity", solver.spill_reasons["big"])
-        self.assertIn("leaf", solver.spill_reasons)
-        self.assertIn("no consumer", solver.spill_reasons["leaf"])
+        self.assertIn("capacity", result["big"].spill_reason)
+        self.assertIn("no consumer", result["leaf"].spill_reason)
         # A resident buffer gets no spill reason.
-        for name, buf in result.items():
-            self.assertEqual(buf.address is None, name in solver.spill_reasons)
+        for buf in result.values():
+            self.assertEqual(buf.address is None, buf.spill_reason is not None)
 
     def test_balance_prefers_balanced_division(self):
         # verify the solver prefers the balanced core split
@@ -1363,6 +1440,200 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
                 balanced.output_splits,
                 f"{name}: balance step should pick the balanced two-axis division",
             )
+
+    def _chosen_tiling(self, buffers, name):
+        result = {
+            buf.name: buf
+            for buf in self.solver_class(
+                buffers, size=1 << 20, alignment=1
+            ).plan_layout_and_core_divisions()
+        }
+        return result[name].core_divisions[result[name].chosen_division].tiling
+
+    def test_cut_stage_joins_the_op_between_producer_and_consumer(self):
+        # Op order a, b, c; c reads a and b. a and c can only be tiled, b may
+        # go either way. Loop groups are consecutive runs, so an untiled b
+        # splits a from c and copies a out: two cuts (a, and c before the
+        # sink) against one when b joins the run. Nothing else separates the
+        # two plans -- all resident, one core each -- and the tile-count stage
+        # alone would pick the untiled b.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled, untiled = CoreDivision(tiling=spec), CoreDivision()
+        a = CoreDivisionBuffer("a", 128, [0, 2], core_divisions=[tiled])
+        b = CoreDivisionBuffer("b", 128, [1, 2], core_divisions=[untiled, tiled])
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[tiled],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0)], "b": [(0, 0), (1, 0)]},
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [3],
+            core_divisions=_whole(),
+            parents=["c"],
+            cd_parent_matches={"c": [(0, 0)]},
+        )
+        self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), spec)
+
+    def test_cut_stage_counts_a_tiled_graph_output(self):
+        # A graph output is copied out of its loop even when its only consumer
+        # shares the nest, so tiling it costs a cut. Here that tiling is also
+        # the more parallel division, which the parallelism stage would take
+        # if the cut went uncounted.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        parallel = CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec)
+        out = CoreDivisionBuffer(
+            "out",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(), parallel],
+            boundary=BufferType.Output,
+        )
+        consumer = CoreDivisionBuffer(
+            "consumer",
+            128,
+            [1, 2],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["out"],
+            cd_parent_matches={"out": [(0, 0), (1, 0)]},
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [2],
+            core_divisions=_whole(),
+            parents=["consumer"],
+            cd_parent_matches={"consumer": [(0, 0)]},
+        )
+        self.assertTrue(
+            self._chosen_tiling([out, consumer, sink], "out").is_untiled,
+        )
+
+    def test_cut_stage_splits_a_pair_the_table_does_not_match(self):
+        # b reads a, and both tilings run the same nest (d0:2), so adjacent
+        # they would share it -- but the table has no (tiled a, tiled b) pair:
+        # b walks a different dim of a's buffer. Sharing the nest would read
+        # the wrong tile, so b must stay untiled even though tiling it is the
+        # more parallel division. Every buffer is barred from LX so residency
+        # cannot make the choice instead.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        barred = "keep residency out of the choice"
+        a = CoreDivisionBuffer(
+            "a",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(tiling=spec)],
+            residency_reason=barred,
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec),
+            ],
+            parents=["a"],
+            cd_parent_matches={"a": [(0, 0)]},
+            residency_reason=barred,
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [2],
+            core_divisions=_whole(),
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0), (1, 0)]},
+        )
+        self.assertTrue(self._chosen_tiling([a, b, sink], "b").is_untiled)
+
+    def test_cut_stage_splits_a_pair_an_untileable_op_sits_between(self):
+        # Op order a, b, c; c reads a, and the table matches their tilings.
+        # But b can only be untiled, and loop groups are consecutive runs, so
+        # b splits a from c whatever they choose: a tiled is copied out for c
+        # to read. That is two cuts (a, and c before the sink) against one for
+        # an untiled a. a's tiled candidate also carries a two-core split,
+        # which the parallelism stage would take if a and c counted as one nest.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        barred = "keep residency out of the choice"
+        a = CoreDivisionBuffer(
+            "a",
+            128,
+            [0, 2],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(splits={sympy.Symbol("x"): 2}, tiling=spec),
+            ],
+            residency_reason=barred,
+        )
+        b = CoreDivisionBuffer(
+            "b", 128, [1, 2], core_divisions=_whole(), residency_reason=barred
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0), (1, 0)], "b": [(0, 0)]},
+            residency_reason=barred,
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [3],
+            core_divisions=_whole(),
+            parents=["c"],
+            cd_parent_matches={"c": [(0, 0)]},
+        )
+        self.assertTrue(self._chosen_tiling([a, b, c, sink], "a").is_untiled)
+
+    def test_cut_stage_joins_a_matched_pair_with_different_specs(self):
+        # a -> b -> c, all running a two-tile nest. b's d1:2 is the tiling the
+        # table matches with a's d0:2 and c's d0:2 (b reads a transposed), so
+        # the three share one nest with a single cut, at c. Keying the nest on
+        # spec equality instead would split b off and cost a cut at a as well.
+        d0 = TileSpec((TileAxis(host_dim=0, count=2),))
+        d1 = TileSpec((TileAxis(host_dim=1, count=2),))
+        barred = "keep residency out of the choice"
+        a = CoreDivisionBuffer(
+            "a",
+            128,
+            [0, 1],
+            core_divisions=[CoreDivision(tiling=d0)],
+            residency_reason=barred,
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=[CoreDivision(), CoreDivision(tiling=d1)],
+            parents=["a"],
+            cd_parent_matches={"a": [(0, 1)]},
+            residency_reason=barred,
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=d0)],
+            parents=["b"],
+            cd_parent_matches={"b": [(1, 0)]},
+            residency_reason=barred,
+        )
+        sink = CoreDivisionBuffer(
+            "__sink__",
+            1,
+            [3],
+            core_divisions=_whole(),
+            parents=["c"],
+            cd_parent_matches={"c": [(0, 0)]},
+        )
+        self.assertEqual(self._chosen_tiling([a, b, c, sink], "b"), d1)
 
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the
@@ -1439,6 +1710,40 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_a_repeated_condition_reuses_its_literal(self):
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {
+            "x": model.new_int_var(0, 10, "x"),
+            "y": model.new_int_var(0, 10, "y"),
+        }
+        printer = _SympyExprToCpSat(model, sym_map, {})
+        for cond in (x >= 3, sympy.And(x >= 3, y <= 4), sympy.Or(x <= 1, y >= 7)):
+            lit = printer._print_condition(cond)
+            num_vars = len(model.proto.variables)
+            num_constraints = len(model.proto.constraints)
+            self.assertIs(printer._print_condition(cond), lit)
+            self.assertEqual(len(model.proto.variables), num_vars)
+            self.assertEqual(len(model.proto.constraints), num_constraints)
+
+    def test_condition_literals_are_not_shared_between_printers(self):
+        x = sympy.Symbol("x", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 10, "x")}
+        first = _SympyExprToCpSat(model, sym_map, {})._print_condition(x >= 3)
+        second = _SympyExprToCpSat(model, sym_map, {})._print_condition(x >= 3)
+        self.assertIsNot(first, second)
+
+    def test_a_condition_repeated_across_piecewises_lowers_correctly(self):
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise((1, x >= 3), (5, True)) + sympy.Piecewise(
+            (2 * x, x >= 3), (0, True)
+        )
+        for value in range(6):
+            solver, _ = self._optimize(expr, {"x": (value, value)}, maximize=True)
+            expected = 1 + 2 * value if value >= 3 else 5
+            self.assertEqual(solver.ObjectiveValue(), expected)
+
     def test_shared_load_penalty_lowers_for_product_degrees(self):
         from torch_spyre._inductor.work_division import _matmul_multicast_penalty
 
@@ -1475,6 +1780,65 @@ class TestSympyExprToCpSatPrinter(TestCase):
         solver, sym_map = self._optimize(expr, {"x": (0, 5)}, maximize=True)
         self.assertEqual(solver.ObjectiveValue(), 10)
         self.assertEqual(solver.Value(sym_map["x"]), 2)
+
+    def test_simplify_eq_conjunction(self):
+        x, y = sympy.symbols("x y", integer=True)
+        cases = [
+            (sympy.And(sympy.Eq(x, 2), sympy.Ne(x, 4)), sympy.Eq(x, 2)),
+            (sympy.And(sympy.Eq(x, 2), sympy.Ne(x, 2)), sympy.false),
+            (sympy.And(sympy.Eq(x, 2), sympy.Eq(x, 4)), sympy.false),
+            (
+                sympy.And(sympy.Eq(x, 2), sympy.Ne(y, 4), sympy.Ne(x, 3)),
+                sympy.And(sympy.Eq(x, 2), sympy.Ne(y, 4)),
+            ),
+            (sympy.And(sympy.Ne(x, 2), sympy.Ne(x, 4)), None),
+            (sympy.And(x >= 2, y <= 4), None),
+            (sympy.Eq(x, 2), None),
+        ]
+        for expr, expected in cases:
+            with self.subTest(expr=expr):
+                result = _simplify_eq_conjunction(expr)
+                self.assertEqual(result, expr if expected is None else expected)
+
+    def test_piecewise_eq_chain_lowers_each_branch_to_its_own_literal(self):
+        # Every branch after the first is Eq(x, c) and Ne's of earlier
+        # constants, which simplify to Eq(x, c) alone: no AND literal is
+        # needed until the default branch.
+        x = sympy.Symbol("x", integer=True)
+        expr = sympy.Piecewise(
+            (10, sympy.Eq(x, 0)),
+            (20, sympy.Eq(x, 1)),
+            (30, sympy.Eq(x, 2)),
+            (x, True),
+        )
+        for value in range(5):
+            solver, _ = self._optimize(expr, {"x": (value, value)}, maximize=True)
+            expected = {0: 10, 1: 20, 2: 30}.get(value, value)
+            self.assertEqual(solver.ObjectiveValue(), expected)
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 4, "x")}
+        _SympyExprToCpSat(model, sym_map, {})._print(expr)
+        names = [v.name for v in model.proto.variables]
+        self.assertEqual(sum(n.startswith("and_") for n in names), 1, names)
+        self.assertFalse(any(n.startswith("piecewise_") for n in names), names)
+
+    def test_piecewise_drops_a_branch_that_cannot_hold(self):
+        x = sympy.Symbol("x", integer=True)
+        # Built unevaluated so sympy keeps the shadowed second branch.
+        expr = sympy.Piecewise(
+            (10, sympy.Eq(x, 2)), (20, sympy.Eq(x, 2)), (x, True), evaluate=False
+        )
+        model = cp_model.CpModel()
+        sym_map = {"x": model.new_int_var(0, 4, "x")}
+        cp_expr = _SympyExprToCpSat(model, sym_map, {})._print(expr)
+        self.assertNotIn("20", str(cp_expr))
+        for value in range(5):
+            model = cp_model.CpModel()
+            sym_map = {"x": model.new_int_var(value, value, "x")}
+            model.maximize(_SympyExprToCpSat(model, sym_map, {})._print(expr))
+            solver = cp_model.CpSolver()
+            self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
+            self.assertEqual(solver.ObjectiveValue(), 10 if value == 2 else value)
 
     def test_conditional_cost_keeps_small_coefficients(self):
         x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
@@ -1672,17 +2036,31 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(self._domain_of(model, name), (3, 24))
 
     def test_inverse_scale_falls_back_past_cap(self):
-        # 7 * 11 * 13 = 1001 fits under the cap and stays exact; 7 * 11 * 17 =
-        # 1309 does not, so the default scale and its rounding return.
+        # 7 * 11 * 13 = 1001 fits under the cap and stays exact. 7 * 11 * 17 =
+        # 1309 does not, so the fallback covers 7 and 17 and rounds 11, taking
+        # 5 * 7 * 17 = 595 over the narrower 7 * 17 = 119 because the wider
+        # scale leaves 11 a smaller remainder.
         a = sympy.Symbol("split_a", integer=True, positive=True)
-        _, model = self._pinned_split_cost(1 / a, {"split_a": [1, 7, 11, 13]}, 0)
-        self.assertEqual(self._domain_of(model, "inv_split_a"), (77, 1001))
-        got, model = self._pinned_split_cost(1000 / a, {"split_a": [1, 7, 11, 17]}, 1)
+        under_cap_values = [1, 7, 11, 13]
+        lcm_scale = 7 * 11 * 13
+        _, model = self._pinned_split_cost(1 / a, {"split_a": under_cap_values}, 0)
+        self.assertEqual(
+            self._domain_of(model, "inv_split_a"), (lcm_scale // 13, lcm_scale)
+        )
+
+        over_cap_values = [1, 7, 11, 17]
+        fallback_scale = 5 * 7 * 17
+        numerator = 1000
+        pinned = over_cap_values.index(7)
+        got, model = self._pinned_split_cost(
+            numerator / a, {"split_a": over_cap_values}, pinned
+        )
         self.assertEqual(
             self._domain_of(model, "inv_split_a"),
-            (_CORE_INV_SCALE // 17, _CORE_INV_SCALE),
+            (fallback_scale // 17, fallback_scale),
         )
-        self.assertAlmostEqual(got, 1000 * (_CORE_INV_SCALE // 7) / _CORE_INV_SCALE)
+        # 7 divides the fallback scale, so the pinned division is priced exactly.
+        self.assertAlmostEqual(got, numerator / 7)
 
     @staticmethod
     def _lin_max_operand_sizes(model):
@@ -1777,7 +2155,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         solver = self.solver_class([LifetimeBoundBuffer("solo", 40, [0, 1])], 256, 1)
         (buf,) = solver.plan_layout()
         self.assertIsNotNone(buf.address)
-        self.assertNotIn("solo", solver.spill_reasons)
+        self.assertIsNone(buf.spill_reason)
 
     def test_spilled_buffer_records_reason(self):
         # A buffer larger than capacity is pinned out up front and carries the
@@ -1787,9 +2165,9 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         solver = self.solver_class([small, huge], 256, 1)
         result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["huge"].address)
-        self.assertIn("capacity", solver.spill_reasons["huge"])
+        self.assertIn("capacity", result["huge"].spill_reason)
         self.assertIsNotNone(result["small"].address)
-        self.assertNotIn("small", solver.spill_reasons)
+        self.assertIsNone(result["small"].spill_reason)
 
     def test_allocator_residency_reason_is_honoured(self):
         # The allocator's hard bars (e.g. the restickify cross-frame barrier)
@@ -1807,7 +2185,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["barred"].address)
         self.assertEqual(
-            solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
+            result["barred"].spill_reason, "read by restickify (cross-frame barrier)"
         )
         self.assertIsNotNone(result["free"].address)
 
@@ -2031,6 +2409,118 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat inv-scale tests need ortools")
+class TestInvScale(TestCase):
+    """``_SympyExprToCpSat._inv_scale`` picks the fixed-point scale of an
+    ``inv_<split>`` variable. Its only consumer, ``_print_Symbol``, derives the
+    variable's domain from ``[scale // v for v in raw]`` and constrains it with
+    a truncating ``add_division_equality``, so a scale that is too small for the
+    candidate values does not fail — it silently flattens the reciprocal term in
+    the objective. These tests pin what the choice guarantees: every power-of-two
+    division stays exact, no reciprocal collapses onto 0, whatever the scale
+    does not divide it still rounds to within a few percent, and among scales
+    that tie on both counts the narrowest wins, since these feed products
+    bounded by ``_MAX_PRODUCT_BOUND``."""
+
+    # Candidate divisions come from each axis's divisors (capped at the core
+    # count), so a buffer's values are divisor-closed sets and their products,
+    # with one entry per enumerated division — hence the repeats.
+    EXACT = {
+        "powers of two": [1, 2, 4, 8, 16, 32],
+        "divisors of 24": [1, 2, 3, 4, 6, 8, 12, 24],
+        "repeated": [1, 2, 2, 4, 4, 4, 8],
+    }
+    FALLBACK = {
+        "divisors of 32, 9 and 7": [1, 2, 4, 8, 16, 32, 3, 9, 7],
+        "their 3D grid": [
+            a * b * c
+            for a in (1, 2, 4, 8, 16, 32)
+            for b in (1, 3, 9)
+            for c in (1, 7)
+            if a * b * c <= 32
+        ],
+        "every factor to 32": list(range(1, 33)),
+        "coprime tail": [8, 3, 5, 7, 11, 13],
+        # Nothing to anchor on: no power of two past 1, and no two of these
+        # fit under the cap together with the third.
+        "odd primes": [1, 3, 19, 29],
+    }
+
+    # The cap bounds this: a value v rounds to (scale % v) / scale, and v is at
+    # most the core count, so a scale near _CORE_INV_SCALE cannot be far off.
+    MAX_ERROR = Fraction(1, 25)
+
+    @staticmethod
+    def _scale(raw):
+        conv = _SympyExprToCpSat(cp_model.CpModel(), {}, {"s": (None, list(raw))})
+        return conv._inv_scale("s")
+
+    @staticmethod
+    def _max_error(raw, scale):
+        """Worst relative error of the fixed-point reciprocal ``scale // v``."""
+        return max(Fraction(scale % v, scale) for v in set(raw))
+
+    def test_no_values_falls_back_to_the_constant(self):
+        conv = _SympyExprToCpSat(cp_model.CpModel(), {}, {"empty": (None, ())})
+        self.assertEqual(conv._inv_scale("empty"), _CORE_INV_SCALE)
+        self.assertEqual(conv._inv_scale("absent"), _CORE_INV_SCALE)
+        self.assertEqual(self._scale([1, 0, 4]), _CORE_INV_SCALE)
+
+    def test_exact_lcm_when_it_fits(self):
+        for label, raw in self.EXACT.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertEqual(scale, math.lcm(*raw))
+                self.assertFalse([v for v in raw if scale % v])
+
+    def test_fallback_keeps_every_reciprocal_nonzero(self):
+        # min(values) == 0 would let the solver treat a division as free.
+        for label, raw in self.FALLBACK.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertGreater(math.lcm(*raw), _CORE_INV_SCALE)
+                self.assertLessEqual(scale, _CORE_INV_SCALE)
+                self.assertGreaterEqual(min(scale // v for v in raw), 1)
+
+    def test_powers_of_two_stay_exact(self):
+        # Anchoring on the largest power of two present keeps every smaller one
+        # exact too, on both paths.
+        for label, raw in {**self.EXACT, **self.FALLBACK}.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                pow2 = [v for v in set(raw) if not v & (v - 1)]
+                self.assertFalse([v for v in pow2 if scale % v])
+
+    def test_fallback_rounds_what_it_cannot_divide(self):
+        for label, raw in self.FALLBACK.items():
+            with self.subTest(label):
+                self.assertLessEqual(
+                    self._max_error(raw, self._scale(raw)), self.MAX_ERROR
+                )
+
+    def test_fallback_covers_candidates_before_it_rounds_well(self):
+        # 840 = 8 * 3 * 5 * 7 divides all but 11 and 13. 1008 rounds every
+        # value to within 1/144 -- a better worst case than 840's 1/105 -- but
+        # divides only 8 and 7, so the count decides first and 840 wins.
+        raw = self.FALLBACK["coprime tail"]
+        scale = self._scale(raw)
+        self.assertEqual(scale, 840)
+        self.assertEqual([v for v in raw if scale % v], [11, 13])
+        self.assertLess(self._max_error(raw, 1008), self._max_error(raw, scale))
+
+    def test_fallback_takes_the_narrowest_of_the_equally_good(self):
+        # 288 = 32 * 9 divides every candidate but 7, which no multiple of 32
+        # under the cap reaches. 864 divides the same values and rounds 7 to
+        # the same 1/288, so both keys tie and the narrower scale wins: these
+        # multiply into products capped at _MAX_PRODUCT_BOUND.
+        raw = self.FALLBACK["divisors of 32, 9 and 7"]
+        scale = self._scale(raw)
+        self.assertEqual(scale, 288)
+        self.assertEqual([v for v in raw if scale % v], [7])
+        self.assertEqual([v for v in raw if 864 % v], [7])
+        self.assertEqual(self._max_error(raw, 864), self._max_error(raw, 288))
 
 
 if __name__ == "__main__":
