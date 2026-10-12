@@ -14,6 +14,7 @@
 
 # Helper methods to handle views
 
+import dataclasses
 from dataclasses import dataclass, astuple
 import math
 import sympy
@@ -781,6 +782,7 @@ class AlignmentInputs:
     repeat_info: dict[sympy.Symbol, dict]
     concrete_ranges: dict[sympy.Symbol, int | float]
     restored_ranges: dict[sympy.Symbol, sympy.Expr | int | float]
+    index_tensor_indices: frozenset[int] = dataclasses.field(default_factory=frozenset)
 
 
 class UnalignedStickSplit(Unsupported):
@@ -809,6 +811,7 @@ def build_alignment_inputs(
     tensors: list[Dict[str, Any]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     repeat_info: "dict[sympy.Symbol, dict] | None" = None,
+    index_tensor_indices: "frozenset[int] | None" = None,
 ) -> AlignmentInputs:
     """Snapshot explicit inputs for a repeatable, side-effect-free alignment."""
 
@@ -843,6 +846,7 @@ def build_alignment_inputs(
         },
         concrete_ranges=concrete_ranges,
         restored_ranges=restored_ranges,
+        index_tensor_indices=frozenset(index_tensor_indices or ()),
     )
 
 
@@ -877,6 +881,7 @@ def align_tensors_pure(
     indirect_sizes = inputs.indirect_sizes
     repeat_info = inputs.repeat_info
     var_ranges = dict(inputs.concrete_ranges)
+    index_tensor_indices = inputs.index_tensor_indices
 
     # work division for each variable
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
@@ -972,6 +977,10 @@ def align_tensors_pure(
         if var is None:
             # A constant/broadcast innermost coordinate has no stick loop to split.
             continue
+        # Index tensors are exempt from the stick-alignment constraint: the spec
+        # allows splitting an index tensor's entry dimension at any granularity.
+        if tensor_index in index_tensor_indices:
+            continue
         has_outer_stick_coordinate = any(
             term.var == var and term.den == physical_stick_size for term in terms[:-1]
         )
@@ -1009,11 +1018,25 @@ def align_tensors_pure(
                 # Re-intersect the committed split against the basis work
                 # division used for this var.
                 if v == var and v in stick_dim:
-                    # Stick var: stick count. The element range would drop a
-                    # legal split when the size is not a multiple of it
-                    # (e.g. gcd(2, 67) == 1).
-                    eps = int(stick_size[stick_dim.index(v)])
-                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                    # Check whether v is the stick variable for any non-index
+                    # tensor.  Index tensors are exempt from the stick-multiple
+                    # constraint (the spec allows splitting their entry dim at
+                    # any granularity), so stick-count rounding is only needed
+                    # when at least one non-index tensor's stick uses this var.
+                    non_index_stick_indices = [
+                        j
+                        for j, sd in enumerate(stick_dim)
+                        if sd == v and j not in index_tensor_indices
+                    ]
+                    if non_index_stick_indices:
+                        # Stick var for a data tensor: stick count.  The
+                        # element range would drop a legal split when the size
+                        # is not a multiple of it (e.g. gcd(2, 67) == 1).
+                        eps = int(stick_size[non_index_stick_indices[0]])
+                        basis = (int(new_var_ranges[v]) + eps - 1) // eps
+                    else:
+                        # Stick var only for index tensors: element range.
+                        basis = new_var_ranges[v]
                 else:
                     # Non-stick var (or synthetic sub-dim): element range.
                     basis = new_var_ranges[v]
@@ -1168,6 +1191,7 @@ def align_tensors(
     tensors: list[Dict[str, list[sympy.Expr]]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
     repeat_info: "dict[sympy.Symbol, dict] | None" = None,
+    index_tensor_indices: "frozenset[int] | None" = None,
 ) -> tuple[
     dict[sympy.Symbol, tuple[sympy.Expr, int]],
     list[dict[str, list]],
@@ -1176,7 +1200,13 @@ def align_tensors(
     """Build explicit alignment inputs, then run the pure implementation."""
 
     return align_tensors_pure(
-        build_alignment_inputs(iteration_space, tensors, indirect_sizes, repeat_info)
+        build_alignment_inputs(
+            iteration_space,
+            tensors,
+            indirect_sizes,
+            repeat_info,
+            index_tensor_indices,
+        )
     )
 
 

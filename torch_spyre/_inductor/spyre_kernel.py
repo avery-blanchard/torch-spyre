@@ -1097,6 +1097,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if self.indirect_vars
             else None,
             repeat_info=self._alignment_repeat_info,
+            indirect_var_names=self.indirect_var_names(),
         )
         return op_spec
 
@@ -1855,6 +1856,7 @@ def simplify_op_spec(
     indirect_access_subs=None,
     *,
     repeat_info=None,
+    indirect_var_names=None,
 ):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
@@ -1864,6 +1866,11 @@ def simplify_op_spec(
         # symbol on both operands, so align_tensors matches them by that symbol.
         _restickify_restore_elided_dim(op_spec)
 
+    index_tensor_indices = frozenset(
+        i
+        for i, arg in enumerate(op_spec.args)
+        if _is_indirect_index_arg(arg, indirect_var_names)
+    )
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         op_spec.iteration_space,
         [
@@ -1872,6 +1879,7 @@ def simplify_op_spec(
         ],
         indirect_sizes,
         repeat_info=repeat_info,
+        index_tensor_indices=index_tensor_indices,
     )
     op_spec.iteration_space = new_op_space_splits
 
