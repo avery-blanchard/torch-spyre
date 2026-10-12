@@ -619,10 +619,12 @@ class TestEmptyLxEligibility(unittest.TestCase):
         empty = _fixed_tiled_layout((0, 64))
         nonempty = _fixed_tiled_layout((64, 64))
         zero_extent = _fixed_tiled_layout((64, 64))
+        _ds = [1, 0, 64]
         zero_extent.device_layout = SpyreTensorLayout(
-            [1, 0, 64],
+            _ds,
             [64, 64, 1],
             DataFormats.SEN169_FP16,
+            {(i,): _ds[i] for i in range(len(_ds))},
             ElementArrangement.STANDARD,
         )
         self.assertEqual(
@@ -2300,7 +2302,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 [32, 32, 1, 1, 64],
                 [32, 1, -1, 65536, 1024],
                 fp16,
-                {(0,): 32, (1,): 32, (2, 4): 64, (3,): 1},
+                {(0,): 32, (1,): 32, (4,): 64},
             )
         )
         w_dev = w.to(
@@ -2308,7 +2310,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 [3, 3, 1, 1, 64],
                 [1, 3, -1, 9, 9],
                 fp16,
-                {(0,): 3, (1,): 3, (2, 4): 1, (3,): 64},
+                {(0,): 3, (1,): 3, (4,): 64},
             )
         )
         return x, w, x_dev, w_dev

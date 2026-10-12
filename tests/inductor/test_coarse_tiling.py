@@ -2153,6 +2153,7 @@ class TestDivideRanges(unittest.TestCase):
             [1, 256, 64],
             [64, 64, 1],
             expected.device_dtype,
+            {(0,): 1, (1,): 256, (2,): 64},
             expected.element_arrangement,
         )
         self.assertNotEqual(layout.device_layout, buggy)
@@ -8319,7 +8320,11 @@ class TestValidateTiling(unittest.TestCase):
         self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+            [64, 80, 1, 64],
+            [5120, 64, -1, 1],
+            dl.device_dtype,
+            {(0,): 64, (1,): 80, (2, 3): 64},
+            dl.element_arrangement,
         )
         self.assertIsNone(predict_frame(op, spec))
 
