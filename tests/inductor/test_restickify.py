@@ -2529,6 +2529,7 @@ def test_size1_grow_prepends_size64_gap_dim():
         list(_SIZE1_COLLAPSED_DEVICE_SIZE),
         list(_SIZE1_COLLAPSED_STRIDE_MAP),
         DataFormats.SEN169_FP16,
+        {(0,): 67, (1, 3): 7, (2,): 1},
         ElementArrangement.STANDARD,
     )
     layout = FixedTiledLayout(

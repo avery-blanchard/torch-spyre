@@ -570,6 +570,14 @@ class TestBuildingBlocks(unittest.TestCase):
                 1,
             ],
             device_dtype=get_device_dtype(dtype),
+            valid_elements={
+                (0, 6): head_dim,
+                (1,): 1,
+                (2,): 1,
+                (3,): 1,
+                (4,): 1,
+                (5,): query_heads,
+            },
         )
 
         expected = sdpa(query, key, value, mask)
