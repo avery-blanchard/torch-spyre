@@ -152,6 +152,12 @@ class SpyreTensorLayout {
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
         valid_elements(std::move(valid_elements)) {
+    // Normalize legacy -1 to 0.
+    for (auto& s : this->stride_map) {
+      TORCH_CHECK(s >= -1, "Invalid SpyreTensorLayout: stride_map entry ", s,
+                  " is not a valid stride (must be >= -1)");
+      if (s == -1) s = 0;
+    }
     validate_shape();
   }
 
