@@ -470,6 +470,10 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   auto& kernel_activity = traceBuffer_.activities.back();
   kernel_activity->startTime = activity->start;
   kernel_activity->endTime = activity->end;
+  kernel_activity->addMetadataQuoted(
+      "timestamp_source", activity->timestamps_estimated
+                              ? "estimated (host completion, 1 ns/tick)"
+                              : "calibrated");
   kernel_activity->id = activity->correlation_id;
   kernel_activity->device = activity->device_id;
   kernel_activity->resource = activity->stream_id;
@@ -593,6 +597,10 @@ void AiuptiActivityProfilerSession::handleMemcpyActivity(
   auto& memcpy_activity = traceBuffer_.activities.back();
   memcpy_activity->startTime = activity->start;
   memcpy_activity->endTime = activity->end;
+  memcpy_activity->addMetadataQuoted(
+      "timestamp_source", activity->timestamps_estimated
+                              ? "estimated (host completion, 1 ns/tick)"
+                              : "calibrated");
   memcpy_activity->id = activity->correlation_id;
   memcpy_activity->device = activity->device_id;
   memcpy_activity->resource = getResourceId(activity);
@@ -670,6 +678,8 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
     auto& mem_activity = traceBuffer_.activities.back();
     mem_activity->startTime = activity->start;
     mem_activity->endTime = activity->end;
+    // Memory management uses host timestamps, not calibrated device ticks.
+    mem_activity->addMetadataQuoted("timestamp_source", "host");
     mem_activity->id = activity->correlation_id;
     mem_activity->device = activity->device_id;
     mem_activity->resource = getResourceId(activity);
@@ -714,6 +724,7 @@ void AiuptiActivityProfilerSession::handleMemoryActivity(
   auto& memory_event = traceBuffer_.activities.back();
 
   memory_event->startTime = activity->start;
+  memory_event->addMetadataQuoted("timestamp_source", "host");
 
   // Following convention where all memory events are put on the
   // CPU thread. "Device Type" will denote CPU vs. AIU memory events
@@ -749,6 +760,8 @@ void AiuptiActivityProfilerSession::handleMemsetActivity(
   auto& memset_activity = traceBuffer_.activities.back();
   memset_activity->startTime = activity->start;
   memset_activity->endTime = activity->end;
+  // Libaiupti represents host-timed allocations as MEMSET records.
+  memset_activity->addMetadataQuoted("timestamp_source", "host");
   memset_activity->id = activity->correlation_id;
   memset_activity->device = activity->device_id;
   // TODO(mcalman): investigate why memset activities are being processed out
