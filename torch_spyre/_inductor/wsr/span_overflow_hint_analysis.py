@@ -1130,7 +1130,7 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
             syms = coord.free_symbols
             if not syms or any(sym in symbol_to_dim for sym in syms):
                 continue
-            span_elems = _coordinate_span_elems(coord, dep, {sym: 1 for sym in syms})
+            span_elems = _coordinate_span_elems(coord, dep, dict.fromkeys(syms, 1))
             if span_elems is None:
                 continue
             best_inner = _best_case_inner_span(

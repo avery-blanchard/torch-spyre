@@ -294,7 +294,7 @@ def multi_dim_iteration_space_split(
     symbol_meta = symbol_meta or {}
     is_reduction_included = bool(reduction_dims)
 
-    splits = {v: 1 for v in iteration_space}
+    splits = dict.fromkeys(iteration_space, 1)
     cores_used = 1
 
     mandatory_splits = dict(min_splits or {})
