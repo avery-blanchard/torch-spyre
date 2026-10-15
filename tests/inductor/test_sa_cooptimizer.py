@@ -1246,6 +1246,25 @@ class CostExprScoringTest(TestCase):
             solver._score_fn([configs[2]], frozenset()), utils.to_fixed_us(40 / 1000)
         )
 
+    def test_tile_count_symbol_drives_the_score(self):
+        # A tiled menu candidate declares the buffer's tile-count symbol, and
+        # the score binds it from the chosen config's own tiling: ``chosen``
+        # holds configs, not menu positions.
+        tiled = CoreDivision(
+            splits={0: 2}, tiling=TileSpec((TileAxis(host_dim=0, count=4),))
+        )
+        buffers = [_cdbuf("A", [], {}, divisions=[CoreDivision(splits={0: 2}), tiled])]
+        solver = SaCoOptimizingSolver(buffers, 1 << 30, 128)
+        (sym,) = buffers[0].sym_tile_counts.values()
+        solver.plan_layout_and_core_divisions(sym * 10)
+        configs = solver._sources[0].configs
+        self.assertEqual(
+            solver._score_fn([configs[0]], frozenset()), utils.to_fixed_us(10 / 1000)
+        )
+        self.assertEqual(
+            solver._score_fn([configs[1]], frozenset()), utils.to_fixed_us(40 / 1000)
+        )
+
     def test_residency_and_multiple_core_division_symbols_combine(self):
         # A single cost_expr mixing sym_is_lx with more than one sym_core_divs
         # entry (two output-split keys and one reduction-split key) at once --
