@@ -195,7 +195,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   for (int i = device_rank - 1; i > -1; i--) {
     device_strides[i] = prev_size;
     prev_size *= stl.device_size[i];
-    // Size 1 dimensions are ignored.
+    // stride_map == 0: size-1, broadcast, or gap dim — skip (no host stride).
     if (stl.stride_map[i] == 0) continue;
     host_strides[i] = stl.stride_map[i];
   }

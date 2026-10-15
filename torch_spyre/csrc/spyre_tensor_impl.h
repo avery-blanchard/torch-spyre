@@ -171,6 +171,10 @@ class SpyreTensorLayout {
         device_dtype(device_dtype),
         element_arrangement(element_arrangement),
         valid_elements(std::move(valid_elements)) {
+    // Normalize legacy -1 to 0.
+    for (auto& s : this->stride_map) {
+      if (s < 0) s = 0;
+    }
     validate_shape();
   }
 
@@ -190,9 +194,9 @@ class SpyreTensorLayout {
    * get_device_stride_infos checks every divisor before use.
    *
    * stride_map entries are deliberately not range-checked here: 0 marks a
-   * size-1, sparse, or broadcast dimension — all legitimate. Consistency
-   * between stride_map and the host strides is only knowable at use time and
-   * is checked in get_device_stride_infos.
+   * size-1, sparse, or broadcast — all legitimate. Consistency between
+   * stride_map and the host strides is only knowable at use time and is checked
+   * in get_device_stride_infos.
    */
   void validate_shape() const {
     TORCH_CHECK(!device_size.empty(),

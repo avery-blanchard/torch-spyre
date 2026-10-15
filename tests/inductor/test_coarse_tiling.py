@@ -9871,7 +9871,7 @@ class TestPredictFrame(unittest.TestCase):
         With a stick host dim of exactly one stick (64 elems at fp16), the
         tile-count dim has size 1 too. ``_resize_device_layout`` used to match
         it to host dim 0 by size once level 1 put that at extent 1, collapsing
-        its stride to ``-1`` at level 2, which a one-shot full->tile resize
+        its stride to ``0`` at level 2, which a one-shot full->tile resize
         never did; hence ``_predict_output_layout`` resizes once per level,
         as ``_divide_ranges`` does.
         """

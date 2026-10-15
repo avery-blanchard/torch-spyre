@@ -163,12 +163,16 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
 
     The generic layout constructor retains a broadcast dimension's logical
     extent in ``device_size`` even though its zero ``stride_map`` makes every
-    access land at coordinate zero.  That is useful for host transfers, which
-    materialize expanded tensors, but it needlessly multiplies the allocation
+    access land at coordinate zero.  That needlessly multiplies the allocation
     and span of compiler-generated overlapping buffers such as coarse-tile read
     copies.  Collapse every such non-stick device dimension to one.  The final
     device dimension remains a full hardware stick; making its stride zero is
     enough to represent a broadcast stick.
+
+    Only collapses dimensions whose ``device_size > 1``: a dimension already at
+    size 1 needs no rebuild and skipping it avoids an otherwise latent ordering
+    dependency — if padding inserts a stride-zero gap dim before this pass runs,
+    the size-1 skip keeps the rebuilt STL identical regardless of call order.
     """
     device_size = list(stl.device_size)
     stride_map = list(stl.stride_map)
@@ -176,9 +180,9 @@ def _compact_broadcast_device_dims(stl: SpyreTensorLayout) -> SpyreTensorLayout:
     for dim, stride in enumerate(stride_map):
         if stride != 0:
             continue
-        if dim != len(device_size) - 1:
+        if dim != len(device_size) - 1 and device_size[dim] != 1:
             device_size[dim] = 1
-        changed = True
+            changed = True
     if not changed:
         return stl
     return SpyreTensorLayout(
