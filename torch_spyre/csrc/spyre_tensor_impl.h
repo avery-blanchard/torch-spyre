@@ -133,10 +133,6 @@ class SpyreTensorLayout {
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
    *
-   * When valid_elements is omitted, it defaults to
-   * compute_valid_elements(device_size), which conservatively treats every
-   * device element as valid. This is incorrect for padded tensors and should
-   * not be relied upon until the caller supplies accurate valid_elements.
    *
    * @deprecated Use the overload that takes valid_elements as a required
    * parameter (before element_arrangement) to ensure accurate padding
