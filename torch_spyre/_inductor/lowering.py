@@ -2040,12 +2040,21 @@ def lower_where(condition, self, other):
     return result
 
 
+# type_promotion_kind=None: DEFAULT performs FP16→FP32 promotion before layout
+# propagation, leaving an IR node with STANDARD EA.  With None the FP16 operand
+# survives into the fused body so propagate_layouts can assign DL16_TO_FP32 EA.
+# The underlying lowering applies default promotion; when both operands stay
+# int32, SpyreOpFuncs.add / SpyreOpFuncs.mul emits the dedicated hardware op
+# (addi32toi32 / muli32toi32).
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_add(x, y, *, alpha=1):
+    # Keep the explicit scale-and-realize for alpha != 1. Delegating to
+    # lowering.add(x, y, alpha=alpha) fails for fractional alpha (test_add_alpha,
+    # alpha=0.5) with InductorError "No FX node for buf1" from split_multi_ops.
     if alpha != 1:
         alpha_tensor = lower_full(
             y.get_size(),
@@ -2054,20 +2063,25 @@ def lower_add(x, y, *, alpha=1):
             device=y.get_device(),
         )
         alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y = lowering.mul(y, alpha_tensor)
         y.realize()
-    return with_int64_fallback(lowering.add, x, y)
+    return lowering.add(x, y)
 
 
+# Same type_promotion_kind=None rationale as lower_add above.
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
     broadcast=True,
 )
 def lower_mul(x, y):
-    return with_int64_fallback(lowering.mul, x, y)
+    return lowering.mul(x, y)
 
 
+# NOTE (follow-up): int64 sub still goes through the fp32 round-trip in
+# with_int64_fallback, so unlike add/mul it is inexact above 2**24. The planned
+# fix is to rewrite ``x - alpha * y`` as ``x + (-alpha) * y`` so that int32/int64
+# sub reuses the native addi32toi32 / muli32toi32 path.
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
