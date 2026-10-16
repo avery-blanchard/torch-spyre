@@ -80,8 +80,9 @@ but never above not tiling. What a tiling does is divide `_per_core_size` by `ou
 well as `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid
 in the HBM traffic residency then frees.
 
-The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: this
-engine, and `config.auto_coarse_tiling` (off by default; see its comment).
+The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: a
+solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
+`config.auto_coarse_tiling` (off by default; see its comment).
 
 Three move types:
 

@@ -1852,7 +1852,12 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
         )
 
     def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
-        """Only a search that generates divisions can carry a ``TileSpec``."""
+        """Only a search that generates divisions can carry a ``TileSpec``:
+        CP-SAT chooses tilings too, but off the menu."""
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
+
         for flag in (False, True):
             with (
                 self.subTest(auto_coarse_tiling=flag),
@@ -1863,7 +1868,7 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
                     flag,
                 )
                 self.assertFalse(
-                    self._allocator(mock.MagicMock())._solver_chooses_tilings
+                    self._allocator(CpSatLayoutSolver)._solver_chooses_tilings
                 )
 
 

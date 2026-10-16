@@ -675,11 +675,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
 
     Args:
         buffers: the buffers to plan, in the allocator's order. Declared as
-            ``Sequence[LifetimeBoundBuffer]`` so the class itself satisfies
-            ``CoreDivisionSolverFactory`` (``Callable`` parameters are
-            contravariant, so a narrower annotation would not), but every buffer
-            passed must be a :class:`CoreDivisionBuffer` -- the engine reads
-            each one's ``core_divisions``, its residency relation to each parent
+            ``Sequence[LifetimeBoundBuffer]`` to match the base constructor the
+            allocator calls, but every buffer passed must be a
+            :class:`CoreDivisionBuffer` -- the engine reads each one's
+            ``core_divisions``, its residency relation to each parent
             (``division_space`` and ``residency_edges`` where the allocator
             built them, ``cd_parent_matches`` otherwise), and its cost symbols.
 
@@ -692,6 +691,34 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         size: scratchpad capacity in bytes.
         alignment: placement alignment (128 = one Spyre stick).
     """
+
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def generates_divisions(cls) -> bool:
+        return True
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return True
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
 
     def __init__(
         self,
@@ -789,7 +816,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             # relayout price is one; see RelayoutCopyBuffer.cost_term). It is the
             # menu position, not the key, so equal configs need not bind alike: a
             # generated config has no position at all. Sound only while no such
-            # term reaches the annealer, which lx_solver_relayout() ensures (#4425).
+            # term reaches the annealer, which ``decides_lx_relayouts()`` ensures
+            # (#4425).
             value_of[buf.sym_division] = lambda chosen, resident, idx=idx: (
                 chosen[idx].menu_index
             )
