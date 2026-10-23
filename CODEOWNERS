@@ -35,7 +35,7 @@
 /codegen/                @ani300 @moriohara @pradghos
 
 # Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos @anubhavjana @n-marion @thoangtrvn @cyang49 @marnold-ibm @jjhursey
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos @anubhavjana @n-marion @thoangtrvn @cyang49 @marnold-ibm
 
 # Distributed tests (more specific than /tests/ above — must come after it so
 # the last-matching-pattern rule gives these owners precedence)
@@ -50,6 +50,8 @@
 /pytest.ini               @ashokponkumar @jabostian @anubhavjana @n-marion
 /pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
 /Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
+
+/extensions/clickhouse-ingest/  @ashokponkumar @jabostian @anubhavjana @n-marion
 
 # ktir-mlir-frontend pin and its installer.  Two files rather than /tools/, which
 # is otherwise CI's: which frontend revision the OpSpec->KTIR emitter is tested

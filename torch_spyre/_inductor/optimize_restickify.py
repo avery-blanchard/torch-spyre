@@ -22,7 +22,6 @@ from typing import Any
 
 import sympy
 
-from . import config
 from .logging_utils import get_inductor_logger
 
 from torch._inductor.dependencies import MemoryDep
@@ -60,6 +59,7 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        forbidden_stick_sym: "sympy.Symbol | None" = None,
     ):
         self.dep = dep
         self._op = op
@@ -68,6 +68,7 @@ class EdgeCostMap:
         self._target_dep = target_dep
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
+        self._forbidden_stick_sym = forbidden_stick_sym
 
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
@@ -98,6 +99,14 @@ class EdgeCostMap:
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
+        if not needed and self._forbidden_stick_sym is not None:
+            stick_expr = device_coordinates(in_stl, self.dep, None)[-1]
+            if self._forbidden_stick_sym in stick_expr.free_symbols:
+                # Input stick contains a forbidden symbol (e.g. topk reduction
+                # var): this pairing is invalid even though stick_compatible
+                # accepted it. Mark as infeasible so the optimizer is forced to
+                # pick a different input candidate or output STL.
+                needed, tgt = True, None
         if not needed:
             cost = 0.0
             self._layout[in_stl][target_stl] = None
@@ -188,13 +197,24 @@ class AllSameNode(RestickNodeCost):
     """
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_deps, op):
+    def from_args(
+        cls,
+        args,
+        out_layouts,
+        out_deps,
+        op,
+        forbidden_stick_sym: "sympy.Symbol | None" = None,
+    ):
         """Build an AllSameNode from input PropArgs and output dep(s).
 
         out_deps is either a single MemoryDep (normal ops) or a list whose first
         entry is the primary output dep and whose remaining entries are co-output
         MemoryDeps (e.g. the shared mutation buffer in copy_forced). Co-output deps
         must agree on the same layout but are not eligible for restickify insertion.
+
+        forbidden_stick_sym: if set, any input whose stick expression contains this
+        symbol is treated as incompatible regardless of stick_compatible() — the
+        optimizer is forced to restickify or pick a different layout.
         """
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         if not isinstance(out_deps, list):
@@ -202,7 +222,10 @@ class AllSameNode(RestickNodeCost):
         out_dep = out_deps[0]  # reference output dep for stick-compatibility checks
         co_output_deps = out_deps[1:]
         input_edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
+            EdgeCostMap(
+                arg.dep, arg.layouts, out_layouts, out_dep, op, forbidden_stick_sym
+            )
+            for arg in args
         ]
         output_edge_costs = [
             EdgeCostMap(
@@ -272,26 +295,48 @@ class FixedInOutNode(RestickNodeCost):
         edge_costs,
         required_out_stl: "SpyreTensorLayout",
         required_in_stls: "list[SpyreTensorLayout]",
+        out_dep: "MemoryDep",
     ):
         super().__init__(edge_costs)
-        self.required_out_stl = required_out_stl  # output layout currently assigned
-        self.required_in_stls = (
-            required_in_stls  # each input must be stick-compatible with this layout
-        )
+        self.required_out_stl = required_out_stl
+        # Parallel to edge_costs by construction in from_args (both built from the
+        # same zip over args/req_stls). strict=True in min_input_cost asserts this.
+        self.required_in_stls = required_in_stls
+        self._out_dep = out_dep
+        self._out_host = V.graph.get_buffer(out_dep.name).get_layout()
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, out_dep):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
             EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
             for arg, req in zip(args, req_stls)
         ]
-        return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
+        return cls(
+            edge_costs,
+            required_out_stl=out_stl,
+            required_in_stls=req_stls,
+            out_dep=out_dep,
+        )
+
+    def _out_stick_compatible(self, out_stl: "SpyreTensorLayout") -> bool:
+        """True if out_stl is stick-compatible with required_out_stl."""
+        if out_stl == self.required_out_stl:
+            return True
+        needed, _ = compute_restickify_needed(
+            self.required_out_stl,
+            self._out_host,
+            self._out_dep,
+            out_stl,
+            self._out_dep,
+            None,
+        )
+        return not needed
 
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
         return sum(
             ec.cost(lk, rk)
@@ -302,24 +347,24 @@ class FixedInOutNode(RestickNodeCost):
         return list(zip(self.edge_costs, self.required_in_stls))
 
     def min_input_cost(self, dep_name, in_stl, out_stl):
-        if out_stl != self.required_out_stl:
+        if not self._out_stick_compatible(out_stl):
             return INF
-        # Returns on first match. If dep_name appears twice (e.g. matmul(x, x)),
-        # the two positions may have different required_in_stls — this would return
-        # the wrong cost. All current FixedInOutNode ops require the same STL for
-        # both positions of a self-matmul, so this is safe today.
-        for ec, req in zip(self.edge_costs, self.required_in_stls):
-            if ec.dep.name == dep_name:
-                edge_c = ec.cost(in_stl, req)
-                if edge_c == INF:
-                    return INF
-                other_ok = all(
-                    any(e.cost(other_c, r) < INF for other_c in e._in_layouts)
-                    for e, r in zip(self.edge_costs, self.required_in_stls)
-                    if e.dep.name != dep_name
-                )
-                return edge_c if other_ok else INF
-        return INF
+        matching = [
+            (ec, req)
+            for ec, req in zip(self.edge_costs, self.required_in_stls, strict=True)
+            if ec.dep.name == dep_name
+        ]
+        if not matching:
+            return INF
+        costs = [ec.cost(in_stl, req) for ec, req in matching]
+        if any(c == INF for c in costs):
+            return INF
+        other_ok = all(
+            any(e.cost(other_c, req) < INF for other_c in e._in_layouts)
+            for e, req in zip(self.edge_costs, self.required_in_stls, strict=True)
+            if e.dep.name != dep_name
+        )
+        return sum(costs) if other_ok else INF
 
 
 class AnyInNode(RestickNodeCost):
@@ -418,66 +463,6 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
     lines += ["", "  Problem:"]
     lines += analysis if analysis else ["    No automated triage available"]
     return NotImplementedError("\n".join(lines))
-
-
-def greedy_local_min_cost(operations: list) -> None:
-    """Greedy layout selection: process ops in topological order, picking the output layout with minimum local restick cost.
-
-    On cost ties, the first candidate layout (leftmost arg's stick) is chosen. Each op's chosen
-    layout is committed immediately so downstream ops can read it.
-    """
-
-    # Process graph inputs first so all upstreams have committed_stl.
-    # For now inputs are always a set of size 1, since we use it as it
-    # was transferred to device
-    for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
-        if (
-            isinstance(tb, TensorBox)
-            and isinstance(tb.data, StorageBox)
-            and isinstance(tb.data.data, InputBuffer)
-            and hasattr(tb, "layouts")
-        ):
-            if not tb.layouts:
-                raise AssertionError(f"graph input {name} has empty layouts set")
-            stl = next(iter(tb.layouts))
-            tb.data.data.committed_stl = stl
-            tb.committed_stl = stl
-
-    for op in operations:
-        if not hasattr(op, "layouts"):
-            continue  # FallbackKernel and other unhandled op types
-
-        assert hasattr(op, "restick_cost_fn"), (
-            f"op {op.get_name()} has layouts but no restick_cost_fn"
-        )
-        cost_fn = op.restick_cost_fn
-
-        # Collect each input arg's committed layout (finalized by earlier topo iterations).
-        in_layouts = []
-        for ec in cost_fn.edge_costs:
-            buf = V.graph.get_buffer(ec.dep.name)
-            assert hasattr(buf, "committed_stl"), (
-                f"buffer {ec.dep.name} has no committed_stl — "
-                "topological order violated or input not committed"
-            )
-            in_layouts.append(buf.committed_stl)
-
-        assert op.layouts, (
-            f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
-        )
-        out_stl = None
-        best_cost = float("inf")
-        for candidate_stl in op.layouts:
-            out_layout_cost = cost_fn.cost(in_layouts, candidate_stl)
-            if out_layout_cost < best_cost:
-                best_cost = out_layout_cost
-                out_stl = candidate_stl
-
-        if out_stl is None:
-            raise _no_feasible_layout_error(op)
-
-        op.committed_stl = out_stl
 
 
 # Global Stick Optimizer
@@ -858,9 +843,5 @@ def beam_global_min_cost(operations: list) -> None:
 def optimize_restickify_locations(graph: GraphLowering) -> None:
     """Select restickify locations for all ops, minimizing total restickify cost."""
     operations = graph.operations
-    if config.global_stick_optimizer:
-        logger.info("optimizer: beam (global)")
-        beam_global_min_cost(operations)
-    else:
-        logger.info("optimizer: greedy (local)")
-        greedy_local_min_cost(operations)
+    logger.info("optimizer: beam (global)")
+    beam_global_min_cost(operations)

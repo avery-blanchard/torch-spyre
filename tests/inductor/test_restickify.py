@@ -33,7 +33,6 @@ from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
-from torch._inductor.exc import InductorError
 from torch_spyre._inductor import config
 from utils_inductor import _compile_and_run, compare_with_cpu
 
@@ -57,7 +56,7 @@ def _seed_rng():
 def _compute_cost(restickify_plan):
     assert restickify_plan is not None, "restickify_plan should not be None"
     return sum(
-        math.prod(int(s) for s in entry["target_layout"].size)
+        math.prod(int(s) for s in entry.target_layout.size)
         for entries in restickify_plan.values()
         for entry in entries
     )
@@ -77,6 +76,23 @@ def _compile_and_run_plan_capture(fn, *args):
         spyre_result = _compile_and_run(fn, args, DEVICE)
 
     return spyre_result, captured.get("plan", {})
+
+
+def _compile_and_run_nonstick_capture(fn, *args):
+    import torch_spyre._inductor.passes as _passes
+
+    captured = {}
+    finalize_layouts = _passes.finalize_layouts
+
+    def capturing_finalize_layouts(graph):
+        finalize_layouts(graph)
+        captured["plan"] = dict(V.graph.restickify_plan)
+        captured["nonstick_log"] = dict(getattr(V.graph, "nonstick_reorder_log", {}))
+
+    with patch.object(_passes, "finalize_layouts", capturing_finalize_layouts):
+        spyre_result = _compile_and_run(fn, args, DEVICE)
+
+    return spyre_result, captured.get("plan", {}), captured.get("nonstick_log", {})
 
 
 def _strict_size1_input_arm(fn, x, expected_arm):
@@ -564,15 +580,76 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+def test_matmul_unit_n_2d():
+    """2D matmul where N=1 (output is a column vector)."""
+    x = torch.rand(5, 64, dtype=torch.float16)
+    y = torch.rand(64, 1, dtype=torch.float16)
+    _compare(lambda x, y: x @ y, x, y)
+
+
+def test_matmul_unit_n_2d_reduce():
+    """2D matmul where Y is sparse"""
+    x = torch.rand(5, 64, dtype=torch.float16)
+    y = torch.rand(64, 64, dtype=torch.float16)
+    _compare(lambda x, y: x @ y.sum(dim=-1, keepdim=True), x, y)
+
+
+def test_bmm_unit_m():
+    """M=1 matmul: x is a 2D matmul output consumed as x[:1] by a second linear."""
+    a = torch.randn((128, 256), dtype=torch.float16) * 0.1
+    w1 = torch.randn((256, 256), dtype=torch.float16) * 0.1
+    w2 = torch.randn((128, 256), dtype=torch.float16) * 0.1
+
+    def fn(a, w1, w2):
+        x = a @ w1
+        return torch.nn.functional.linear(x[:1], w2)
+
+    _compare(fn, a, w1, w2)
+
+
+def test_bmm_unit_n():
+    """Batched matmul with N=1 output dimension (decode-style query matmul).
+
+    Both x and y are (32, 1, 128); y is transposed before the matmul giving
+    out: (32, 1, 1).  When N=1 the N symbol is constant-folded away, producing
+    a sparse y layout.  Verifies the compiler handles it correctly.
+    """
+    x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    y = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x, y: torch.matmul(x, y.transpose(1, 2)), x, y)
+
+
+def test_bmm_unit_self_1():
+    """Self-matmul where N=1: same tensor for both operands with a sparse y layout."""
+    x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
+
+
+def test_bmm_unit_self_2():
+    """Self-matmul where M=N=2: exercises restickify occurrence-counter bookkeeping for the self-alias case."""
+    x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
+
+
+def test_bmm_self():
+    """Self-matmul: same tensor for both operands, forcing the optimizer to
+    distinguish the LHS and RHS restickify edges even though both reads share
+    one deduplicated MemoryDep."""
+    x = torch.randn((32, 2, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x, optimal_cost=x.numel())
+
+
 # ------- FallbackKernel + restickify regression test ---------
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 def test_fallback_with_restickify():
-    # FallbackKernel (torch.sin) produces a MultiOutput node. Verify the optimizer
-    # handles it via AnyInNode and still makes a correct restickify decision downstream.
+    # FallbackKernel (torch.tril) produces a MultiOutput node. Verify the optimizer
+    # handles it via AnyInNode and still makes a correct restickify decision
+    # downstream. (torch.sin used to fill this slot; it has a Spyre decomposition
+    # now and no longer lowers to a FallbackKernel.)
     x, y = _make_tensors(2, S, S)
-    _compare(lambda x, y: torch.sin(x) + y.t(), x, y, optimal_cost=S * S)
+    _compare(lambda x, y: torch.tril(x) + y.t(), x, y, optimal_cost=S * S)
 
 
 # ------- Mutation + restickify regression test ---------
@@ -616,7 +693,7 @@ def test_mutation_target_multi_candidate_layout():
 
     def fn(a, b, d):
         c = a + b
-        torch.ops.spyre.copy_forced(d, c)
+        c = torch.ops.spyre.copy_forced(d, c)
         return c
 
     _compare(fn, a, b, d)
@@ -634,7 +711,7 @@ def test_mutation_target_restick_on_src_not_target():
 
     def fn(a, b, d):
         c = a + b
-        torch.ops.spyre.copy_forced(d.t(), c)
+        c = torch.ops.spyre.copy_forced(d.t(), c)
         return c
 
     _compare(fn, a, b, d, optimal_cost=M * N)
@@ -650,8 +727,8 @@ def test_two_mutations_same_target_copy_f():
 
     def fn(a, b):
         acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
-        torch.ops.spyre.copy_forced(a.t() + a.t(), acc)
-        torch.ops.spyre.copy_forced(b + b, acc)
+        acc = torch.ops.spyre.copy_forced(a.t() + a.t(), acc)
+        acc = torch.ops.spyre.copy_forced(b + b, acc)
         return acc
 
     result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
@@ -687,9 +764,9 @@ def test_two_mutations_read_between_writes_minimal_copy_f():
 
     def fn(a, b):
         acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
-        torch.ops.spyre.copy_forced(a.t(), acc)  # write 1: col-stick
+        acc = torch.ops.spyre.copy_forced(a.t(), acc)  # write 1: col-stick
         snapshot = acc * b  # READ acc
-        torch.ops.spyre.copy_forced(b, acc)  # write 2: row-stick
+        acc = torch.ops.spyre.copy_forced(b, acc)  # write 2: row-stick
         return snapshot
 
     result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
@@ -715,26 +792,17 @@ def test_two_mutations_read_between_writes_minimal_copy_():
     _compare(fn, a, b, acc)
 
 
-@pytest.mark.skip(
-    reason="crashes in _clone_layout (propagate_layouts) before the conflicting-layout "
-    "assert fires: `return snapshot * acc` forces a flat 1D clone of acc (size=[32768]) "
-    "between the two writes; device_coordinates on the col-stick acc via that flat index "
-    "produces the unsupported stick expr floor((Mod(d0,16384))/256). Issue #4093"
-)
 def test_two_mutations_read_between_writes_v2_copy_f():
     # write / read / write returning snapshot * acc (both outputs live).
-    # Skipped: `return snapshot * acc` forces a flat 1D clone of acc between the
-    # two writes; device_coordinates on the col-stick acc via that flat index
-    # produces an unsupported stick expression in _clone_layout.
     M, N = 128, 256
     a = torch.randn((N, M), dtype=torch.float16) * 0.01  # a.t() is MxN col-stick
     b = torch.randn((M, N), dtype=torch.float16) * 0.01  # MxN row-stick
 
     def fn(a, b):
         acc = torch.ops.spyre.empty([M, N], device=a.device, dtype=a.dtype)
-        torch.ops.spyre.copy_forced(a.t() + a.t(), acc)  # write 1: col-stick
+        acc = torch.ops.spyre.copy_forced(a.t() + a.t(), acc)  # write 1: col-stick
         snapshot = acc * b  # READ acc
-        torch.ops.spyre.copy_forced(b + b, acc)  # write 2: row-stick
+        acc = torch.ops.spyre.copy_forced(b + b, acc)  # write 2: row-stick
         return snapshot * acc
 
     result = _compile_and_run(fn, (a.to(DEVICE), b.to(DEVICE)), DEVICE).cpu()
@@ -1151,18 +1219,12 @@ def test_amax_full_and_amax_live_maximum():
     _compare(f, t, optimal_cost=0)
 
 
-# ------- Unsupported stick configurations ---------
-
-
 def test_sparse_dense_pointwise():
     """a.sum(-1) + b - reduction followed by pointwise without broadcasting."""
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
-    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
 
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+    _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
 # ------- Restickify padding: strided input raises Unsupported ---------
@@ -1535,6 +1597,48 @@ SPLIT_T0_LAST = [(7, 67, 2), (7, 65, 2), (5, 3, 2), (7, 67, 63)]
 def test_strict_transpose_0_last_clone(shape):
     x = _arange(*shape)
     _strict(lambda x: x.transpose(0, -1).clone(), x)
+
+
+# -------- torch.cat on the target-model shapes (#1094) ----------
+#
+# ``torch.cat`` lowers to two slice writes into one freshly cloned buffer, so a
+# concat whose split point is not a stick multiple makes both writes land in the
+# SAME stick: ``[..., :32]`` and ``[..., 32:64]`` of a 64-wide stick.  Neither
+# write can be lowered natively -- the offset write cannot express its stick
+# expression, and the offset-free ``:32`` write covers only half a stick, so
+# written whole it pads to a full stick and zeroes the tail, clobbering its
+# sibling.  Both must therefore relocate to one shared alternative layout that
+# moves the offset off the stick dim.
+#
+# The two inputs occupy disjoint fp16-exact bands ([0, 512) and [512, 1024)), so
+# ``_strict`` catches any element that crosses the concat boundary in either
+# direction.  Within one input the ramp wraps every 512 elements, so a
+# displacement that is an exact multiple of 512 along the ramp is invisible; the
+# boundary itself, which is what these shapes exercise, is not.
+CAT_MODEL_SHAPES = [
+    # Aligned 64+64: both writes are whole sticks, no relocation needed.
+    ((1, 8, 1, 64), (1, 8, 1, 64), -1),
+    ((1, 14, 64), (1, 14, 64), -1),
+    ((1, 32, 41, 64), (1, 32, 41, 64), -1),
+    # KV-cache append on a non-stick dim: 67+1 -> 68 planes of a full stick.
+    ((1, 8, 67, 128), (1, 8, 1, 128), 2),
+    # Mid-stick 32+32 -> 64 (rotary embedding): the split point falls inside one
+    # stick, so both writes share it and must relocate together.
+    ((1, 8, 11, 32), (1, 8, 11, 32), -1),
+    ((1, 8, 1, 32), (1, 8, 1, 32), -1),
+]
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    CAT_MODEL_SHAPES,
+    ids=lambda p: f"{'x'.join(map(str, p[0]))}+{'x'.join(map(str, p[1]))}_dim{p[2]}",
+)
+def test_strict_cat_model_shapes(shapes):
+    a_shape, b_shape, dim = shapes
+    x = _arange(*a_shape, base=0, span=512)
+    y = _arange(*b_shape, base=512, span=512)
+    _strict(lambda x, y: torch.cat([x, y], dim=dim), x, y)
 
 
 # ======================================================================
@@ -2112,26 +2216,29 @@ def test_2d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S)
 
 
 def test_3d_sparse_broadcast_dense_pointwise():
     """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S, S), dtype=torch.float16)
-    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S * S)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
 
 
 def test_sparse_dense_pointwise_d0_stick():
     """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 
-    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
     b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
-    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
-    with pytest.raises(
-        InductorError, match="No mechanism to gather elements from multiple sticks"
-    ):
-        _compare(lambda a, b: a.amin(-1) + b, a, b)
+
+    _compare(
+        lambda a, b: a.amin(-1)[0] + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b.to(device_layout=b_layout)],
+    )
 
 
 def test_sparse_broadcast_dense_pointwise_d0_stick():
@@ -2360,6 +2467,25 @@ def test_restickify_coverage_gap(shape):
     _strict(lambda t: (t + t).transpose(0, -1).contiguous(), x)
 
 
+# Broadcasting an elided size-one axis into a new stick is an identity fill.
+_BROADCAST_INTO_STICK_SHAPES = [
+    ((1, 8, 1), 64),
+    ((1, 8, 1), 67),
+    ((3, 5, 1), 64),
+    ((1, 1, 1), 64),
+]
+
+
+@pytest.mark.parametrize(
+    "shape,bwidth",
+    _BROADCAST_INTO_STICK_SHAPES,
+    ids=[f"{'x'.join(map(str, s))}_b{b}" for s, b in _BROADCAST_INTO_STICK_SHAPES],
+)
+def test_restickify_broadcast_into_stick(shape, bwidth):
+    x = _arange(*shape, span=511)
+    _strict(lambda t: t.expand(*shape[:-1], bwidth).contiguous(), x)
+
+
 # --------------------------------------------------------------------------
 # White-box (device-free) geometry of the size-1 stick allocation grow.
 #
@@ -2522,3 +2648,226 @@ def test_round_up_to_stick_geometry():
     assert round_up_to_stick(70, torch.float16) == 128
     assert round_up_to_stick(128, torch.float16) == 128
     assert round_up_to_stick(129, torch.float16) == 192
+
+
+# ---------------------------------------------------------------------------
+# nonstick_dim_order tests
+# ---------------------------------------------------------------------------
+
+
+def test_nonstick_no_reorder_when_large_dim_already_at_slot():
+    """Pass must not move a dim when slot already holds the largest dim.
+
+    Layout: [broadcast_outside, outer_stick, large_dim, inner_stick]
+    idc=['0', 'floor(d1/64)', 'd0', 'Mod(d1, 64)'] — outer_stick=1, slot=2,
+    large M dim (d0) is already at slot.  The outside dim (index 0) has
+    coordinate '0' (broadcast) and is not a useful candidate.  No reorder.
+
+    Uses bmm with batch=55, M=1, K=99.
+    """
+
+    def fn(x, w):
+        y = x * 2.0
+        return torch.bmm(y, w)
+
+    x = torch.randn(55, 1, 99, dtype=torch.float16)
+    w = torch.randn(55, 99, 128, dtype=torch.float16)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        x.to(DEVICE),
+        w.to(DEVICE),
+    )
+    cpu_result = fn(x, w)
+    torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=0.1, rtol=0.1)
+
+    assert not nonstick_log, (
+        "Expected no reorder when large dim is already at slot, "
+        f"but got: {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+
+
+def test_nonstick_reorder_pointwise_into_matmul():
+    """Pointwise feeding a bmm gets largest non-stick dim moved into the stick sandwich slot.
+
+    x has shape [2, 55, 99] and is tiled as device_size=[55, 2, 2, 64] —
+    batch=2 at position 2, M=55 at position 0 (large), outer_stick=floor(d/64)
+    at position 1, inner=Mod(d,64) at last. The pass swaps the largest non-frozen
+    dim (55 at position 0) into slot outer_stick+1=2, giving device_size=[2, 2, 55, 64].
+
+    K=99 > 64 is required so the stick dimension actually splits (outer_stick at
+    a non-last device position with room between it and the stick inner).
+    """
+
+    def fn(x, w):
+        y = x * 2.0
+        return torch.bmm(y, w)
+
+    x = torch.randn(2, 55, 99, dtype=torch.float16)
+    w = torch.randn(2, 99, 128, dtype=torch.float16)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        x.to(DEVICE),
+        w.to(DEVICE),
+    )
+    cpu_result = fn(x, w)
+    torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=0.1, rtol=0.1)
+
+    # The pass reorders the pointwise buffer (buf0) that feeds the bmm.
+    # x=[2,55,2] → device_size=[55,2,2,64] → outer_stick=1, slot=2 → [2,2,55,64].
+    assert nonstick_log, "Expected nonstick_reorder_log to be non-empty"
+    reordered_any = False
+    for buf_name, stl in nonstick_log.items():
+        device_size = list(stl.device_size)
+        if len(device_size) < 3:
+            continue
+        nonstick = device_size[:-1]
+        # For the 2D-stick shape used here (4 device dims, outer_stick=1,
+        # slot=2), the sandwich slot is device_size[-2].  Only check
+        # buffers where the slot dim is actually the largest — buffers
+        # whose idc couldn't be resolved are left unchanged.
+        if device_size[-2] != max(nonstick):
+            continue
+        reordered_any = True
+    assert reordered_any, (
+        f"Expected at least one buffer with largest non-stick dim in slot n-2. "
+        f"nonstick_log={[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+
+
+def test_nonstick_flat_dense_projection_collapses_outer_dims():
+    """NDO collapses a fused SDPA output from [B,L,H,D] to flat [M,K] for o_proj.
+
+    A fused attention producer retains a higher-rank host view [B, H, L, D]
+    that the downstream dense projection reads as the flat 2-D matrix [M, K]
+    where M=B*L and K=H*D. Without the flat-M transform, the backend encodes
+    this as a BMM. NDO must detect the pattern and collapse committed_stl to
+    the canonical flat-M shape.
+    """
+    import torch.nn.functional as F
+
+    B, H, L, D = 2, 2, 64, 64
+    M, K = B * L, H * D
+
+    q, k, v = _make_tensors(3, B, H, L, D)
+    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=D**-0.5
+        )
+        flat = attention.transpose(1, 2).reshape(M, K)
+        return F.linear(flat, weight)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        q.to(DEVICE),
+        k.to(DEVICE),
+        v.to(DEVICE),
+        weight.to(DEVICE),
+    )
+
+    assert nonstick_log, "expected NDO to rewrite at least one buffer"
+    flat_m_found = any(
+        list(stl.device_size) == [K // 64, M, 64] for stl in nonstick_log.values()
+    )
+    assert flat_m_found, (
+        f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
+        f"got {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+    compare_with_cpu(
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=spyre_result,
+        run_eager=False,
+        atol=0.2,
+        rtol=0.2,
+    )
+
+
+# Regression coverage for bounded outer non-stick steps (issue #5388).
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,step,start",
+    [
+        ((2, 97, 256), 3, 0),
+        ((2, 96, 256), 3, 0),
+        ((1, 97, 256), 3, 0),
+        ((2, 98, 256), 5, 0),
+        ((2, 97, 256), 3, 1),
+        ((2, 7, 3, 128), 3, 0),
+    ],
+)
+def test_bounded_nonstick_slice(shape, step, start, dtype):
+    # Small dyadic values survive device conversion exactly; a wrong row or
+    # batch must fail an exact comparison instead of hiding in a tolerance.
+    gen = torch.Generator().manual_seed(5388)
+    x = torch.randint(-16, 17, shape, generator=gen).to(dtype) / 8
+
+    def fn(t):
+        return t[:, start::step, ...] + 1
+
+    got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to("spyre")).cpu()
+    torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
+
+
+def test_matmul_weight_with_factorized_contraction_dim():
+    """A computed weight ``[N, Ht, D]`` reshaped to ``[N, Ht * D]`` feeds a matmul.
+
+    The contraction dim K is factorized over two host dims, so K appears in more
+    than one outer device coordinate once the stick moves to N.  The restickify
+    target must keep both dims (here 8 heads), and the matmul needs K collapsed
+    into one outer dim.  Issue #5550: the target layout used to overwrite the
+    heads dim, giving a layout with 8x too many elements and wrong values.
+    """
+    import torch.nn.functional as F
+
+    hidden, Ht, D = 4096, 8, 128
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, Ht * D, dtype=torch.float16, generator=generator)
+    w3 = torch.randn(hidden, Ht, D, dtype=torch.float16, generator=generator) * 0.05
+
+    def fn(x, w3):
+        # ``+ 0`` makes the weight a computed buffer with layout [N, Ht, D].
+        return F.linear(x, (w3 + 0).reshape(hidden, Ht * D))
+
+    compare_with_cpu(fn, x, w3, run_eager=False)
+
+
+def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
+    """Moving the stick off a factorized contraction var is not computable.
+
+    The weight ``[N, 8, 128]`` has its K var ``d1`` on the heads dim, the D-high
+    dim and the stick.  There is no single outer dim to repurpose when the stick
+    moves to N, and repurposing the first one overwrites the heads dim.  The
+    target must be reported infeasible (``None``) instead of a layout whose device
+    size no longer matches the tensor (issue #5550).
+    """
+    import sympy
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    host = FixedLayout(DEVICE, torch.float16, [4096, 8, 128], [1024, 128, 1])
+    stl = _CSTL(
+        [8, 2, 4096, 64],
+        [128, 64, 1024, 1],
+        DataFormats.SEN169_FP16,
+        {(0,): 8, (1, 3): 128, (2,): 4096},
+    )
+    host_coords = [d0, sympy.floor(d1 / 128), sympy.Mod(d1, 128)]
+    device_coords = [
+        sympy.floor(d1 / 128),
+        sympy.floor(sympy.Mod(d1, 128) / 64),
+        d0,
+        sympy.Mod(d1, 64),
+    ]
+    assert (
+        compute_restickify_target_layout(stl, host, d0, host_coords, device_coords)
+        is None
+    )

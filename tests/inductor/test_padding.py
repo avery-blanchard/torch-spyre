@@ -18,31 +18,145 @@ Tests hook into CustomPreSchedulingPasses after insert_bmm_padding runs to inspe
 the operations list directly, without requiring end-to-end compilation to succeed.
 """
 
-from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
-
 import unittest
 from unittest.mock import patch
+from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
 
+import sympy
 import torch
+import torch.fx as fx
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import (
     ComputedBuffer,
+    FixedLayout,
+    InputBuffer,
     Operation,
     Reduction,
 )
 from torch._inductor.graph import GraphLowering
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.padding import (
+    _compute_digits,
+    _is_dense_flattened_coordinate,
+    _is_nonoverlapping_aligned_stick_coordinate,
+    _restickify_input_required_extent,
+)
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 
 
 Ts = TypeVarTuple("Ts")
+
+
+class TestRestickifyInputCoordinate(unittest.TestCase):
+    def test_dense_flattened_coordinate(self) -> None:
+        head, feature = sympy.symbols("head feature", integer=True)
+        ranges = {head: 16, feature: 128}
+
+        digits = _compute_digits(128 * head + feature, ranges)
+        self.assertTrue(_is_dense_flattened_coordinate(digits, ranges))
+        digits = _compute_digits(128 * head + feature + 7, ranges)
+        self.assertTrue(_is_dense_flattened_coordinate(digits, ranges))
+
+    def test_gapped_coordinate_is_not_dense(self) -> None:
+        head, feature = sympy.symbols("head feature", integer=True)
+        ranges = {head: 16, feature: 128}
+
+        digits = _compute_digits(256 * head + feature, ranges)
+        self.assertFalse(_is_dense_flattened_coordinate(digits, ranges))
+        digits = _compute_digits(head + 32 * feature, ranges)
+        self.assertFalse(_is_dense_flattened_coordinate(digits, ranges))
+
+    def test_dense_flattened_required_extent(self) -> None:
+        batch, sequence = sympy.symbols("batch sequence", integer=True)
+
+        self.assertEqual(
+            _restickify_input_required_extent(
+                64 * batch + sequence,
+                {batch: 2, sequence: 64},
+                sequence,
+                torch.float16,
+            ),
+            128,
+        )
+        self.assertEqual(
+            _restickify_input_required_extent(
+                64 * batch + sequence + 7,
+                {batch: 2, sequence: 64},
+                sequence,
+                torch.float16,
+            ),
+            135,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires a re-base copy"):
+            _restickify_input_required_extent(
+                63 * batch + sequence,
+                {batch: 2, sequence: 63},
+                sequence,
+                torch.float16,
+            )
+
+    def test_gapped_coarse_tile_has_nonoverlapping_stick_windows(self) -> None:
+        batch, sequence = sympy.symbols("batch sequence", integer=True)
+        coord = 512 * batch + sequence
+        ranges = {batch: 4, sequence: 256}
+
+        digits = _compute_digits(coord, ranges)
+        self.assertFalse(_is_dense_flattened_coordinate(digits, ranges))
+        self.assertTrue(
+            _is_nonoverlapping_aligned_stick_coordinate(
+                digits, coord, ranges, sequence, torch.float16
+            )
+        )
+        self.assertEqual(
+            _restickify_input_required_extent(coord, ranges, sequence, torch.float16),
+            1792,
+        )
+
+        coord = 510 * batch + sequence
+        digits = _compute_digits(coord, ranges)
+        self.assertFalse(
+            _is_nonoverlapping_aligned_stick_coordinate(
+                digits,
+                coord,
+                {batch: 4, sequence: 255},
+                sequence,
+                torch.float16,
+            )
+        )
+        coord = 128 * batch + sequence
+        digits = _compute_digits(coord, ranges)
+        self.assertFalse(
+            _is_nonoverlapping_aligned_stick_coordinate(
+                digits,
+                coord,
+                ranges,
+                sequence,
+                torch.float16,
+            )
+        )
+
+    def test_single_symbol_required_extent_preserves_split_coordinate(self) -> None:
+        sequence = sympy.symbols("sequence", integer=True)
+
+        self.assertEqual(
+            _restickify_input_required_extent(
+                sympy.floor(sequence / 64),
+                {sequence: 128},
+                sequence,
+                torch.float16,
+            ),
+            128,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +179,15 @@ class CustomPreSchedulingPassesWithCapture(CustomPreSchedulingPasses):
         assert self.test_instance is not None
         super().__call__(graph)
         self.test_instance.captured_operations = list(graph.operations)
+        self.test_instance.captured_name_to_buffer = dict(graph.name_to_buffer)
+        # Reads must be traced while V.graph is live; record them per op here.
+        self.test_instance.captured_read_names = {
+            op.get_name(): {
+                d.name for d in op.get_read_writes().reads if hasattr(d, "name")
+            }
+            for op in graph.operations
+            if isinstance(op, ComputedBuffer)
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +204,8 @@ class TestInsertPaddingIR(unittest.TestCase):
     """
 
     captured_operations: list[Operation] = []
+    captured_name_to_buffer: dict[str, Any] = {}
+    captured_read_names: dict[str, set[str]] = {}
 
     def setUp(self) -> None:
         torch.manual_seed(0xAFFE)
@@ -176,6 +301,18 @@ class TestInsertPaddingIR(unittest.TestCase):
                 if getattr(getattr(op, "origin_node", None), "target", None) == aten_op:
                     padded_buf_ops.append(op)
         return padded_buf_ops
+
+    @staticmethod
+    def _restickify_ops(operations: list[Operation]) -> list[ComputedBuffer]:
+        """Return ComputedBuffer operations whose origin_node.target is spyre.restickify."""
+        restickify_op = torch.ops.spyre.restickify.default
+        return [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and getattr(getattr(op, "origin_node", None), "target", None)
+            == restickify_op
+        ]
 
     @staticmethod
     def _constant_ops(ops: list[Operation]) -> list[SpyreConstantFallback]:
@@ -701,6 +838,247 @@ class TestInsertPaddingIR(unittest.TestCase):
         # padding sequence for y, so _assert_constant_pad_nd_ops (which expects
         # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
         torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
+    def test_bmm_invariant_y_unaligned_k_pads_for_each_tile(self) -> None:
+        """A loop-invariant weight with unaligned K inside a for_each_tile body.
+
+        x is [E, M, K=67] tiled over E and w is a loop-invariant [K, N].  The
+        padding ops for w join the loop group, but must not inherit the
+        matmul's per-trip read advance: that record is positional in the
+        matmul's reads (the tiled x), so on the pad ops it advanced the read of
+        the invariant w and corrupted the padded copy on every trip after the
+        first, leaving ~64% of the result wrong (#5440).
+        """
+        dtype = torch.float16
+        E, M, K, N = 3, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        x_cpu = torch.randn(E, M, K, dtype=dtype)
+        w_cpu = torch.randn(K, N, dtype=dtype)
+
+        def fn(x, w):
+            def body(_, ops):
+                x_tile, w_whole = ops
+                return None, torch.matmul(x_tile, w_whole)
+
+            return for_each_tile(body, (x, w), dims=(0, None), tile_size=1, out_dim=0)[
+                1
+            ]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            torch.matmul(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
+    def test_linear_invariant_weight_unaligned_k_pads_for_each_tile(self) -> None:
+        """An ``nn.Linear`` weight ``[N, K]`` with unaligned K, loop-invariant.
+
+        The same padding-op bug as the ``x @ w`` case above, on the most common
+        weight pattern: the weight is stored ``[N, K]``, padded, and restickified
+        for the matmul, all inside the loop group.  Over 70% of the result was
+        wrong before the padding ops stopped inheriting the matmul's read advance
+        (#5440).
+        """
+        import torch.nn.functional as F
+
+        dtype = torch.float16
+        E, M, K, N = 3, 64, 67, 128
+        assert K % get_elem_in_stick(dtype) != 0
+
+        generator = torch.Generator().manual_seed(0)
+        x_cpu = torch.randn(E, M, K, dtype=dtype, generator=generator)
+        w_cpu = torch.randn(N, K, dtype=dtype, generator=generator)
+
+        def fn(x, w):
+            def body(_, ops):
+                x_tile, w_whole = ops
+                return None, F.linear(x_tile, w_whole)
+
+            return for_each_tile(body, (x, w), dims=(0, None), tile_size=1, out_dim=0)[
+                1
+            ]
+
+        _, result = self.compile_and_run(fn, (x_cpu.to("spyre"), w_cpu.to("spyre")))
+        torch.testing.assert_close(
+            F.linear(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
+    def test_transposed_y_unaligned_k_pads_then_restickifies(self) -> None:
+        """``x @ w.t()`` with unaligned K -- the ``nn.Linear`` weight pattern.
+
+        The weight is stored ``[N, K]`` with K within the stick, so the matmul
+        needs it restickified to put N within the stick.  Padding runs before
+        stickification, so the pass pads the weight's K while it is a plain host
+        buffer and stickification then restickifies the *padded* buffer.  The
+        matmul must read that restickify output, and the restickify must read
+        the padded buffer, so the zero rows K..K_padded-1 are what the matmul
+        accumulates over (issue #4208).
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        M, K, N = 64, 784, 512
+        assert K % stick_size != 0
+
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(N, K, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
+
+        def fn(x, w):
+            return x @ w.t()
+
+        ops, result = self.compile_and_run(fn, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1)
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), K)
+
+        ops_before = self._ops_before(ops, mm)
+        padded = self._padded_buf_ops(ops_before)
+        self.assertEqual(len(padded), 1, "expected exactly one padded buffer")
+        padded_buf = padded[0]
+        self.assertEqual(
+            [int(s) for s in padded_buf.get_size()],
+            [N, K + stick_size - K % stick_size],
+            "y is padded along its K dim, in y's own [N, K] host order",
+        )
+
+        resticks = self._restickify_ops(ops_before)
+        self.assertEqual(len(resticks), 1, "expected one restickify of the padded y")
+        restick = resticks[0]
+        self.assertIn(
+            padded_buf.get_name(),
+            self.captured_read_names[restick.get_name()],
+            "the restickify must read the padded buffer, not the raw weight",
+        )
+        self.assertIn(
+            restick.get_name(),
+            self.captured_read_names[mm.get_name()],
+            "the matmul must read the restickify output",
+        )
+
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.5, rtol=0.05)
+
+    def test_linear_unaligned_in_features(self) -> None:
+        """``F.linear`` (bias included) compiles and is correct for unaligned
+        ``in_features`` -- e.g. ``nn.Linear(28 * 28, 512)`` (issue #4208)."""
+        dtype = torch.float16
+        M, K, N = 32, 28 * 28, 512
+        x_cpu = torch.randn(M, K, dtype=dtype)
+        w_cpu = torch.randn(N, K, dtype=dtype) * 0.05
+        b_cpu = torch.randn(N, dtype=dtype)
+        args = tuple(t.to(device="spyre") for t in (x_cpu, w_cpu, b_cpu))
+
+        def fn(x, w, b):
+            return torch.nn.functional.linear(x, w, b)
+
+        ops, result = self.compile_and_run(fn, args)
+        self.assertEqual(len(self._matmul_ops(ops)), 1)
+        self.assertEqual(len(self._padded_buf_ops(ops)), 1)
+        torch.testing.assert_close(
+            fn(x_cpu, w_cpu, b_cpu), result.cpu(), atol=0.5, rtol=0.05
+        )
+
+    def test_rebuilt_matmul_is_registered_in_graph(self) -> None:
+        """The matmul ``insert_bmm_padding`` rebuilds must be the object the graph
+        registry returns for its name.
+
+        Layout selection runs after padding and commits its choice through
+        ``V.graph.get_buffer(name)``; a stale registry entry would receive the
+        committed layout while the live op in ``operations`` got none.
+        """
+        dtype = torch.float16
+        x = torch.randn(55, 67, dtype=dtype).to(device="spyre")
+        w = torch.randn(67, 128, dtype=dtype).to(device="spyre")
+
+        ops = self.compile_and_capture(lambda x, w: x @ w, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1)
+        mm = matmuls[0]
+        self.assertIs(self.captured_name_to_buffer[mm.get_name()], mm)
+        for op in ops:
+            if isinstance(op, ComputedBuffer):
+                self.assertIs(self.captured_name_to_buffer[op.get_name()], op)
+
+
+class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
+    """White-box tests for ``lower_pad_sequence``'s host-stride ranking.
+
+    A buffer can carry a broadcast dim -- stride 0, size > 1 -- alongside a
+    dim that needs stick-boundary padding (an uncompacted-rank copy leaves
+    absent/broadcast dims at stride 0).  ``lower_pad_sequence`` ranks the padded buffer's host dims
+    by the source buffer's raw host stride to preserve fastest/slowest
+    ordering; ranking a stride-0 broadcast dim by that raw value put it
+    first (0 sorts smallest) and handed it a real nonzero stride, corrupting
+    addressing for a dimension that must stay stride 0.
+
+    These tests call ``lower_pad_sequence`` directly against a hand-built
+    ``InputBuffer`` (the pre-stickification path used by
+    ``insert_bmm_padding``, mirroring ``coarse_tile.py``'s own FX-node-free
+    ``arg_buf`` call convention), independent of any end-to-end
+    coarse-tiling or SDPA compilation -- exercising the bug's structural
+    precondition directly rather than reproducing it through a full
+    ``torch.compile`` call.
+    """
+
+    def setUp(self) -> None:
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self) -> None:
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_broadcast_dim_kept_at_stride_zero_when_padding_adjacent_dim(
+        self,
+    ) -> None:
+        """A stride-0, size>1 dim must stay stride 0 in the padded buffer.
+
+        arg_buf mirrors a coarse-tile read-copy of V broadcast across 4 head
+        tiles (dim 0, stride 0, size 4), with a real row dim (dim 1, size
+        64, stride 32) and a K dim (dim 2, size 13, unaligned) padded to 32.
+        """
+        from torch_spyre._inductor.pass_utils import lower_pad_sequence
+
+        device = torch.device("cpu")
+        dtype = torch.float16
+
+        arg_buf = InputBuffer(
+            name="arg0",
+            layout=FixedLayout(device, dtype, [4, 64, 13], [0, 1, 32]),
+        )
+        V.graph.name_to_buffer["arg0"] = arg_buf
+        V.graph.graph_inputs["arg0"] = arg_buf
+        insert_before = next(iter(V.graph.graph.nodes))
+
+        padded_buf, _new_ops = lower_pad_sequence(
+            arg_fx_node=None,
+            padded_size=[4, 64, 32],
+            device=device,
+            dtype=dtype,
+            dim=2,
+            insert_before=insert_before,
+            orig_stl=None,
+            fill_value=0.0,
+            arg_buf=arg_buf,
+        )
+
+        size = [int(s) for s in padded_buf.get_size()]
+        stride = [int(s) for s in padded_buf.get_stride()]
+        self.assertEqual(size, [4, 64, 32])
+        self.assertEqual(
+            stride[0],
+            0,
+            f"broadcast dim (size 4) must stay stride 0; got padded stride {stride}",
+        )
+        # The two real dims must still be assigned distinct, non-overlapping
+        # strides consistent with their original relative order (dim 1 was
+        # fastest-varying at stride 1, dim 2 was next at stride 32).
+        self.assertLess(stride[1], stride[2])
+        self.assertNotEqual(stride[1], stride[0])
+        self.assertNotEqual(stride[2], stride[0])
 
 
 if __name__ == "__main__":

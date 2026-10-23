@@ -15,15 +15,10 @@
 import os
 import shutil
 from pathlib import Path
-from typing import cast
 
 os.environ.setdefault(
     "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
 )  # must be before torch import
-os.environ.setdefault(
-    "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "flex")
-)
-
 
 import glob
 
@@ -32,17 +27,6 @@ from setuptools import Command, setup
 PATH_NAME = "torch_spyre"
 PACKAGE_NAME = "torch_spyre"
 DISTRIBUTED_PACKAGE_NAME = "spyre_ccl"
-
-
-def get_torch_spyre_version() -> str:
-    version_ns: dict[str, object] = {}
-    with open(f"{PATH_NAME}/version.py") as f:
-        exec(f.read(), version_ns)
-        version = cast(str, version_ns["__version__"])
-    return version
-
-
-version = get_torch_spyre_version()
 
 
 def check_libflex():
@@ -155,7 +139,6 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 LIBRARIES = ["flex"]
 
 
