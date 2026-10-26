@@ -258,7 +258,7 @@ def rescale_stl_for_dtype(
                     f"{stl.device_size[i]} stick(s) of {in_eps} elements, which is "
                     f"not a whole number of {out_eps}-element output sticks"
                 )
-            out_device_size[i] = total_elems // out_eps
+            out_device_size[i] = (total_elems + out_eps - 1) // out_eps
             out_stride_map[i] = out_eps
             break
     return SpyreTensorLayout(
