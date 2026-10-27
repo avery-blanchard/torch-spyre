@@ -2234,7 +2234,7 @@ class TestDivideRanges(unittest.TestCase):
 
     def test_resize_device_layout_grow_from_singleton_permuted(self):
         """The grow path on a permuted buffer: a device dim tiled to size 1
-        (stride_map -1) grows back to the full buffer's actual host stride, not
+        (stride_map 0) grows back to the full buffer's actual host stride, not
         the contiguous one."""
         from torch_spyre._C import SpyreTensorLayout
         from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
@@ -2249,7 +2249,7 @@ class TestDivideRanges(unittest.TestCase):
         ):
             with self.subTest(tile_size=tile_size):
                 stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
-                self.assertIn(-1, list(stl.stride_map))
+                self.assertIn(0, list(stl.stride_map))
                 result = _resize_device_layout(
                     stl,
                     tile_size,
@@ -2307,7 +2307,7 @@ class TestDivideRanges(unittest.TestCase):
         order = [0, 1, 2, 3]
         stl = SpyreTensorLayout(size, stride, torch.float16, order)
         self.assertEqual(list(stl.device_size), [20, 1, 1, 1, 64])
-        self.assertEqual(list(stl.stride_map), [32, -1, 32, -1, 1])
+        self.assertEqual(list(stl.stride_map), [32, 0, 32, 0, 1])
 
         tile_size, tile_stride = [1, 10, 1, 32], [320, 32, 32, 1]
         result = _resize_device_layout(
@@ -2457,7 +2457,7 @@ class TestDivideRanges(unittest.TestCase):
         dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
         # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
         # is a non-stick dim of the same size (512), so they collide by size.
-        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, 0, 1], dev)
         host_size = [1, 32, 512, 512]
 
         # Fallback (no identity): size-based elimination is ambiguous -> raise.
@@ -8282,7 +8282,7 @@ class TestValidateTiling(unittest.TestCase):
         self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
-            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+            [64, 80, 1, 64], [5120, 64, 0, 1], dl.device_dtype, dl.element_arrangement
         )
         self.assertIsNone(predict_frame(op, spec))
 

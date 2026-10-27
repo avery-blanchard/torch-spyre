@@ -994,7 +994,7 @@ def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned
 def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
     device_layout = pass_utils_module.SpyreTensorLayout(
         [1, 1, 8, 16, 64],
-        [-1, -1, 64, 512, 1],
+        [0, 0, 64, 512, 1],
         DataFormats.SEN169_FP16,
         ElementArrangement.STANDARD,
     )
