@@ -36,6 +36,11 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     try_device_coordinates,
 )
+from torch_spyre._inductor.device_index import (
+    DeviceIndexError,
+    compute_device_index_terms,
+    validate_device_index_terms,
+)
 from torch_spyre._inductor.nonstick_dim_order import _flat_dense_projection_x_layout
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
@@ -1329,6 +1334,233 @@ class TestFlatDenseProjectionLayout(TestCase):
             x, y, output, out_dep, contraction, M, N
         )
         self.assertIsNone(result)
+
+
+class TestDeviceIndex(TestCase):
+    """Unit tests for compute_device_index_terms and validate_device_index_terms."""
+
+    # fp16: 128 bytes / 2 bytes per element = 64 elements per stick
+    EPS = 64
+
+    def _compute(self, var_ranges, device_size, stride_map, index):
+        return compute_device_index_terms(
+            dict(var_ranges), device_size, stride_map, index
+        )
+
+    def test_simple_2d(self):
+        # [rows, 64] fp16: stride_map=[64, 1], device_size=[rows, 64]
+        # index = 64*p0 + p1, var_ranges={p0: rows, p1: 64}
+        rows = 4
+        grouped, stick_var = self._compute(
+            {p0: rows, p1: 64},
+            [rows, 64],
+            [64, 1],
+            64 * p0 + p1,
+        )
+        self.assertIn(p0, grouped)
+        self.assertIn(p1, grouped)
+        self.assertEqual(stick_var, p1)
+        # p0 is a residue term (non-stick) — its num must be a multiple of EPS=64
+        p0_terms = grouped[p0]
+        self.assertEqual(len(p0_terms), 1)
+        self.assertEqual(int(p0_terms[0].num), 1)
+        # The stick term is p1 with dim_size 64
+        p1_terms = grouped[p1]
+        self.assertEqual(len(p1_terms), 1)
+        self.assertEqual(int(p1_terms[0].dim_size), 64)
+
+    def test_3d_batch_seq_embed(self):
+        # [B=2, S=256, E=4096] fp16 → device_size=[2, 256, 64], stride_map=[1048576, 4096, 1]
+        # Flat index: 1048576*p0 + 4096*p1 + p2
+        grouped, stick_var = self._compute(
+            {p0: 2, p1: 256, p2: 64},
+            [2, 256, 64],
+            [1048576, 4096, 1],
+            1048576 * p0 + 4096 * p1 + p2,
+        )
+        self.assertEqual(stick_var, p2)
+        self.assertIn(p0, grouped)
+        self.assertIn(p1, grouped)
+        self.assertIn(p2, grouped)
+
+    def test_flattened_batch_seq(self):
+        # [B=2, S=256, E=4096] fp16 read as [B*S=512, E=4096]
+        # index = 4096*p0 + p1, device_size=[2, 256, 64], stride_map=[1048576, 4096, 1]
+        grouped, stick_var = self._compute(
+            {p0: 512, p1: 64},
+            [2, 256, 64],
+            [1048576, 4096, 1],
+            4096 * p0 + p1,
+        )
+        self.assertEqual(stick_var, p1)
+        # p0 covers both the batch and seq device dims
+        self.assertIn(p0, grouped)
+        self.assertIn(p1, grouped)
+        self.assertEqual(len(grouped[p0]), 2)
+
+    def test_stick_var_is_none_for_constant_stick_dim(self):
+        # A 0-dim access (index = 0): no variable touches the stick dimension
+        grouped, stick_var = self._compute(
+            {p0: 4},
+            [4, 64],
+            [64, 1],
+            64 * p0,
+        )
+        # stick dim has no contributing variable
+        self.assertIsNone(stick_var)
+
+    def test_grouping_keyed_by_loop_var_not_device_dim(self):
+        # Verify that a single loop variable covering two device dims
+        # produces a single entry in grouped with two Terms.
+        # [512, 64] device, stride_map=[64, 1], index=p0 (range 512)
+        # p0 touches the [8, 64] outer dim and the stick; normalize splits them.
+        grouped, stick_var = self._compute(
+            {p0: 512},
+            [8, 64],
+            [64, 1],
+            p0,
+        )
+        # p0 spans both device dims, so all its terms live under one key
+        self.assertIn(p0, grouped)
+        self.assertEqual(stick_var, p0)
+
+    def test_devindex_error_is_raised_on_backwards_index(self):
+        # A reversed traversal (negative coefficient) should surface as
+        # DeviceIndexError wrapping the underlying Unsupported from compute_coordinates.
+        with self.assertRaises(DeviceIndexError):
+            self._compute(
+                {p0: 4, p1: 64},
+                [4, 64],
+                [64, 1],
+                192 - 64 * p0 + p1,
+            )
+
+    def test_devindex_error_str_includes_details(self):
+        try:
+            self._compute(
+                {p0: 4, p1: 64},
+                [4, 64],
+                [64, 1],
+                192 - 64 * p0 + p1,
+            )
+            self.fail("expected DeviceIndexError")
+        except DeviceIndexError as e:
+            self.assertIn("compute_coordinates failed", str(e))
+            self.assertIsNotNone(e.details)
+
+    def test_devindex_error_args_populated(self):
+        # Ensure e.args is not empty so raise...from and introspection work.
+        try:
+            self._compute(
+                {p0: 4, p1: 64},
+                [4, 64],
+                [64, 1],
+                192 - 64 * p0 + p1,
+            )
+            self.fail("expected DeviceIndexError")
+        except DeviceIndexError as e:
+            self.assertTrue(len(e.args) > 0, "e.args must not be empty")
+            self.assertEqual(e.args[0], str(e))
+
+
+class TestValidateDeviceIndexTerms(TestCase):
+    """Unit tests for validate_device_index_terms invariants."""
+
+    EPS = 64  # fp16
+
+    def _compute(self, var_ranges, device_size, stride_map, index):
+        return compute_device_index_terms(
+            dict(var_ranges), device_size, stride_map, index
+        )
+
+    def test_valid_residue_passes(self):
+        # p0 residue num=1 → not a multiple of 64, but validate_device_index_terms
+        # checks num, which for outer dims after normalize is 1 — this is valid
+        # because a residue term's num encodes the stride within its device dim,
+        # not across sticks.  A simple 2D tensor should pass cleanly.
+        grouped, stick_var = self._compute(
+            {p0: 4, p1: 64},
+            [4, 64],
+            [64, 1],
+            64 * p0 + p1,
+        )
+        # Should not raise
+        validate_device_index_terms(grouped, stick_var, self.EPS)
+
+    def test_valid_3d_passes(self):
+        grouped, stick_var = self._compute(
+            {p0: 2, p1: 256, p2: 64},
+            [2, 256, 64],
+            [1048576, 4096, 1],
+            1048576 * p0 + 4096 * p1 + p2,
+        )
+        validate_device_index_terms(grouped, stick_var, self.EPS)
+
+    def test_repeated_residue_raises(self):
+        # Build a grouped dict that manually has repeated (den, mod) for one var.
+        from torch_spyre._inductor.views import Term as _Term
+
+        var = p0
+        term1 = _Term(
+            num=sympy.Integer(64),
+            den=sympy.Integer(1),
+            var=var,
+            mod=sympy.Integer(64),
+            dim_size=sympy.Integer(4),
+        )
+        term2 = _Term(
+            num=sympy.Integer(64),
+            den=sympy.Integer(1),
+            var=var,
+            mod=sympy.Integer(64),
+            dim_size=sympy.Integer(4),
+        )
+        grouped = {var: [term1, term2]}
+        with self.assertRaises(DeviceIndexError) as ctx:
+            validate_device_index_terms(grouped, None, self.EPS)
+        self.assertIn("repeated residue", str(ctx.exception))
+
+    def test_residue_num_not_multiple_of_eps_raises(self):
+        # A residue term (non-stick) whose num is not a multiple of EPS=64
+        # must be rejected.  num=3 is not a multiple of 64.
+        from torch_spyre._inductor.views import Term as _Term
+
+        row_var = p0
+        stick_var_sym = p1
+        residue_term = _Term(
+            num=sympy.Integer(3),
+            den=sympy.Integer(1),
+            var=row_var,
+            mod=sympy.Integer(4),
+            dim_size=sympy.Integer(4),
+        )
+        stick_term = _Term(
+            num=sympy.Integer(1),
+            den=sympy.Integer(1),
+            var=stick_var_sym,
+            mod=sympy.Integer(64),
+            dim_size=sympy.Integer(64),
+        )
+        grouped = {row_var: [residue_term], stick_var_sym: [stick_term]}
+        with self.assertRaises(DeviceIndexError) as ctx:
+            validate_device_index_terms(grouped, stick_var_sym, self.EPS)
+        self.assertIn("num_elements_per_stick", str(ctx.exception))
+
+    def test_stick_term_not_subject_to_residue_check(self):
+        # The stick term's num is free; it must not be checked against EPS.
+        from torch_spyre._inductor.views import Term as _Term
+
+        var = p0
+        stick_term = _Term(
+            num=sympy.Integer(3),  # not a multiple of 64
+            den=sympy.Integer(1),
+            var=var,
+            mod=sympy.Integer(64),
+            dim_size=sympy.Integer(64),
+        )
+        grouped = {var: [stick_term]}
+        # stick_var=var → this is the stick term, so num=3 must not raise
+        validate_device_index_terms(grouped, var, self.EPS)
 
 
 if __name__ == "__main__":

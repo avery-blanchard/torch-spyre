@@ -25,14 +25,12 @@ from __future__ import annotations
 import sympy
 
 from .device_index import (
+    DeviceIndexError,
     compute_device_index_terms,
     validate_device_index_terms,
-    DeviceIndexError,
 )
 from .errors import Unsupported
-from .logging_utils import get_inductor_logger
-
-logger = get_inductor_logger("compute_device_indices")
+from .views import Term
 
 
 def compute_indices_for_layout(
@@ -40,34 +38,32 @@ def compute_indices_for_layout(
     device_size: list[int],
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     host_index: sympy.Expr,
+    num_elements_per_stick: int,
     tensor_name: str = "",
-) -> tuple[dict[sympy.Symbol, list], sympy.Symbol | None]:
+) -> tuple[dict[sympy.Symbol, list[Term]], sympy.Symbol | None]:
     """Compute device-index terms for a tensor layout.
 
     Args:
         stride_map: Stride per device dimension
         device_size: Device extent per dimension
-        var_ranges: Loop variable ranges (from host index)
+        var_ranges: Loop variable ranges (from dep.ranges)
         host_index: Host index expression
+        num_elements_per_stick: Element count per stick for this tensor's dtype
         tensor_name: Name for error messages
 
     Returns:
         (grouped, stick_var): Device-index terms grouped by loop variable.
 
     Raises:
-        Unsupported: If device-index computation fails.
+        Unsupported: If device-index computation or validation fails.
     """
     try:
         grouped, stick_var = compute_device_index_terms(
             var_ranges, device_size, stride_map, host_index
         )
-        validate_device_index_terms(grouped, stick_var)
+        validate_device_index_terms(grouped, stick_var, num_elements_per_stick)
         return (grouped, stick_var)
     except DeviceIndexError as e:
         raise Unsupported(
             f"device-index validation failed for {tensor_name}: {e}"
-        ) from e
-    except Exception as e:
-        raise Unsupported(
-            f"device-index computation failed for {tensor_name}: {e}"
         ) from e

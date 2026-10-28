@@ -22,22 +22,26 @@ keyed by semantics (which loop var) rather than tensor shape (which device dim).
 
 from __future__ import annotations
 
-import dataclasses
-import math
 from collections.abc import Sequence
 
 import sympy
 
-from .views import Term
+from .views import Term, compute_coordinates, normalize_coordinates
 
 
-@dataclasses.dataclass(frozen=True)
 class DeviceIndexError(Exception):
     """Raised when device-index term structure violates an invariant."""
 
-    message: str
-    var: sympy.Symbol | None = None
-    details: str | None = None
+    def __init__(
+        self,
+        message: str,
+        var: sympy.Symbol | None = None,
+        details: str | None = None,
+    ) -> None:
+        self.message = message
+        self.var = var
+        self.details = details
+        super().__init__(str(self))
 
     def __str__(self) -> str:
         s = self.message
@@ -94,101 +98,80 @@ def compute_device_index_terms(
         f"stride_map length {len(stride_map)} != device_size length {n}"
     )
 
-    # Compute terms for each device dimension (like compute_coordinates does).
-    device_terms: list[Term | None] = [None] * n
+    # Delegate coordinate extraction to compute_coordinates, which correctly
+    # handles FloorDiv/Mod terms, overflow, and all index structures that arise
+    # in practice.  normalize_coordinates then converts the raw sympy coordinate
+    # expressions into structured Term objects (num, den, var, mod, dim_size).
+    _synthetic_idx = [0]
 
-    # Build next_stride[i] = smallest stride > stride[i]
-    next_stride = [math.inf] * n
-    for i in range(n):
-        for j in range(n):
-            if stride_map[j] > stride_map[i] and stride_map[j] < next_stride[i]:
-                next_stride[i] = stride_map[j]
+    def _synthetic_var() -> sympy.Symbol:
+        v = sympy.Symbol(f"_si{_synthetic_idx[0]}")
+        _synthetic_idx[0] += 1
+        var_ranges[v] = 1
+        return v
 
-    # Process each variable in the index.
-    for var in index.free_symbols:
-        # Extract the coefficient and step for this variable.
-        step_expr = index.xreplace({var: 1}).xreplace(
-            {v: 0 for v in index.free_symbols if v != var}
-        )
-        step_expr_int = (
-            int(step_expr) if isinstance(step_expr, (int, sympy.Integer)) else step_expr
-        )
+    try:
+        coords = compute_coordinates(device_size, stride_map, var_ranges, index)
+    except Exception as e:
+        raise DeviceIndexError(
+            message="compute_coordinates failed",
+            details=str(e),
+        ) from e
 
-        # For each device dimension, check if this var's stride range includes it.
-        for dim in range(n):
-            if device_size[dim] == 1:
-                continue  # Skip size-1 dims
-            st = stride_map[dim]
-            # var contributes to this dim if st <= step < next_stride[dim].
-            if st <= step_expr_int < next_stride[dim]:
-                # Compute den/mod for this term.
-                if next_stride[dim] < math.inf and step_expr_int >= next_stride[dim]:
-                    # Overflow: var wraps across multiple dims
-                    den = next_stride[dim] // st
-                    mod = next_stride[dim]
-                else:
-                    # No overflow: simple term
-                    den = step_expr_int // st
-                    mod = step_expr_int
+    try:
+        terms = normalize_coordinates(var_ranges, device_size, coords, _synthetic_var)
+    except Exception as e:
+        raise DeviceIndexError(
+            message="normalize_coordinates failed",
+            details=str(e),
+        ) from e
 
-                # Create Term: num=1, var, den, mod, offset=0
-                device_terms[dim] = Term(
-                    num=sympy.S.One,
-                    den=sympy.Integer(den),
-                    var=var,
-                    mod=sympy.Integer(mod),
-                    dim_size=sympy.Integer(device_size[dim]),
-                    offset=sympy.S.Zero,
-                )
-
-    # Group terms by variable, preserving var_ranges iteration order.
-    # Initialize dict with all vars from var_ranges in iteration order.
+    # Group terms by their loop variable (traversal dimension), preserving
+    # var_ranges iteration order.  Terms with var=None are constant/synthetic
+    # and do not contribute to the grouping.
     grouped: dict[sympy.Symbol, list[Term]] = {var: [] for var in var_ranges}
-    stick_var = None
-    for dim in range(n):
-        term = device_terms[dim]
-        if term is not None:
+    for term in terms:
+        if term.var is not None and term.var in grouped:
             grouped[term.var].append(term)
-            if dim == n - 1:  # Last device dimension is the stick
-                stick_var = term.var
 
-    # Filter out empty lists to keep only vars that actually contributed.
+    # The stick variable is the var owning the last term (stick dimension).
+    stick_var = terms[-1].var if terms and terms[-1].var is not None else None
+
     return (
-        {var: terms for var, terms in grouped.items() if terms},
+        {var: term_list for var, term_list in grouped.items() if term_list},
         stick_var,
     )
 
 
 def validate_device_index_terms(
-    grouped: dict[sympy.Symbol, list[Term]], stick_var: sympy.Symbol | None
+    grouped: dict[sympy.Symbol, list[Term]],
+    stick_var: sympy.Symbol | None,
+    num_elements_per_stick: int,
 ) -> None:
     """Validate device-index term structure invariants.
 
-    Checks:
+    Checks (per the device tensor spec):
     - No traversal variable has repeated (den, mod) pairs (no repeated residues)
-    - Non-stick residue terms' den evenly divides the stick size
+    - Nums in the residue (non-stick terms) must all be multiples of
+      num_elements_per_stick
 
     Args:
         grouped: dict[var -> list[Term]] from compute_device_index_terms
         stick_var: the variable owning the stick dimension, or None
+        num_elements_per_stick: element count per stick for the tensor's dtype
 
     Raises:
         DeviceIndexError: if any invariant is violated.
     """
-    # Extract stick size from the stick term (last term of stick_var's list).
-    stick_size = None
-    if stick_var is not None and stick_var in grouped:
-        terms = grouped[stick_var]
-        if terms:
-            stick_size = int(terms[-1].dim_size)
-
-    # Check each variable for repeated residues and residue den divisibility.
     for var, terms in grouped.items():
         is_stick_var = var is stick_var
         seen_keys: set[tuple] = set()
 
         for idx, term in enumerate(terms):
             is_stick_term = is_stick_var and idx == len(terms) - 1
+            num_int = (
+                int(term.num) if isinstance(term.num, (int, sympy.Integer)) else None
+            )
             den_int = (
                 int(term.den) if isinstance(term.den, (int, sympy.Integer)) else None
             )
@@ -212,12 +195,14 @@ def validate_device_index_terms(
                 )
             seen_keys.add(key)
 
-            # Check residue den divides stick size (for non-stick terms).
-            if not is_stick_term and stick_size is not None:
-                den = den_int
-                if stick_size % den != 0:
+            # Spec: nums in the residue must be multiples of num_elements_per_stick.
+            # num=1 means the term steps by one full row (always a whole number of
+            # sticks by construction); only check terms with num > 1, which encode
+            # a sub-row stride that must still land on a stick boundary.
+            if not is_stick_term and num_int is not None and num_int > 1:
+                if num_int % num_elements_per_stick != 0:
                     raise DeviceIndexError(
-                        message="residue term den is not a multiple of stick size",
+                        message="residue term num is not a multiple of num_elements_per_stick",
                         var=var,
-                        details=f"den={den}, stick_size={stick_size}",
+                        details=f"num={num_int}, num_elements_per_stick={num_elements_per_stick}",
                     )
