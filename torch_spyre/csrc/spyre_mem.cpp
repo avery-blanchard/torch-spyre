@@ -195,8 +195,15 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   for (int i = device_rank - 1; i > -1; i--) {
     device_strides[i] = prev_size;
     prev_size *= stl.device_size[i];
-    // stride_map == 0: size-1, broadcast, or gap dim — skip (no host stride).
-    if (stl.stride_map[i] == 0) continue;
+    // stride_map == 0: size-1, broadcast, or gap dim — no host stride.
+    // For broadcast dims (device_size > 1, zero host stride) dcsi_sizes must
+    // span the full device dimension so the DCI covers all device elements.
+    if (stl.stride_map[i] == 0) {
+      if (stl.device_size[i] > 1) {
+        dcsi_sizes[i] = stl.device_size[i];
+      }
+      continue;
+    }
     host_strides[i] = stl.stride_map[i];
   }
 
