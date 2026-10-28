@@ -28,7 +28,6 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Scatter
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
 from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout, get_device_dtype
 
@@ -413,6 +412,9 @@ def test_compute_restickify_target_layout_synthesizes_when_no_size1_dim_exists()
     assert list(result.stride_map) == [1, 64, -1]
 
 
+_FP16 = get_device_dtype(torch.float16)
+
+
 def _stl(device_size, stride_map, valid_elements, ea=ElementArrangement.STANDARD):
     return SpyreTensorLayout(device_size, stride_map, _FP16, valid_elements, ea)
 
@@ -713,4 +715,3 @@ def test_compiled_transpose_restickify_padded_valid_elements():
     stick_dim = len(out_stl.device_size) - 1
     stick_key = next(k for k in out_stl.valid_elements if stick_dim in k)
     assert out_stl.valid_elements[stick_key] == S
->>>>>>> 6f8a2dc78 (Switch inductor to valid elements constructor)
