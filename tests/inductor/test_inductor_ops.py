@@ -13005,9 +13005,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+
+        def _dw_ve(ds):
+            return {(0,): ds[0], (1,): ds[1], (2,): 1, (3, 4): ds[3] * ds[4]}
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0], dev_stride[0], device_dtype_fp16, _dw_ve(dev_layout[0])
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1], dev_stride[1], device_dtype_fp16, _dw_ve(dev_layout[1])
         )
 
         x_dev = x.to(device_layout=x_layout)
@@ -13051,9 +13057,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
-        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+
+        def _dw1d_ve(ds):
+            return {(0,): ds[0], (1,): 1, (2, 3): ds[2] * ds[3]}
+
+        x_layout = SpyreTensorLayout(
+            dev_layout[0], dev_stride[0], device_dtype_fp16, _dw1d_ve(dev_layout[0])
+        )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16
+            dev_layout[1], dev_stride[1], device_dtype_fp16, _dw1d_ve(dev_layout[1])
         )
 
         x_dev = x.to(device_layout=x_layout)

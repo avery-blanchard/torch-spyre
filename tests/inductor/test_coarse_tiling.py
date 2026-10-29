@@ -2467,7 +2467,12 @@ class TestDivideRanges(unittest.TestCase):
         dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
         # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
         # is a non-stick dim of the same size (512), so they collide by size.
-        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        stl = SpyreTensorLayout(
+            [32, 512, 8, 1, 64],
+            [512, 16384, 64, -1, 1],
+            dev,
+            {(0,): 32, (1,): 512, (2, 4): 512, (3,): 1},
+        )
         host_size = [1, 32, 512, 512]
 
         # Fallback (no identity): size-based elimination is ambiguous -> raise.

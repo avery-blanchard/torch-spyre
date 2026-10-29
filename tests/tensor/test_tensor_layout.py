@@ -662,7 +662,9 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_d2h_slice_to_larger_host_dtype(self, dtype):
         host = ((torch.arange(8 * 128) % 251) - 125).to(dtype).reshape(8, 128)
-        layout = SpyreTensorLayout([8, 2, 64], [128, 64, 1], DataFormats.SEN169_FP16)
+        layout = SpyreTensorLayout(
+            [8, 2, 64], [128, 64, 1], DataFormats.SEN169_FP16, {(0,): 8, (1, 2): 128}
+        )
         device = host.to("spyre", device_layout=layout)
         # The 512-byte destination needs more capacity than the 256-byte DMA.
         # Flex must receive the CPU storage capacity, not the staging buffer size.
