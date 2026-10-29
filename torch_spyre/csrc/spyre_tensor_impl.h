@@ -122,7 +122,7 @@ class SpyreTensorLayout {
       std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
       c10::ScalarType dtype, std::vector<int32_t> dim_order,
       ElementArrangement element_arrangement = ElementArrangement::STANDARD) {
-    init(host_size, host_strides, dtype, dim_order);
+    init(host_size, host_strides, dtype, dim_order, element_arrangement);
     this->element_arrangement = element_arrangement;
   }
 
@@ -224,8 +224,10 @@ class SpyreTensorLayout {
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
-  void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
-            c10::ScalarType dtype, std::vector<int32_t> dim_order);
+  void init(
+      std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
+      c10::ScalarType dtype, std::vector<int32_t> dim_order,
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD);
 
   std::string toString() const;
 

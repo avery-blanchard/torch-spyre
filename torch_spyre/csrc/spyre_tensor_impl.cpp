@@ -79,7 +79,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              std::vector<int64_t> host_strides,
                              c10::ScalarType dtype,
-                             std::vector<int32_t> dim_order) {
+                             std::vector<int32_t> dim_order,
+                             ElementArrangement element_arrangement) {
   TORCH_CHECK(host_size.size() == host_strides.size(),
               "Incompatible host_size and host_strides");
   TORCH_CHECK((host_size.size() == dim_order.size()) ||
@@ -119,7 +120,14 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   auto compute_extent = [&](int32_t host_dim) -> int64_t {
     if (host_dim == -1) return 1;
     if (host_dim == stick_dim) {
-      return sparse ? 1 : (host_size[host_dim] + stick_size - 1) / stick_size;
+      if (sparse) return 1;
+      int64_t num_sticks = (host_size[host_dim] + stick_size - 1) / stick_size;
+      if (element_arrangement == ElementArrangement::DL16_TO_FP32) {
+        int64_t dl16_stick_size = elems_per_stick(DataFormats::SEN169_FP16);
+        num_sticks = (host_size[host_dim] + dl16_stick_size - 1) /
+                     dl16_stick_size * (dl16_stick_size / stick_size);
+      }
+      return num_sticks;
     }
     return host_size[host_dim];
   };
