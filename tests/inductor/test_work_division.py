@@ -2300,7 +2300,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 [32, 32, 1, 1, 64],
                 [32, 1, -1, 65536, 1024],
                 fp16,
-                {(0,): 32, (1,): 32, (2,): 1, (3, 4): 1 * 64},
+                {(0,): 32, (1,): 32, (2, 4): 64, (3,): 1},
             )
         )
         w_dev = w.to(
@@ -2308,7 +2308,7 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 [3, 3, 1, 1, 64],
                 [1, 3, -1, 9, 9],
                 fp16,
-                {(0,): 3, (1,): 3, (2,): 1, (3, 4): 1 * 64},
+                {(0,): 3, (1,): 3, (2, 4): 1, (3,): 64},
             )
         )
         return x, w, x_dev, w_dev

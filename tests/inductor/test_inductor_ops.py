@@ -13006,14 +13006,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
 
-        def _dw_ve(ds):
-            return {(0,): ds[0], (1,): ds[1], (2,): 1, (3, 4): ds[3] * ds[4]}
+        def _dw_ve(t, ds):
+            # t: (N, C, H, W); device layout (H, W, 1, N, C_sticks).
+            # Dim 2 (sentinel) groups with dim 4 (channel stick); value = host C.
+            return {(0,): ds[0], (1,): ds[1], (2, 4): t.shape[1], (3,): t.shape[0]}
 
         x_layout = SpyreTensorLayout(
-            dev_layout[0], dev_stride[0], device_dtype_fp16, _dw_ve(dev_layout[0])
+            dev_layout[0], dev_stride[0], device_dtype_fp16, _dw_ve(x, dev_layout[0])
         )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16, _dw_ve(dev_layout[1])
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _dw_ve(weight, dev_layout[1]),
         )
 
         x_dev = x.to(device_layout=x_layout)
@@ -13058,14 +13063,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
 
-        def _dw1d_ve(ds):
-            return {(0,): ds[0], (1,): 1, (2, 3): ds[2] * ds[3]}
+        def _dw1d_ve(t, ds):
+            # t: (N, C, W); device layout (W, 1, N, C_sticks).
+            # Dim 1 (sentinel) groups with dim 3 (channel stick); value = host C.
+            return {(0,): ds[0], (1, 3): t.shape[1], (2,): t.shape[0]}
 
         x_layout = SpyreTensorLayout(
-            dev_layout[0], dev_stride[0], device_dtype_fp16, _dw1d_ve(dev_layout[0])
+            dev_layout[0], dev_stride[0], device_dtype_fp16, _dw1d_ve(x, dev_layout[0])
         )
         weight_layout = SpyreTensorLayout(
-            dev_layout[1], dev_stride[1], device_dtype_fp16, _dw1d_ve(dev_layout[1])
+            dev_layout[1],
+            dev_stride[1],
+            device_dtype_fp16,
+            _dw1d_ve(weight, dev_layout[1]),
         )
 
         x_dev = x.to(device_layout=x_layout)

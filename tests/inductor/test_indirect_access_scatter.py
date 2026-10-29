@@ -181,7 +181,7 @@ class _ScatterScenarios:
             device_size=[M, H, D // eps, Bn, eps],
             stride_map=[D, M * D, eps, H * M * D, 1],
             device_dtype=get_device_dtype(dtype),
-            valid_elements={(0,): M, (1,): H, (2, 4): D // eps, (3,): Bn},
+            valid_elements={(0,): M, (1,): H, (2, 4): D, (3,): Bn},
         )
 
         def apply_rope(src, freqs):
