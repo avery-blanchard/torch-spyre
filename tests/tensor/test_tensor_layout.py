@@ -376,10 +376,10 @@ class TestSpyreTensorLayout(TestCase):
     @parametrize(
         "sizes,strides,device_size,stride_map",
         [
-            ([60], [1], [1, 60, 64], [-1, 1, -1]),
-            ([60], [1], [1, 1, 60, 64], [1, -1, 1, -1]),
-            ([60], [1], [1, 1, 1, 60, 64], [1, 1, -1, 1, -1]),
-            ([60], [1], [1, 1, 1, 1, 60, 64], [1, 1, 1, -1, 1, -1]),
+            ([60], [1], [1, 60, 64], [0, 1, 0]),
+            ([60], [1], [1, 1, 60, 64], [1, 0, 1, 0]),
+            ([60], [1], [1, 1, 1, 60, 64], [1, 1, 0, 1, 0]),
+            ([60], [1], [1, 1, 1, 1, 60, 64], [1, 1, 1, 0, 1, 0]),
         ],
     )
     def test_to_spyre_layout_explicit_trailing_ones(
@@ -581,7 +581,7 @@ class TestSpyreTensorLayout(TestCase):
         sticks = (width + eps - 1) // eps
         # The row-major physical layout produced by the compiled LM head.
         layout = SpyreTensorLayout(
-            [rows, sticks, 1, eps], [width, eps, -1, 1], device_format
+            [rows, sticks, 1, eps], [width, eps, 0, 1], device_format
         )
         device = host.to("spyre", device_layout=layout)
         view = device[:, row, :]
@@ -642,7 +642,7 @@ class TestSpyreTensorLayout(TestCase):
             .reshape(2, 8, 128)
         )
         layout = SpyreTensorLayout(
-            [2, 8, 2, 1, 64], [1024, 128, 64, -1, 1], DataFormats.SEN169_FP16
+            [2, 8, 2, 1, 64], [1024, 128, 64, 0, 1], DataFormats.SEN169_FP16
         )
         device = host.to("spyre", device_layout=layout)
         # The bounded descriptor must preserve source strides when rebasing.
@@ -979,7 +979,7 @@ class TestSpyreTensorLayout(TestCase):
             (128, 256): ([2, 128, 128], [128, 256, 1]),
             (4, 128, 64): ([4, 1, 128, 128], [8192, 64, 64, 1]),
             (2, 12, 128, 128): ([2, 12, 1, 128, 128], [196608, 16384, 128, 128, 1]),
-            (1, 12, 256, 384): ([1, 12, 3, 256, 128], [-1, 98304, 128, 384, 1]),
+            (1, 12, 256, 384): ([1, 12, 3, 256, 128], [0, 98304, 128, 384, 1]),
         }
         cpu = torch.device("cpu")
         for size, (device_size, stride_map) in cases.items():
