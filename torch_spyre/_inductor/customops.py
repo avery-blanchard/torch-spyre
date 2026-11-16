@@ -171,6 +171,19 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     return x.new_empty(out_size, dtype=x.dtype)
 
 
+@torch.library.custom_op(
+    "spyre::non_zero_pos_to_idx", mutates_args=(), device_types="spyre"
+)
+def non_zero_pos_to_idx(x: torch.Tensor, dim: int) -> torch.Tensor:
+    pass
+
+
+@non_zero_pos_to_idx.register_fake
+def _(x: torch.Tensor, dim: int) -> torch.Tensor:
+    # A scan keeps the shape of its input along every dim, including ``dim``.
+    return x.new_empty(x.size())
+
+
 @torch.library.custom_op("spyre::keep_by_index", mutates_args=(), device_types="spyre")
 def keep_by_index(
     values: torch.Tensor,

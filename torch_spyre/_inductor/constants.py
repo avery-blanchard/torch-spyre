@@ -171,6 +171,7 @@ SPYRE_FP32_OPS = [
     "rsqrt",
     "topkvalue",
     "topkindex",
+    "non_zero_pos_to_idx",
     "floor",
     "to_dtype",
     "maximum",
@@ -232,6 +233,12 @@ SPYRE_FP8_OPS = {
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
+
+# Scan opfunc names. A scan keeps its input's shape and writes the scan symbol
+# into its output index, so it is lowered to ``ir.Scan`` (not ``Reduction``).
+# Its scan dim may not carry the stick and may not be split across cores.
+NON_ZERO_POS_TO_IDX_OP = "non_zero_pos_to_idx"
+SCAN_OPS = frozenset({NON_ZERO_POS_TO_IDX_OP})
 _MAX_K_PER_CORE = 4
 TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 

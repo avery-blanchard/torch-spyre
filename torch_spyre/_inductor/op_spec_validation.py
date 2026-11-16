@@ -106,7 +106,7 @@ REDUCTION_OPS = (
 
 DTYPE_OPS = DtypeOpTable.op_names()
 
-SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
+SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP}) | constants.SCAN_OPS
 
 BINARY_OPS = frozenset(
     {

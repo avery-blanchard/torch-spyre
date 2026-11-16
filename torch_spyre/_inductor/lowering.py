@@ -27,7 +27,8 @@ import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
-from torch._inductor.virtualized import V
+from torch._inductor.codegen.common import BackendFeature
+from torch._inductor.virtualized import V, ops
 from torch.utils._ordered_set import OrderedSet
 
 import torch_spyre._inductor.customops  # noqa: F401
@@ -896,6 +897,58 @@ def _topk_reduction_kwargs(x, k, dim):
         ranges=ranges,
         reduction_ranges=reduction_ranges,
     )
+
+
+@contextmanager
+def _scan_feature_enabled():
+    """Let ``ir.Scan.create`` run for this lowering only.
+
+    ``Scan.create`` returns ``None`` unless the backend advertises
+    ``BackendFeature.SCAN``. Advertising it globally would also turn stock
+    ``cumprod``/``logcumsumexp`` lowerings into scans Spyre cannot emit, where
+    they now fall back to aten.
+    """
+    graph = V.graph
+    original = graph.has_feature
+
+    def has_feature(device, feature):
+        return feature == BackendFeature.SCAN or original(device, feature)
+
+    graph.has_feature = has_feature
+    try:
+        yield
+    finally:
+        graph.has_feature = original
+
+
+@register_spyre_lowering(torch.ops.spyre.non_zero_pos_to_idx)
+def lower_non_zero_pos_to_idx(x, dim):
+    """Lower to a plain ``ir.Scan`` along ``dim``; the output keeps x's shape.
+
+    The scan axis lives in ``Scan.reindex`` / ``scan_ranges``; see
+    ``pass_utils.scan_var`` for how the passes recover it.
+    """
+
+    def combine_fn(a_tuple, b_tuple):
+        (a,) = a_tuple
+        (b,) = b_tuple
+        return (ops.non_zero_pos_to_idx(a, b),)
+
+    kwargs = lowering._make_scan_inner(
+        x, axis=lowering._validate_dim(x, dim), dtype=None
+    )
+    with _scan_feature_enabled():
+        (result,) = ir.Scan.create(
+            **kwargs, combine_fn=combine_fn, can_fallback_to_aten=False
+        )
+    # Scan.create returns a Pointwise copy for a length-1 scan dim and a
+    # SplitScan if it chose to split; neither implements this op.
+    if result is None or type(result.data.data.data) is not ir.Scan:
+        raise Unsupported(
+            f"non_zero_pos_to_idx: dim {dim} of size {x.get_size()} did not lower "
+            f"to a single scan"
+        )
+    return result
 
 
 @register_spyre_lowering(torch.ops.spyre.topkvalue)

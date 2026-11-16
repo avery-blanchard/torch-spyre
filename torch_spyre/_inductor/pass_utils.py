@@ -47,6 +47,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scan,
     Scatter,
     StorageBox,
     TensorBox,
@@ -2051,8 +2052,10 @@ def _scatter_iteration_space(rw: ReadWrites) -> dict[sympy.Symbol, sympy.Expr]:
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Scatter):
         return _scatter_iteration_space(n.read_writes)
-    elif isinstance(n.node.data, Pointwise):
-        # The iteration space of a Pointwise is that of its output
+    elif isinstance(n.node.data, (Pointwise, Scan)):
+        # The iteration space of a Pointwise is that of its output. A Scan's
+        # output index also carries the scan symbol, so its write dep already
+        # covers every loop (see scan_var for which one is the scan).
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
@@ -2079,7 +2082,7 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     rw = op_read_writes(op)
     if isinstance(op.data, Scatter):
         return _scatter_iteration_space(rw)
-    elif isinstance(op.data, Pointwise):
+    elif isinstance(op.data, (Pointwise, Scan)):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
@@ -3645,6 +3648,62 @@ def is_topk(op: Operation) -> bool:
         and isinstance(op.data, Reduction)
         and op.data.reduction_type in TOPK_OPS
     )
+
+
+def is_scan(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing an ``ir.Scan``."""
+    return isinstance(op, ComputedBuffer) and isinstance(op.data, Scan)
+
+
+def scan_axis(data: Scan) -> int:
+    """Host axis a ``Scan`` runs along, from its origin FX node's ``dim`` argument.
+
+    The lowering passes ``dim`` straight through, so the original call is the
+    authoritative source. ``dim`` may be negative, so normalize it by the rank
+    (``len(data.size)``, the full shape including the scan dim).
+    """
+    origins = list(data.origins)
+    if not origins or len(origins[0].args) < 2:
+        raise Unsupported("scan node has no origin call to read its dim from")
+    dim = origins[0].args[1]
+    if not isinstance(dim, int):
+        raise Unsupported(f"scan dim is not a literal int: {dim!r}")
+    return dim % len(data.size)
+
+
+def scan_var(op: ComputedBuffer, write: "MemoryDep | None" = None) -> sympy.Symbol:
+    """Iteration symbol of the dim a ``Scan`` scans.
+
+    ``write`` must come from the same namespace as the caller's symbols: pass the
+    scheduler node's write dep at codegen (its symbols key ``op_spec``), or leave
+    it None for the ``d{i}`` names of ``op_read_writes`` at lowering time.
+
+    A scan's output keeps the scan dim, so unlike a reduction var this symbol
+    is not absent from the output index (``find_reduction_var`` cannot find it).
+    The scan dim is the output dim at ``scan_axis``: its symbol is the one in
+    the write index whose coefficient is that dim's host stride and whose range
+    is its size. A dim that Inductor merged with a neighbour has no such symbol
+    and is rejected.
+    """
+    data = op.data
+    if not isinstance(data, Scan):
+        raise Unsupported(f"{op.get_name()} is not a scan")
+    axis = scan_axis(data)
+    stride = op.get_layout().stride[axis]
+    size = data.size[axis]
+    if write is None:
+        write = next(iter(op_read_writes(op).writes))
+    candidates = [
+        sym
+        for sym, rng in write.ranges.items()
+        if rng == size and write.index.coeff(sym) == stride
+    ]
+    if len(candidates) != 1:
+        raise Unsupported(
+            f"{op.get_name()}: cannot identify the scan symbol of axis {axis} "
+            f"(index {write.index}, ranges {write.ranges})"
+        )
+    return candidates[0]
 
 
 def is_keep_by_index(op: Operation) -> bool:
