@@ -46,14 +46,14 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
-    SPYRE_INT32_OPS,
     SCAN_OPS,
+    SPYRE_INT32_OPS,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
 )
 from torch_spyre._inductor.core_mapping import matmul_reduction_dim
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,

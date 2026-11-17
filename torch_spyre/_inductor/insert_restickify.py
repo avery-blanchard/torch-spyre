@@ -47,6 +47,7 @@ from torch._inductor.ir import (
     IRNode,
     MutableBox,
     MutationLayoutSHOULDREMOVE,
+    Scan,
     Operation,
     ReinterpretView,
     StorageBox,
@@ -694,11 +695,16 @@ def insert_restickify_on_node_inputs(
     (canonical_idx, canonical_ridx), _ = index_vars_squeeze(
         op.data.get_pointwise_size(), op.data.get_reduction_size(), prefix="d"
     )
-    canonical_args = (
-        (canonical_idx, canonical_ridx)
-        if op.data.get_reduction_type()
-        else (canonical_idx,)
-    )
+    if isinstance(op.data, Scan):
+        # A Scan's inner_fn takes one full index: its reindex already splices the
+        # scan symbol into place, so its canonical form is that single group.
+        canonical_args: tuple = (op.data.reindex(canonical_idx, canonical_ridx),)
+    else:
+        canonical_args = (
+            (canonical_idx, canonical_ridx)
+            if op.data.get_reduction_type()
+            else (canonical_idx,)
+        )
     object.__setattr__(
         op.data,
         "inner_fn",
@@ -706,6 +712,19 @@ def insert_restickify_on_node_inputs(
             op.data.inner_fn, edge_swaps, name_map, canonical_args, moved_terms
         ),
     )
+    if isinstance(op.data, Scan):
+        # Scan.store_reduction loads through ``inner_fns`` (one per output dtype),
+        # not ``inner_fn``, so the per-edge redirect must wrap every one of them.
+        object.__setattr__(
+            op.data,
+            "inner_fns",
+            tuple(
+                make_per_edge_inner_fn(
+                    fn, edge_swaps, name_map, canonical_args, moved_terms
+                )
+                for fn in op.data.inner_fns
+            ),
+        )
     # op now reads the restickify buffers: an extraction memoized before this
     # (e.g. by optimize_restickify_locations) names the old inputs.
     invalidate_op_read_writes(op)

@@ -30,7 +30,7 @@ from torch._inductor.codegen.common import (
     REMOVED,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch._inductor.ir import ComputedBuffer, Pointwise
+from torch._inductor.ir import ComputedBuffer, Pointwise, Scan
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
@@ -74,6 +74,7 @@ from .scratchpad.lx_relayout import (
 )
 from .pass_utils import (
     concretize_expr,
+    host_ordered_scan_space,
     op_read_writes,
     scan_var,
     compute_symbolic_bounds,
@@ -1106,6 +1107,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
         )
+        if isinstance(ir_node.data, Scan):
+            # Positional SDSC labels follow this order: make it host order.
+            it_space_extended = host_ordered_scan_space(
+                it_space_extended, next(iter(self.current_node.read_writes.writes))
+            )
         # Build per-level tiled_symbols (innermost first) for this op.
         # loop_tiled_dims / loop_tiled_reduction_dims are lists of per-level
         # dim-index lists, outermost first — so we build outermost-first then

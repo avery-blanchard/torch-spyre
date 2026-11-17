@@ -856,7 +856,13 @@ def scan_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     """
     if not is_scan(ctx.op):
         return ConstraintResult()
-    return ConstraintResult(allowed_splits={scan_var(ctx.op): frozenset({1})})
+    sym = scan_var(ctx.op)
+    if sym not in ctx.it_space:
+        raise Unsupported(
+            f"{ctx.op.get_name()} (scan): scan symbol {sym} is not in the "
+            f"iteration space {list(ctx.it_space)}"
+        )
+    return ConstraintResult(allowed_splits={sym: frozenset({1})})
 
 
 def _keep_by_index_axes(ctx: WorkDivConstraintContext) -> set[Symbol] | None:

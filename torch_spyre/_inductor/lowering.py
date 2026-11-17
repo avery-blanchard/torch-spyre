@@ -909,6 +909,7 @@ def _scan_feature_enabled():
     they now fall back to aten.
     """
     graph = V.graph
+    had_instance_attr = "has_feature" in vars(graph)
     original = graph.has_feature
 
     def has_feature(device, feature):
@@ -918,7 +919,11 @@ def _scan_feature_enabled():
     try:
         yield
     finally:
-        graph.has_feature = original
+        # Remove the instance override rather than leaving a bound method behind.
+        if had_instance_attr:
+            graph.has_feature = original
+        else:
+            del graph.has_feature
 
 
 @register_spyre_lowering(torch.ops.spyre.non_zero_pos_to_idx)
@@ -941,8 +946,10 @@ def lower_non_zero_pos_to_idx(x, dim):
         (result,) = ir.Scan.create(
             **kwargs, combine_fn=combine_fn, can_fallback_to_aten=False
         )
-    # Scan.create returns a Pointwise copy for a length-1 scan dim and a
-    # SplitScan if it chose to split; neither implements this op.
+    # Deliberately rejected: Scan.create returns a Pointwise copy for a length-1
+    # scan dim, and this op's per-element semantics are not known to be an
+    # identity there, so it is not lowered as a copy. A SplitScan is also not a
+    # single scan and is rejected.
     if result is None or type(result.data.data.data) is not ir.Scan:
         raise Unsupported(
             f"non_zero_pos_to_idx: dim {dim} of size {x.get_size()} did not lower "

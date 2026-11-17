@@ -3656,19 +3656,49 @@ def is_scan(op: Operation) -> bool:
 
 
 def scan_axis(data: Scan) -> int:
-    """Host axis a ``Scan`` runs along, from its origin FX node's ``dim`` argument.
+    """Host axis a ``Scan`` runs along, from its origin call's ``dim`` argument.
 
     The lowering passes ``dim`` straight through, so the original call is the
-    authoritative source. ``dim`` may be negative, so normalize it by the rank
-    (``len(data.size)``, the full shape including the scan dim).
+    authoritative source. ``data.origins`` is a set and can hold other nodes, so
+    select the ``non_zero_pos_to_idx`` call explicitly. ``dim`` may be passed
+    positionally or as a keyword, and may be negative, so normalize it by the
+    rank (``len(data.size)``, the full shape including the scan dim).
     """
-    origins = list(data.origins)
-    if not origins or len(origins[0].args) < 2:
-        raise Unsupported("scan node has no origin call to read its dim from")
-    dim = origins[0].args[1]
+    target = torch.ops.spyre.non_zero_pos_to_idx.default
+    calls = [o for o in data.origins if getattr(o, "target", None) is target]
+    if len(calls) != 1:
+        raise Unsupported(
+            f"scan node has {len(calls)} non_zero_pos_to_idx origin calls, expected 1"
+        )
+    call = calls[0]
+    if len(call.args) >= 2:
+        dim = call.args[1]
+    elif "dim" in call.kwargs:
+        dim = call.kwargs["dim"]
+    else:
+        raise Unsupported("scan origin call has no dim argument")
     if not isinstance(dim, int):
         raise Unsupported(f"scan dim is not a literal int: {dim!r}")
     return dim % len(data.size)
+
+
+def host_ordered_scan_space(
+    space: dict[sympy.Symbol, Any], write: "MemoryDep"
+) -> dict[sympy.Symbol, Any]:
+    """Order a Scan's iteration space by host position, outermost first.
+
+    A Scan's write dep lists its pointwise vars before the scan var, so the
+    iteration-space order is not the host order when the scan dim is not last.
+    Positional SDSC labels follow this order, so they must follow the host
+    order instead. Host position is the write index coefficient (the host
+    stride): larger stride means further out.
+    """
+    return dict(
+        sorted(
+            space.items(),
+            key=lambda kv: -concretize_expr(write.index.coeff(kv[0])),
+        )
+    )
 
 
 def scan_var(op: ComputedBuffer, write: "MemoryDep | None" = None) -> sympy.Symbol:

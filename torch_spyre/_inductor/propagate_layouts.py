@@ -2307,8 +2307,15 @@ def _scan_layouts(
     """
     _check_supported_input_sticks(args, "scan")
     x = args[0]
-    sym = scan_var(op)
     axis = scan_axis(op.data)  # type: ignore[arg-type]
+    sym = scan_var(op)
+    # The scan symbol must name the same iteration variable in the input and
+    # output deps, or the stick pin below would silently match nothing.
+    if sym not in x.dep.index.free_symbols or sym not in output_dep.index.free_symbols:
+        raise Unsupported(
+            f"{op.get_name()} (scan): scan symbol {sym} is not shared by the input "
+            f"index {x.dep.index} and output index {output_dep.index}"
+        )
     out_coords = host_coordinates(output, output_dep, None)
     stick_size = get_elem_in_stick(output.dtype)
 
