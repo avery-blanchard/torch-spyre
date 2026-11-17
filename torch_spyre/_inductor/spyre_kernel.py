@@ -1110,7 +1110,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         if isinstance(ir_node.data, Scan):
             # Positional SDSC labels follow this order: make it host order.
             it_space_extended = host_ordered_scan_space(
-                it_space_extended, next(iter(self.current_node.read_writes.writes))
+                it_space_extended,
+                next(iter(self.current_node.read_writes.writes)),  # type: ignore[arg-type]
             )
         # Build per-level tiled_symbols (innermost first) for this op.
         # loop_tiled_dims / loop_tiled_reduction_dims are lists of per-level
@@ -1419,7 +1420,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op_info["scan_dim"] = str(
                     scan_var(
                         self.current_node.node,  # type: ignore[arg-type]
-                        write=next(iter(self.current_node.read_writes.writes)),
+                        self.current_node.read_writes,
+                        self.current_node._body,
                     )
                 )
             self.op_specs.append(

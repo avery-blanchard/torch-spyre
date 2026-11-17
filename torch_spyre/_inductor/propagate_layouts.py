@@ -2307,8 +2307,8 @@ def _scan_layouts(
     """
     _check_supported_input_sticks(args, "scan")
     x = args[0]
+    sym = scan_var(op)  # type: ignore[arg-type]
     axis = scan_axis(op.data)  # type: ignore[arg-type]
-    sym = scan_var(op)
     # The scan symbol must name the same iteration variable in the input and
     # output deps, or the stick pin below would silently match nothing.
     if sym not in x.dep.index.free_symbols or sym not in output_dep.index.free_symbols:

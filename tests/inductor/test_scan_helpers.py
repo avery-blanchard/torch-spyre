@@ -23,53 +23,77 @@ from types import SimpleNamespace
 
 import pytest
 import sympy
-import torch
 
 import torch_spyre  # noqa: F401  (registers spyre::non_zero_pos_to_idx)
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.pass_utils import host_ordered_scan_space, scan_axis
-
-_TARGET = torch.ops.spyre.non_zero_pos_to_idx.default
-
-
-def _scan_node(*origin_calls, size=(4, 64, 128)):
-    return SimpleNamespace(size=list(size), origins=list(origin_calls))
-
-
-def _call(*args, **kwargs):
-    return SimpleNamespace(target=_TARGET, args=args, kwargs=kwargs)
+from torch._inductor.ir import Scan
+from torch_spyre._inductor.pass_utils import (
+    host_ordered_scan_space,
+    scan_axis,
+    scan_var as op_scan_var,
+)
 
 
-def test_scan_axis_positional_dim():
-    assert scan_axis(_scan_node(_call("x", 1))) == 1
+def _scan_op(pointwise, scan):
+    data = Scan.__new__(Scan)
+    object.__setattr__(data, "ranges", list(pointwise))
+    object.__setattr__(data, "scan_ranges", list(scan))
+    object.__setattr__(data, "size", list(pointwise) + list(scan))
+    return SimpleNamespace(data=data, get_name=lambda: "buf0")
 
 
-def test_scan_axis_normalizes_negative_dim():
-    assert scan_axis(_scan_node(_call("x", -1))) == 2
-
-
-def test_scan_axis_keyword_dim():
-    assert scan_axis(_scan_node(_call("x", dim=0))) == 0
-
-
-def test_scan_axis_ignores_other_origins():
-    other = SimpleNamespace(
-        target=torch.ops.aten.add.Tensor, args=("a", "b"), kwargs={}
+def _body(var, extent, write_index):
+    """Stand-in for a LoopBody: its declared scan var and write index."""
+    return SimpleNamespace(
+        reduce_vars=[var],
+        var_ranges={var: extent},
+        get_write_expr=lambda name: write_index,
     )
-    assert scan_axis(_scan_node(other, _call("x", 2))) == 2
 
 
-def test_scan_axis_rejects_missing_call():
-    other = SimpleNamespace(
-        target=torch.ops.aten.add.Tensor, args=("a", "b"), kwargs={}
-    )
-    with pytest.raises(Unsupported, match="0 non_zero_pos_to_idx origin calls"):
-        scan_axis(_scan_node(other))
+def _rw(ranges, index):
+    return SimpleNamespace(writes=[SimpleNamespace(ranges=ranges, index=index)])
 
 
-def test_scan_axis_rejects_non_literal_dim():
-    with pytest.raises(Unsupported, match="not a literal int"):
-        scan_axis(_scan_node(_call("x", sympy.Symbol("s"))))
+def test_scan_var_matches_declared_scan_var_by_extent_and_stride():
+    q0, q1 = sympy.symbols("q0 q1")
+    c0, c1, c2 = sympy.symbols("c0 c1 c2")
+    # Body: scan var q1 (extent 64, stride 128); deps rename it, any position.
+    body = _body(q1, 64, 8192 * q0 + 128 * q1)
+    rw = _rw({c0: 64, c1: 4}, 128 * c0 + 8192 * c1)
+    assert op_scan_var(_scan_op([4], [64]), rw, body) == c0
+
+
+def test_scan_var_rejects_merged_scan_dim():
+    q0, c0 = sympy.symbols("q0 c0")
+    body = _body(q0, 16, q0)
+    rw = _rw({c0: 128}, c0)  # scan merged with an 8-wide neighbour
+    with pytest.raises(Unsupported, match="matches \\[\\]"):
+        op_scan_var(_scan_op([8], [16]), rw, body)
+
+
+def test_scan_var_rejects_ambiguous_match():
+    q0, c0, c1 = sympy.symbols("q0 c0 c1")
+    body = _body(q0, 4, q0)
+    rw = _rw({c0: 4, c1: 4}, c0 + c1)
+    with pytest.raises(Unsupported, match="matches"):
+        op_scan_var(_scan_op([4], [4]), rw, body)
+
+
+def test_scan_var_rejects_non_scan():
+    with pytest.raises(Unsupported, match="not a scan"):
+        op_scan_var(SimpleNamespace(data=object(), get_name=lambda: "b"))
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_scan_axis_from_reindex(axis):
+    data = _scan_op([4, 128], [64]).data
+
+    def reindex(index, scan_index):
+        return [*index[:axis], *scan_index, *index[axis:]]
+
+    object.__setattr__(data, "reindex", reindex)
+    assert scan_axis(data) == axis
 
 
 class _Write:

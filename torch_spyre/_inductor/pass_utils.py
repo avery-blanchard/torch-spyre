@@ -57,7 +57,11 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import sympy_subs
 from torch.utils._sympy.functions import FloorDiv
-from torch._inductor.dependencies import MemoryDep, ReadWrites, is_indirect
+from torch._inductor.dependencies import (
+    MemoryDep,
+    ReadWrites,
+    is_indirect,
+)
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -3656,30 +3660,68 @@ def is_scan(op: Operation) -> bool:
 
 
 def scan_axis(data: Scan) -> int:
-    """Host axis a ``Scan`` runs along, from its origin call's ``dim`` argument.
+    """Host axis a ``Scan`` runs along, read from its ``reindex``.
 
-    The lowering passes ``dim`` straight through, so the original call is the
-    authoritative source. ``data.origins`` is a set and can hold other nodes, so
-    select the ``non_zero_pos_to_idx`` call explicitly. ``dim`` may be passed
-    positionally or as a keyword, and may be negative, so normalize it by the
-    rank (``len(data.size)``, the full shape including the scan dim).
+    ``Scan.reindex(pointwise_index, scan_index)`` builds the full host-ordered
+    index handed to ``inner_fn``: ``[*pw[:axis], *scan, *pw[axis:]]``. Feeding
+    it fresh symbols shows where the scan index lands, so the axis comes from
+    the node itself, not from the originating FX call or from strides.
     """
-    target = torch.ops.spyre.non_zero_pos_to_idx.default
-    calls = [o for o in data.origins if getattr(o, "target", None) is target]
-    if len(calls) != 1:
+    pointwise = [sympy.Symbol(f"_p{i}") for i in range(len(data.ranges))]
+    scan = [sympy.Symbol(f"_s{i}") for i in range(len(data.scan_ranges))]
+    positions = [i for i, e in enumerate(data.reindex(pointwise, scan)) if e in scan]
+    if len(scan) != 1 or len(positions) != 1:
+        raise Unsupported(f"scan with {len(scan)} scan dims at positions {positions}")
+    return positions[0]
+
+
+def scan_var(
+    op: ComputedBuffer,
+    rw: "ReadWrites | None" = None,
+    body: Any = None,
+) -> sympy.Symbol:
+    """Iteration symbol of the dim a ``Scan`` scans, in the namespace of ``rw``.
+
+    ``ir.Scan`` reports its scan range as its reduction size, so its ``LoopBody``
+    declares the scan var as its single ``reduce_vars`` entry. That body writes
+    the output with an index over its own vars, which gives the scan var's
+    extent (``body.var_ranges``) and stride (its coefficient in the write
+    index). The deps ``rw`` rename the body's vars (``d{i}`` or ``c{i}``), so
+    the matching dep symbol is the one with that same extent and stride. No
+    position in the dep's ranges is assumed. A scan dim merged into a
+    neighbour has no such symbol and is rejected.
+
+    Pass the scheduler node's ``read_writes`` and ``_body`` at codegen; leave
+    both None before scheduling, where ``op_read_writes`` and the lowered
+    node's default body are used.
+
+    Unlike a reduction var, the scan symbol is present in the output index, so
+    ``find_reduction_var`` cannot find it.
+    """
+    if not isinstance(op.data, Scan):
+        raise Unsupported(f"{op.get_name()} is not a scan")
+    if body is None:
+        body = op.get_default_sizes_body()[1]
+    if len(body.reduce_vars) != 1:
         raise Unsupported(
-            f"scan node has {len(calls)} non_zero_pos_to_idx origin calls, expected 1"
+            f"{op.get_name()}: expected one scan var, got {body.reduce_vars}"
         )
-    call = calls[0]
-    if len(call.args) >= 2:
-        dim = call.args[1]
-    elif "dim" in call.kwargs:
-        dim = call.kwargs["dim"]
-    else:
-        raise Unsupported("scan origin call has no dim argument")
-    if not isinstance(dim, int):
-        raise Unsupported(f"scan dim is not a literal int: {dim!r}")
-    return dim % len(data.size)
+    (body_var,) = body.reduce_vars
+    size = body.var_ranges[body_var]
+    stride = body.get_write_expr(op.get_name()).coeff(body_var)
+    write = next(iter((rw or op_read_writes(op)).writes))
+    matches = [
+        sym
+        for sym, extent in write.ranges.items()
+        if extent == size and write.index.coeff(sym) == stride
+    ]
+    if len(matches) != 1:
+        raise Unsupported(
+            f"{op.get_name()}: scan var {body_var} (extent {size}, stride {stride}) "
+            f"matches {matches} in write index {write.index} / ranges "
+            f"{dict(write.ranges)}"
+        )
+    return matches[0]
 
 
 def host_ordered_scan_space(
@@ -3699,41 +3741,6 @@ def host_ordered_scan_space(
             key=lambda kv: -concretize_expr(write.index.coeff(kv[0])),
         )
     )
-
-
-def scan_var(op: ComputedBuffer, write: "MemoryDep | None" = None) -> sympy.Symbol:
-    """Iteration symbol of the dim a ``Scan`` scans.
-
-    ``write`` must come from the same namespace as the caller's symbols: pass the
-    scheduler node's write dep at codegen (its symbols key ``op_spec``), or leave
-    it None for the ``d{i}`` names of ``op_read_writes`` at lowering time.
-
-    A scan's output keeps the scan dim, so unlike a reduction var this symbol
-    is not absent from the output index (``find_reduction_var`` cannot find it).
-    The scan dim is the output dim at ``scan_axis``: its symbol is the one in
-    the write index whose coefficient is that dim's host stride and whose range
-    is its size. A dim that Inductor merged with a neighbour has no such symbol
-    and is rejected.
-    """
-    data = op.data
-    if not isinstance(data, Scan):
-        raise Unsupported(f"{op.get_name()} is not a scan")
-    axis = scan_axis(data)
-    stride = op.get_layout().stride[axis]
-    size = data.size[axis]
-    if write is None:
-        write = next(iter(op_read_writes(op).writes))
-    candidates = [
-        sym
-        for sym, rng in write.ranges.items()
-        if rng == size and write.index.coeff(sym) == stride
-    ]
-    if len(candidates) != 1:
-        raise Unsupported(
-            f"{op.get_name()}: cannot identify the scan symbol of axis {axis} "
-            f"(index {write.index}, ranges {write.ranges})"
-        )
-    return candidates[0]
 
 
 def is_keep_by_index(op: Operation) -> bool:

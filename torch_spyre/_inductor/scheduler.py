@@ -612,7 +612,11 @@ class SuperDSCScheduling(BaseScheduling):
         if isinstance(snode.node.data, Scan):
             # The scan symbol is the reduction-style group. Name it explicitly
             # rather than relying on it being last in the iteration space.
-            scan_sym = scan_var(snode.node, write=next(iter(snode.read_writes.writes)))
+            scan_sym = scan_var(
+                snode.node,  # type: ignore[arg-type]
+                snode.read_writes,
+                snode._body,
+            )
             pointwise = [sym for sym in symbols if sym != scan_sym]
             if len(pointwise) != n_iter:
                 raise Unsupported(

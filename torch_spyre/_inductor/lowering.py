@@ -930,8 +930,8 @@ def _scan_feature_enabled():
 def lower_non_zero_pos_to_idx(x, dim):
     """Lower to a plain ``ir.Scan`` along ``dim``; the output keeps x's shape.
 
-    The scan axis lives in ``Scan.reindex`` / ``scan_ranges``; see
-    ``pass_utils.scan_var`` for how the passes recover it.
+    The scan axis is carried by ``Scan.reindex`` and ``scan_ranges``; see
+    ``pass_utils.scan_axis`` / ``scan_var`` for how the passes recover it.
     """
 
     def combine_fn(a_tuple, b_tuple):
