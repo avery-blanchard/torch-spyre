@@ -3702,6 +3702,10 @@ def scan_var(
         raise Unsupported(f"{op.get_name()} is not a scan")
     if body is None:
         body = op.get_default_sizes_body()[1]
+        # Don't leave this body cached on the op: later passes swap the op's
+        # loaders (insert_restickify), and the scheduler must trace the swapped
+        # ones, not this stale copy.
+        ComputedBuffer.get_default_sizes_body.clear_cache(op)
     if len(body.reduce_vars) != 1:
         raise Unsupported(
             f"{op.get_name()}: expected one scan var, got {body.reduce_vars}"

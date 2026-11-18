@@ -927,7 +927,7 @@ def _scan_feature_enabled():
 
 
 @register_spyre_lowering(torch.ops.spyre.non_zero_pos_to_idx)
-def lower_non_zero_pos_to_idx(x, dim):
+def lower_non_zero_pos_to_idx(x, dim, padval):
     """Lower to a plain ``ir.Scan`` along ``dim``; the output keeps x's shape.
 
     The scan axis is carried by ``Scan.reindex`` and ``scan_ranges``; see
@@ -937,7 +937,7 @@ def lower_non_zero_pos_to_idx(x, dim):
     def combine_fn(a_tuple, b_tuple):
         (a,) = a_tuple
         (b,) = b_tuple
-        return (ops.non_zero_pos_to_idx(a, b),)
+        return (ops.non_zero_pos_to_idx(a, b, padval),)
 
     kwargs = lowering._make_scan_inner(
         x, axis=lowering._validate_dim(x, dim), dtype=None

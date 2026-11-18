@@ -356,11 +356,12 @@ class SpyreOpFuncs:
         return ReductionOp("quantscalepertokenfp8", [x])
 
     @staticmethod
-    def non_zero_pos_to_idx(x, carry):
+    def non_zero_pos_to_idx(x, carry, padval):
         # Combiner of the ``spyre::non_zero_pos_to_idx`` scan. ``scan`` below
-        # reads the op name from the combiner and emits it as one op over the
-        # whole scan dim; the combiner is never expanded into a loop.
-        return PointwiseOp(NON_ZERO_POS_TO_IDX_OP, [x, carry])
+        # reads the op name and constants from the combiner and emits one op over
+        # the whole scan dim; the combiner is never expanded into a loop.
+        op_info = {"constants": {"padval": padval}}
+        return PointwiseOp(NON_ZERO_POS_TO_IDX_OP, [x, carry], op_info)
 
     @staticmethod
     def relu(x):
@@ -540,7 +541,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
         combined = getattr(combined, "value", combined)
         if not isinstance(combined, PointwiseOp) or combined.op not in SCAN_OPS:
             raise Unsupported(f"unsupported scan combiner {combined}")
-        return (PointwiseOp(combined.op, list(values)),)
+        return (PointwiseOp(combined.op, list(values), combined.op_info),)
 
 
 def _tile_advance_expr_from_dep(

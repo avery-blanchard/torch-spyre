@@ -22,6 +22,7 @@ node and index expressions, so they are exercised here without hardware.
 from types import SimpleNamespace
 
 import pytest
+import torch
 import sympy
 
 import torch_spyre  # noqa: F401  (registers spyre::non_zero_pos_to_idx)
@@ -117,3 +118,38 @@ def test_host_ordered_scan_space_moves_scan_dim_to_host_position():
     write = _Write(8192 * d0 + d1 + 128 * d2)
     space = {d0: 4, d1: 128, d2: 64}
     assert list(host_ordered_scan_space(space, write)) == [d0, d2, d1]
+
+
+def _ref(x, dim, padval):
+    return torch.ops.spyre.non_zero_pos_to_idx(x, dim, padval)
+
+
+def test_non_zero_pos_to_idx_spec_example():
+    x = torch.tensor([0.0, 5.0, 0.0, 3.0])
+    out = _ref(x, 0, -1.0)
+    assert out.tolist() == [-1.0, 0.0, -1.0, 1.0]
+
+
+def test_non_zero_pos_to_idx_keeps_shape_and_dtype():
+    x = torch.randn(3, 4, 5).half()
+    out = _ref(x, 1, 0.0)
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+
+
+def test_non_zero_pos_to_idx_all_zero_row_gets_padval():
+    x = torch.zeros(2, 6)
+    out = _ref(x, 1, 7.0)
+    assert torch.equal(out, torch.full((2, 6), 7.0))
+
+
+def test_non_zero_pos_to_idx_counter_is_per_row_along_dim():
+    x = torch.tensor([[1.0, 0.0, 2.0], [0.0, 3.0, 4.0]])
+    out = _ref(x, 1, -1.0)
+    assert out.tolist() == [[0.0, -1.0, 1.0], [-1.0, 0.0, 1.0]]
+
+
+def test_non_zero_pos_to_idx_negative_dim_matches_positive():
+    x = torch.randint(0, 2, (3, 4, 5)).float()
+    assert torch.equal(_ref(x, -1, -1.0), _ref(x, 2, -1.0))
+    assert torch.equal(_ref(x, -2, -1.0), _ref(x, 1, -1.0))
