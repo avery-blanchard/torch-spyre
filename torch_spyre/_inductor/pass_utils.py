@@ -101,6 +101,7 @@ from .views import (
     AlignmentInputs,
     build_alignment_inputs,
     compute_coordinates,
+    compute_group_coordinates,
 )
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -220,6 +221,74 @@ def forward_valid_elements(
     that does not move which device dims belong to which host dim.
     """
     return dict(stl.valid_elements)
+
+
+def pad_to_whole_groups(stl: SpyreTensorLayout, group_eps: int) -> SpyreTensorLayout:
+    """Size ``stl`` to hold whole groups of ``group_eps``-element sticks.
+
+    A conversion handles whole sticks of the dtype with more elements per stick:
+    an FP16 stick staggers across a pair of FP32 sticks, an FP8 stick holds two
+    FP16 sticks.  A layout whose stick has fewer elements per stick than
+    ``group_eps`` must therefore hold a whole number of such groups, however many
+    elements are valid.  The valid count stays in ``valid_elements``; only the
+    capacity grows, so consumers still see the valid extent.
+
+    The sticks are counted by the dim that steps them, grown in place.  A single
+    stick has no such dim, so an outermost gap dim (``stride_map`` 0) is prepended;
+    it joins the stick's ``valid_elements`` group, as it covers the same host dim.
+
+    Returns ``stl`` itself when there is nothing to grow: the stick is already
+    as wide as the group, holds no host elements, or is a whole number of groups.
+    """
+    sizes = list(stl.device_size)
+    smap = list(stl.stride_map)
+    lane = len(sizes) - 1
+    eps = sizes[lane]
+    if eps >= group_eps or smap[lane] <= 0:
+        return stl
+    per_group = -(-group_eps // eps)
+    valid = dict(stl.valid_elements)
+
+    stick_key = next((key for key in valid if lane in key), (lane,))
+    counting = [d for d in stick_key if d != lane and sizes[d] > 1]
+    if not counting:
+        # No map to say which dim counts the sticks: the one that steps one stick.
+        counting = [
+            d for d in range(lane) if smap[d] == eps * smap[lane] and sizes[d] > 1
+        ]
+    if counting:
+        dim = counting[-1]
+        grown = -(-sizes[dim] // per_group) * per_group
+        if grown == sizes[dim]:
+            return stl
+        sizes[dim] = grown
+        return SpyreTensorLayout(
+            sizes, smap, stl.device_dtype, valid, stl.element_arrangement
+        )
+
+    shifted = {tuple(d + 1 for d in key): val for key, val in valid.items()}
+    if stick_key in valid:
+        count = shifted.pop(tuple(d + 1 for d in stick_key))
+        shifted[(0, *(d + 1 for d in stick_key))] = count
+    return SpyreTensorLayout(
+        [per_group, *sizes],
+        [0, *smap],
+        stl.device_dtype,
+        shifted,
+        stl.element_arrangement,
+    )
+
+
+def pad_staggered_output(stl: SpyreTensorLayout) -> SpyreTensorLayout:
+    """``stl`` sized to whole FP16 sticks if it is ``DL16_TO_FP32``, else unchanged.
+
+    A DL16_TO_FP32 value writes each FP16 stick across a pair of FP32 sticks, for
+    the conversion producing it and for every op downstream keeping the
+    arrangement.
+    """
+    if stl.element_arrangement != ElementArrangement.DL16_TO_FP32:
+        return stl
+    return pad_to_whole_groups(stl, get_elem_in_stick(torch.float16))
 
 
 def reorder_valid_elements(
@@ -2105,9 +2174,16 @@ def alignment_coordinates(
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(index, set(it_space))
-    coords = compute_coordinates(
+    # Only a layout with a padding dim (stride_map 0, extent above one) needs its
+    # valid_elements groups; skip fetching them for the rest, as this runs hot.
+    has_padding_dim = any(
+        extent > 1 and step <= 0
+        for extent, step in zip(stl.device_size, stl.stride_map)
+    )
+    coords = compute_group_coordinates(
         stl.device_size,
         stl.stride_map,
+        stl.valid_elements if has_padding_dim else {},
         it_space,
         index,
         indirect_sizes,

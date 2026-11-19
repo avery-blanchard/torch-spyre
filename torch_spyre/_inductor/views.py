@@ -363,6 +363,105 @@ def compute_coordinates(
     )
 
 
+def _collapsible_groups(
+    size: Sequence[int],
+    stride: Sequence[int],
+    valid_elements: "dict[tuple[int, ...], int]",
+) -> "list[list[int]]":
+    """The ``valid_elements`` groups whose coordinates stride matching cannot give.
+
+    A group lists the device dims that jointly cover one host dim, outermost
+    first.  Stride matching reads a dim's coordinate off its ``stride_map`` entry,
+    and a padding dim holds no host stride (entry 0), so it is invisible there.
+    Only a group with such a dim ahead of a dim that does step the host needs the
+    group-wide split; every other group matches by stride as before.
+
+    Returns each such group's non-unit dims, outermost first.
+    """
+    groups = []
+    for key in valid_elements:
+        non_unit = [d for d in sorted(key) if size[d] > 1]
+        if len(non_unit) < 2 or stride[non_unit[-1]] <= 0:
+            continue
+        if any(stride[d] <= 0 for d in non_unit[:-1]):
+            groups.append(non_unit)
+    return groups
+
+
+def compute_group_coordinates(
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+    valid_elements: "dict[tuple[int, ...], int]",
+    var_ranges: dict[sympy.Symbol, sympy.Expr],
+    index: sympy.Expr,
+    indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
+    repeat_info_out: "dict[sympy.Symbol, dict] | None" = None,
+) -> list[sympy.Expr]:
+    """:func:`compute_coordinates` for a device layout, reading its ``valid_elements``.
+
+    ``valid_elements`` keys group the device dims that jointly cover one host dim
+    (outermost first, row-major).  A group holding a padding dim, one with no host
+    stride, cannot be told apart from its neighbours by ``stride``: the stick of a
+    layout padded to a stick pair is ``[gap, num_sticks, stick]`` with strides
+    ``[0, s, 1]``, and an index over the whole pair lands on the stick alone.
+
+    Each such group is treated as one dim spanning its non-unit members' sizes and
+    stepped by the innermost member's stride.  Its coordinate is then split across
+    the members mixed-radix: the innermost wraps at its size, the outermost is
+    unbounded.  Other groups are matched by stride as in
+    :func:`compute_coordinates`, so a layout with no padding dim is unchanged.
+    """
+    groups = _collapsible_groups(size, stride, valid_elements)
+    if not groups:
+        return compute_coordinates(
+            size, stride, var_ranges, index, indirect_sizes, repeat_info_out
+        )
+
+    # One collapsed dim stands for each group, at its outermost non-unit member.
+    dropped = {d for g in groups for d in g[1:]}
+    by_head = {g[0]: g for g in groups}
+    kept = [d for d in range(len(size)) if d not in dropped]
+    c_size, c_stride = [], []
+    for d in kept:
+        group = by_head.get(d)
+        if group is None:
+            c_size.append(size[d])
+            c_stride.append(stride[d])
+        else:
+            c_size.append(math.prod(int(size[m]) for m in group))
+            c_stride.append(stride[group[-1]])
+    collapsed = compute_coordinates(
+        c_size, c_stride, var_ranges, index, indirect_sizes, repeat_info_out
+    )
+
+    coordinates = [sympy.S.Zero] * len(size)
+    for pos, d in enumerate(kept):
+        group = by_head.get(d)
+        if group is None:
+            coordinates[d] = collapsed[pos]
+            continue
+        # A constant offset (a read starting at x[..., 64:96]) is split by place
+        # value, apart from the variable part, so a stick coordinate keeps the
+        # ``Mod(var, N) + c`` form the stick check accepts rather than
+        # ``Mod(var + c, N)``.
+        offset, moving = sympy.sympify(collapsed[pos]).as_coeff_Add()
+        if not offset.is_Integer:
+            offset, moving = sympy.S.Zero, collapsed[pos]
+        offset = int(offset)
+        inner = 1
+        for member in reversed(group):
+            width = int(size[member])
+            digit = sympy.floor(moving / inner) if inner > 1 else moving
+            carry = offset // inner
+            if member != group[0]:
+                digit = sympy.Mod(digit, width) + carry % width
+            else:
+                digit = digit + carry
+            coordinates[member] = digit
+            inner *= width
+    return coordinates
+
+
 def _coordinates_memo_key(size, stride, var_ranges, index, indirect_sizes):
     """:func:`compute_coordinates`' memo key, or ``None`` when its result may
     depend on more than its arguments.

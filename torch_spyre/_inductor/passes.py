@@ -45,7 +45,6 @@ from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 from .padding import (
     insert_bmm_padding,
     insert_restickify_padding,
-    insert_staggered_ea_padding,
 )
 from .reserved_dims_contract import apply_reserved_dims_contract
 from .temp_passes import (
@@ -651,7 +650,6 @@ class CustomPreSchedulingPasses:
             reorder_nonstick_dims_mutation,
             insert_post_mutation_restickify,
             insert_restickify_padding,
-            insert_staggered_ea_padding,
             #
             dedup_and_promote_constants,
             #

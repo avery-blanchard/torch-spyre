@@ -258,8 +258,8 @@ def test_fp32_to_fp16_restoration(device, fp16):
 # [4, 96] and [5, 4, 96]: sub-stick (96 = 1.5 fp16 sticks; the last is partial).
 # [2, 3, 5] and [2, 3, 1]: extents inside the first half-stick, where the live
 # elements fit one FP32 stick but the stagger still reaches the pair, so the
-# widening conversion's capacity comes from insert_staggered_ea_padding rather
-# than from the extent itself.  [2, 3, 1] also exercises the sentinel stick dim.
+# widening conversion's capacity comes from layout propagation
+# (pad_to_whole_groups) rather than from the extent itself.  [2, 3, 1] also exercises the sentinel stick dim.
 _ROUNDTRIP_SHAPES = [
     pytest.param((4, 128), id="aligned_4x128"),
     pytest.param((4, 96), id="substick_4x96"),

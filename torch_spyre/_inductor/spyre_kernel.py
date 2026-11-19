@@ -2377,26 +2377,26 @@ def _check_relayout_boundary(
 
 
 def _has_staggered_ea(op_spec: OpSpec) -> bool:
-    """Whether this op reads or writes a staggered arrangement, as padding decides.
+    """Whether this op writes whole groups of sticks, as layout propagation sized it.
 
-    Mirrors ``insert_staggered_ea_padding``: a typecast, one input and one output
-    differing in elements per stick, or an op writing a DL16_TO_FP32 value.  A
-    reduction is never a typecast: it keeps its input dtype, and a separate
-    pointwise op converts the result.
+    A typecast to fewer elements per stick (an upcast: one input stick converts to
+    several output sticks), or an op writing a DL16_TO_FP32 value.  Layout
+    propagation sizes those outputs to whole groups (``pad_to_whole_groups``), so
+    the op iterates them whole.  A downcast reads the valid elements of its input,
+    which nothing pads.  A reduction is never a typecast: it keeps its input
+    dtype, and a separate pointwise op converts the result.
     """
     if not op_spec.args:
         return False
     in_arg, out_arg = op_spec.args[0], op_spec.args[-1]
     in_eps = in_arg.device_size[-1]
     out_eps = out_arg.device_size[-1]
-    is_typecast = (
-        not op_spec.is_reduction and len(op_spec.args) == 2 and in_eps != out_eps
-    )
-    return is_typecast or out_arg.element_arrangement == ElementArrangement.DL16_TO_FP32
+    is_upcast = not op_spec.is_reduction and len(op_spec.args) == 2 and in_eps > out_eps
+    return is_upcast or out_arg.element_arrangement == ElementArrangement.DL16_TO_FP32
 
 
 def _holds_stick_pair(arg: TensorArg, max_eps: int) -> bool:
-    """Whether ``arg`` keeps a stick pair on the gap dim ``_pad_num_sticks`` prepends."""
+    """Whether ``arg`` keeps a stick pair on the gap dim ``pad_to_whole_groups`` prepends."""
     return (
         arg.device_size[-1] < max_eps
         and arg.stride_map is not None
@@ -2441,8 +2441,9 @@ def _add_size1_stick_var(op_spec: OpSpec, max_eps: int) -> None:
 def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
     """Make an op with a staggered arrangement iterate whole sticks.
 
-    ``insert_staggered_ea_padding`` pads such an op's buffers to whole sticks, but
-    the op's iteration space still spans only the live elements.  This rounds the
+    Layout propagation sizes such an op's output to whole sticks
+    (``pad_to_whole_groups``), but the op's iteration space still spans only the
+    valid elements.  This rounds the
     range of each stick var up to match, and binds the stick index of an operand
     with fewer elements per stick to the dim holding its stick pair.
 
@@ -2500,7 +2501,7 @@ def _adjust_for_staggered_ea(op_spec: OpSpec) -> None:
         stride_map, size = arg.stride_map, arg.device_size
         assert stride_map is not None, arg
         if stride_map[0] == 0 and size[0] > 1:
-            # The gap dim ``_pad_num_sticks`` prepends when the num-sticks dim holds
+            # The gap dim ``pad_to_whole_groups`` prepends when the num-sticks dim holds
             # a single stick.  A size-1 dim with ``stride_map`` 0 is an elided
             # host dim instead.
             stick_index_dim = 0

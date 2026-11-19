@@ -95,6 +95,8 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
+    pad_staggered_output,
+    pad_to_whole_groups,
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
@@ -335,7 +337,9 @@ def _make_output_stl(
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order, ea)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
-        return stl
+        # A DL16_TO_FP32 value is written in whole FP16 sticks, however many
+        # elements are valid.
+        return pad_staggered_output(stl)
     return None
 
 
@@ -500,7 +504,6 @@ def rescale_stl_for_dtype(
     stl: SpyreTensorLayout,
     out_dtype: torch.dtype,
     ea: ElementArrangement,
-    host_layout: FixedLayout,
     dep: MemoryDep,
 ) -> SpyreTensorLayout:
     """Rescale a device layout across a conversion that changes the elements per stick.
@@ -512,29 +515,30 @@ def rescale_stl_for_dtype(
 
     The num-sticks dim's size and ``stride_map`` entry come from the input layout,
     except in two cases the input does not record: a split into more sticks counts
-    from the host dim size, and a merge into a single stick takes the host dim
-    size as its entry. For example, with a contiguous stick dim::
+    from the valid elements, and a merge into a single stick takes the valid element
+    count as its entry.  That count is the stick group's ``valid_elements`` entry,
+    so no host layout is needed.  For example, with a contiguous stick dim::
 
-        conversion    host dim size  in sticks, entry    out sticks, entry
-        fp32 -> fp16  20             1, 20               1, 20  (kept)
-        fp32 -> fp16  50             2, 32               1, 50  (host dim size)
-        fp32 -> fp16  96             3, 32               2, 64
-        fp16 -> fp32  40             1, 40               2, 32
-        fp16 -> fp32  65             2, 64               3, 32  (not 4)
+        conversion    valid elements  in sticks, entry    out sticks, entry
+        fp32 -> fp16   20             1, 20               1, 20  (kept)
+        fp32 -> fp16   50             2, 32               1, 50  (valid elements)
+        fp32 -> fp16   96             3, 32               2, 64
+        fp16 -> fp32   40             1, 40               2, 32
+        fp16 -> fp32   65             2, 64               3, 32  (not 4)
 
-    The layout holds only the sticks the live elements reach; the rest of the
-    stick capacity is ``insert_staggered_ea_padding``'s to add (issue #3999), since
-    growing it here would follow the value into every consumer of this STL.
+    The layout holds only the sticks the valid elements reach.  Sizing it to whole
+    stick groups is ``_typecast_layouts``'s job (``pad_to_whole_groups``), done on
+    the result: the sticks here are counted from the valid elements, so padding
+    does not follow the value into a consumer's layout.
 
     Every device dim must read at most one host dim, as ``_can_rescale_input_stl``
-    ensures; a num-sticks dim folding other host dims is not bounded by its host
-    dim size.
+    ensures; a num-sticks dim folding other host dims is not bounded by the stick
+    group's valid count.
 
     Args:
         stl: Input device layout to rescale.
         out_dtype: Torch dtype of the conversion output.
         ea: ElementArrangement to stamp on the returned layout.
-        host_layout: Host layout of the tensor ``stl`` describes.
         dep: The conversion's access to that tensor.
     """
     out_eps = get_elem_in_stick(out_dtype)
@@ -554,7 +558,6 @@ def rescale_stl_for_dtype(
             ea,
         )
 
-    stick_host_dim = matching_dim(host_coordinates(host_layout, dep, None), stick_coord)
     outer_coords = device_coords[:-1]
     assert all(len(c.free_symbols) <= 1 for c in outer_coords), (stl, dep)
     num_sticks_dim = next(
@@ -567,28 +570,33 @@ def rescale_stl_for_dtype(
         num_sticks_dim = next(
             (d for d, c in enumerate(outer_coords) if c == sympy.S.Zero), None
         )
-    if stick_host_dim is None or num_sticks_dim is None:
+    if num_sticks_dim is None:
         # ``_can_rescale_input_stl`` sends a read with no dim to count its sticks
         # down the sliced path.
-        # TODO: a stick coordinate whose variable matches no host dim has not been
-        # seen; resizing the stick alone could drop elements.
         raise Unsupported(
             f"no num-sticks dim in {list(stl.device_size)} {list(stl.stride_map)} "
             f"for {dep}"
         )
 
     in_sticks = stl.device_size[num_sticks_dim]
-    in_eps = stl.device_size[-1]
     elem_step = stl.stride_map[-1]
-    host_dim_size = concretize_expr(host_layout.size[stick_host_dim])
+    # The valid elements of the stick's dim, from its valid_elements group.  The
+    # capacity is the fallback for a layout that records none (a pickle from
+    # before valid_elements): it counts any padding as data.
+    stick_key = next(
+        (key for key in stl.valid_elements if len(stl.device_size) - 1 in key), None
+    )
+    valid = (
+        stl.valid_elements[stick_key]
+        if stick_key is not None
+        else in_sticks * stl.device_size[-1]
+    )
 
-    if out_eps < in_eps:
-        # Splitting sticks, where the last input stick may be part-filled:
-        # 65 fp16 elements in 2 sticks -> 3 fp32 sticks, not 4.
-        out_sticks = ceildiv(host_dim_size, out_eps)
-    else:
-        # Whole input sticks merge (or keep their width): 3 fp32 sticks -> 2 fp16.
-        out_sticks = ceildiv(in_sticks * in_eps, out_eps)
+    # Count the valid elements, not the input's capacity: a padded input (see
+    # ``pad_to_whole_groups``) would otherwise pass its padding on as data.
+    # 65 fp16 elements in 2 sticks -> 3 fp32 sticks, not 4; 96 fp32 elements in
+    # 3 sticks -> 2 fp16.
+    out_sticks = ceildiv(valid, out_eps)
 
     if out_sticks > 1:
         # The dim steps one output stick: 40 fp16 elements -> 2 fp32, entry 32.
@@ -600,7 +608,7 @@ def rescale_stl_for_dtype(
     else:
         # Sticks merged into one, whose entry is the host dim size, as
         # ``dim_map_to_stride_map`` writes it: 50 fp32 elements -> entry 50.
-        stride_map_entry = host_dim_size * elem_step
+        stride_map_entry = valid * elem_step
 
     out_device_size[num_sticks_dim] = out_sticks
     out_stride_map[num_sticks_dim] = stride_map_entry
@@ -637,8 +645,9 @@ def _typecast_layouts(
     conversion works on whole sticks, so a slice skips a source whose stick it
     starts mid-stick.
 
-    Either layout holds only the sticks the live elements reach;
-    ``insert_staggered_ea_padding`` adds the rest.
+    An upcast output is sized to whole groups of the source's sticks
+    (``pad_to_whole_groups``): the conversion writes the whole group, so the
+    layout chosen here already holds it.
     """
     in_device_coords = try_device_coordinates(stl, dep, None)
     if in_device_coords is None:
@@ -705,9 +714,7 @@ def _typecast_layouts(
             # keeps the source's device dims too. Alternatively drop this
             # branch: the host-size layout below is correct for whole reads
             # as well, only it may permute the non-stick device dims.
-            candidate = rescale_stl_for_dtype(
-                source_stl, output.dtype, out_ea, in_layout, dep
-            )
+            candidate = rescale_stl_for_dtype(source_stl, output.dtype, out_ea, dep)
         else:
             # The source's stride_map steps through the wider buffer, so only
             # its stick dim carries over; the non-stick device dims are rebuilt
@@ -734,6 +741,8 @@ def _typecast_layouts(
                 output.dtype,
                 out_ea,
             )
+        if candidate is not None:
+            candidate = pad_to_whole_groups(candidate, source_stl.device_size[-1])
         if candidate is not None and candidate not in layouts:
             layouts.append(candidate)
     return layouts
@@ -2224,8 +2233,10 @@ def _multi_arg_pointwise_layouts(
             stick_size,
             op,
         ):
-            return SpyreTensorLayout(
-                c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
+            return pad_staggered_output(
+                SpyreTensorLayout(
+                    c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
+                )
             )
         return None
 
@@ -2885,6 +2896,44 @@ def _align_single_source_producer(
     if not isinstance(producer.data, Pointwise):
         return
     producer.layouts = [alt_stl]
+
+
+def _scan_downcast_reads(operations: list[Operation]) -> dict[str, int]:
+    """Map each buffer a downcast reads to the elements per stick it converts to.
+
+    A downcast packs several input sticks into one output stick (two FP32 sticks
+    per FP16 stick, two FP16 per FP8) and reads whole groups of them, so the
+    buffer it reads must be sized to hold whole groups.  The producer picks that
+    buffer's layout before the reader is visited, so the readers are collected up
+    front, as ``_scan_mutation_layout_inputs`` does for mutation targets.
+    """
+    wanted: dict[str, int] = {}
+    for op in operations:
+        if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
+            continue
+        layout = op.maybe_get_layout()
+        if layout is None or layout.device.type != DEVICE_NAME:
+            continue
+        if layout.dtype == torch.bool:
+            continue
+        if _origin_target(op.data) not in (
+            prims.convert_element_type.default,
+            aten.copy.default,
+            torch.ops.spyre.to_dtype_d2d.default,
+            spyreop.qfp8ch.default,
+        ):
+            continue
+        reads = [r for r in op_read_writes(op).reads if isinstance(r, MemoryDep)]
+        if len(reads) != 1:
+            continue
+        buf = V.graph.try_get_buffer(reads[0].name)
+        in_layout = buf.get_layout() if buf is not None else None
+        if in_layout is None or in_layout.dtype == torch.bool:
+            continue
+        out_eps = get_elem_in_stick(layout.dtype)
+        if get_elem_in_stick(in_layout.dtype) < out_eps:
+            wanted[reads[0].name] = max(out_eps, wanted.get(reads[0].name, 0))
+    return wanted
 
 
 def _scan_mutation_layout_inputs(
@@ -3639,6 +3688,7 @@ def propagate_spyre_tensor_layouts(
     mutation_alts, mutation_consumer_counts, mutation_writers = (
         _scan_mutation_layout_inputs(operations)
     )
+    downcast_reads = _scan_downcast_reads(operations)
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
@@ -3783,6 +3833,10 @@ def propagate_spyre_tensor_layouts(
                 op.restick_cost_fn = AnyInNode.from_args()
             elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
+                if (group_eps := downcast_reads.get(op.get_name())) is not None:
+                    # A downcast reads this buffer in whole groups of its sticks.
+                    sized = (pad_to_whole_groups(stl, group_eps) for stl in op.layouts)
+                    op.layouts = list(dict.fromkeys(sized))
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, _CollectiveKernel):

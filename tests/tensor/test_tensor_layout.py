@@ -1048,11 +1048,11 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_rescale_for_dtype_rounds_the_num_sticks_dim_up(self):
         """A num-sticks dim that does not hold a whole number of output sticks
-        rounds up, so that padded and unpadded inputs describing the same live
+        rounds up, so that padded and unpadded inputs describing the same valid
         elements yield the same layout: three fp32 sticks and four both hold 96
-        live elements and both describe two fp16 sticks.
-        ``insert_staggered_ea_padding`` sizes the wide side's padding from this
-        layout (issue #3999).
+        valid elements and both describe two fp16 sticks.
+        ``pad_to_whole_groups`` sizes the wide side's padding from the valid
+        elements this layout counts (issue #3999).
 
         Rounding up also keeps a single input stick from flooring to a size-0
         dim, which described no tensor and reached ``get_device_stride_infos`` to
@@ -1077,7 +1077,6 @@ class TestSpyreTensorLayout(TestCase):
                 stl,
                 torch.float16,
                 ElementArrangement.STANDARD,
-                _host_layout(torch.float32, host_size),
                 _dep("buf", host_size),
             )
 
@@ -1086,7 +1085,7 @@ class TestSpyreTensorLayout(TestCase):
         # Three fp32 sticks (96 elements) span two fp16 sticks; flooring to one
         # would drop 32 elements.
         self.assertEqual(list(rescaled(3, 96).device_size), [2, 4, 64])
-        # Four, the padded form of the same 96 live elements, agrees.
+        # Four, the padded form of the same 96 valid elements, agrees.
         self.assertEqual(list(rescaled(4, 96).device_size), [2, 4, 64])
         # An exact ratio rescales the dim and its stride.
         self.assertEqual(list(rescaled(4, 128).device_size), [2, 4, 64])
@@ -1098,9 +1097,9 @@ class TestSpyreTensorLayout(TestCase):
         step, and the dim already counts the single stick that extent occupies.
         Rescaling it would claim stepping the host tensor does not have, which
         the layout validator rejects, so only the elements per stick change. The
-        extra capacity a widening conversion needs is added by
-        ``insert_staggered_ea_padding``, which pads the one buffer that needs it
-        rather than sending a grown dim into every downstream consumer.
+        extra capacity a widening conversion needs is added to its result by
+        ``_typecast_layouts`` (``pad_to_whole_groups``), after the valid sticks are
+        counted here, so a grown dim is not sent into every downstream consumer.
 
         A sentinel num-sticks slot (0, a dim that is extent 1 by construction
         and never stepped) is left alone for the same reason. Needs no device.
@@ -1121,7 +1120,6 @@ class TestSpyreTensorLayout(TestCase):
             sub_stick,
             torch.float32,
             ElementArrangement.STANDARD,
-            _host_layout(torch.float16, [2, 3, 5]),
             _dep("buf", [2, 3, 5]),
         )
         self.assertEqual(list(out.device_size), [3, 1, 2, 32])
@@ -1134,7 +1132,6 @@ class TestSpyreTensorLayout(TestCase):
             scalar,
             torch.float32,
             ElementArrangement.STANDARD,
-            _host_layout(torch.float16, [1]),
             _dep("buf", [1]),
         )
         self.assertEqual(list(scalar_out.device_size), [1, 32])
@@ -1163,7 +1160,6 @@ class TestSpyreTensorLayout(TestCase):
                 stl,
                 torch.float32,
                 ElementArrangement.DL16_TO_FP32,
-                _host_layout(torch.float16, host_size),
                 _dep("buf", host_size),
             )
 
@@ -1267,7 +1263,6 @@ class TestSpyreTensorLayout(TestCase):
                 qkv_stl,
                 torch.float32,
                 ElementArrangement.STANDARD,
-                _host_layout(torch.float16, host_size),
                 _dep("buf", host_size),
             )
 
@@ -1329,7 +1324,6 @@ class TestSpyreTensorLayout(TestCase):
                 stl,
                 torch.float8_e4m3fn,
                 ElementArrangement.QFP8CH,
-                _host_layout(torch.float16, [4, extent]),
                 _dep("buf", [4, extent]),
             )
 
@@ -1341,11 +1335,11 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(to_qfp8ch(3).device_size), [2, 4, 128])
         self.assertEqual(list(to_qfp8ch(2).device_size), [1, 4, 128])
 
-    def test_fp8_to_fp16_layout_counts_the_live_sticks(self):
-        """The fp8 -> fp16 conversion after qfp8ch lays its output out by the
-        sticks the live elements reach: 192 elements take 3 fp16 sticks. The
-        fourth that the conversion writes is added by insert_staggered_ea_padding
-        (test_pad_fp8_to_fp16_output_to_whole_fp8_sticks). Needs no device."""
+    def test_fp8_to_fp16_layout_holds_whole_fp8_sticks(self):
+        """The fp8 -> fp16 conversion after qfp8ch lays its output out in whole
+        fp8 sticks: 192 elements reach 3 fp16 sticks, and the conversion writes the
+        fourth (test_pad_fp8_to_fp16_output_to_whole_fp8_sticks), so the layout
+        chosen here already holds 4. Needs no device."""
         from torch_spyre._C import ElementArrangement
         from torch_spyre._inductor.propagate_layouts import (
             _typecast_layouts,
@@ -1367,7 +1361,6 @@ class TestSpyreTensorLayout(TestCase):
                 fp16_stl,
                 torch.float8_e4m3fn,
                 ElementArrangement.QFP8CH,
-                _host_layout(torch.float16, [4, extent]),
                 _dep("x", [4, extent]),
             )
             [out] = _typecast_layouts(
@@ -1377,11 +1370,12 @@ class TestSpyreTensorLayout(TestCase):
                 _host_layout(torch.float8_e4m3fn, [4, extent]),
                 fp8_stl,
             )
-            self.assertEqual(list(out.stride_map), [64, extent, 1])
+            # A single stick gains a gap dim (stride_map 0) ahead of these.
+            self.assertEqual(list(out.stride_map)[-3:], [64, extent, 1])
             return out.device_size[0]
 
         self.assertEqual(
-            [dequantized_sticks(e) for e in [64, 128, 192, 256, 320]], [1, 2, 3, 4, 5]
+            [dequantized_sticks(e) for e in [64, 128, 192, 256, 320]], [2, 2, 4, 4, 6]
         )
 
     def test_offset_stick_conversion_writes_from_a_restickified_input(self):
@@ -1435,7 +1429,6 @@ class TestSpyreTensorLayout(TestCase):
             stl,
             torch.float8_e4m3fn,
             ElementArrangement.QFP8CH,
-            _host_layout(torch.float16, host_size),
             _dep("buf", host_size),
         )
         self.assertEqual(list(out.device_size), [8, 64, 1, 2, 128])
@@ -1600,7 +1593,6 @@ class TestSpyreTensorLayout(TestCase):
             three_sticks,
             torch.float16,
             ElementArrangement.FP32_TO_DL16,
-            _host_layout(torch.float32, [2, 96]),
             _dep("buf", [2, 96]),
         )
 
@@ -1609,241 +1601,83 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(list(out.stride_map), [64, 96, 1])
         self.assertEqual(out.element_arrangement, ElementArrangement.FP32_TO_DL16)
 
-    def _conversion_op(self, in_dtype, in_stl, out_dtype, out_stl, host_size):
-        """A mock unary conversion ComputedBuffer and a graph holding its input.
-
-        Returns ``(op, in_buf, graph)``; a pass that pads the input replaces
-        ``in_buf.layout``, one that pads the output replaces ``op.layout``.
-        """
-        import unittest.mock as mock
-        import torch._inductor.ir as _ir
-        from torch_spyre._inductor.ir import FixedTiledLayout
-
-        stride = _contiguous(host_size)
-        in_layout = FixedTiledLayout(
-            torch.device("spyre"), in_dtype, list(host_size), stride, in_stl
-        )
-        in_buf = mock.MagicMock()
-        in_buf.__class__ = _ir.ComputedBuffer
-        in_buf.get_layout.return_value = in_layout
-        in_buf.layout = in_layout
-
-        out_layout = FixedTiledLayout(
-            torch.device("spyre"), out_dtype, list(host_size), stride, out_stl
-        )
-        rw = mock.MagicMock()
-        rw.reads = [_dep("buf_in", host_size)]
-        rw.writes = [_dep("buf_out", host_size)]
-        op = mock.MagicMock()
-        op.__class__ = _ir.ComputedBuffer
-        op.get_layout.return_value = out_layout
-        op.layout = out_layout
-        op.get_read_writes.return_value = rw
-        op.get_name.return_value = "buf_out"
-        op.data = _ir.Pointwise.__new__(_ir.Pointwise)
-
-        graph = mock.MagicMock()
-        graph.get_buffer.return_value = in_buf
-        graph.operations = [op]
-        return op, in_buf, graph
-
-    def test_pad_downcast_input_fp32_partial_stick(self):
-        """_pad_downcast_input: 3-stick fp32 input expanded to 4 sticks (issue #3999).
-
-        After finalize_layouts, the fp32 input has device_size=[3,2,32] but the
-        FP32_TO_DL16 output requires 2*64/32=4 fp32 sticks of physical capacity.
-        _pad_downcast_input must grow device_size[0] from 3 to 4.
-
-        The stride_map values are the ones a real [2, 96] tensor carries: the row
-        dim steps a whole host row, 96, not the stick width. Giving it 32 would
-        make it share dim 0's step, which spyre_mem.cpp rejects.
-        """
-        from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.ir import FixedTiledLayout
-        from torch_spyre._inductor.padding import insert_staggered_ea_padding
-
-        op, in_buf, graph = self._conversion_op(
-            torch.float32,
-            SpyreTensorLayout(
-                [3, 2, 32],
-                [32, 96, 1],
-                get_device_dtype(torch.float32),
-                {(0, 2): 96, (1,): 2},
-                ElementArrangement.STANDARD,
-            ),
-            torch.float16,
-            SpyreTensorLayout(
-                [2, 2, 64],
-                [64, 96, 1],
-                get_device_dtype(torch.float16),
-                {(0, 2): 96, (1,): 2},
-                ElementArrangement.FP32_TO_DL16,
-            ),
-            [2, 96],
-        )
-        insert_staggered_ea_padding(graph)
-
-        # After padding, input device_size[0] must be 4 (= 2*64/32).
-        padded_layout = in_buf.layout
-        self.assertIsInstance(padded_layout, FixedTiledLayout)
-        self.assertEqual(list(padded_layout.device_layout.device_size), [4, 2, 32])
-        # stride_map and stick dim are unchanged.
-        self.assertEqual(list(padded_layout.device_layout.stride_map), [32, 96, 1])
-
-    def test_pad_downcast_input_fp16_to_fp8(self):
-        """qfp8ch's fp16 input spans every fp16 stick of the fp8 sticks it fills.
-
-        192 elements fill 2 fp8 sticks, which the conversion reads as 4 fp16
-        sticks, one more than the host extent needs. The pass reaches it through
-        the QFP8CH arrangement on the output.
-        """
-        from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.padding import insert_staggered_ea_padding
-
-        op, in_buf, graph = self._conversion_op(
-            torch.float16,
-            SpyreTensorLayout(
-                [3, 4, 64],
-                [64, 192, 1],
-                get_device_dtype(torch.float16),
-                {(0, 2): 192, (1,): 4},
-                ElementArrangement.STANDARD,
-            ),
-            torch.float8_e4m3fn,
-            SpyreTensorLayout(
-                [2, 4, 128],
-                [128, 192, 1],
-                get_device_dtype(torch.float8_e4m3fn),
-                {(0, 2): 192, (1,): 4},
-                ElementArrangement.QFP8CH,
-            ),
-            [4, 192],
-        )
-        insert_staggered_ea_padding(graph)
-
-        self.assertEqual(list(in_buf.layout.device_layout.device_size), [4, 4, 64])
-        self.assertEqual(list(in_buf.layout.device_layout.stride_map), [64, 192, 1])
-        # The fp8 output already holds whole fp8 sticks.
-        self.assertEqual(list(op.layout.device_layout.device_size), [2, 4, 128])
-
     def test_pad_fp8_to_fp16_output_to_whole_fp8_sticks(self):
         """The fp8 -> fp16 output spans both fp16 sticks of every fp8 stick.
 
         The conversion writes each fp8 stick as two fp16 sticks, so 192 elements
-        (2 fp8 sticks) take 4 fp16 sticks although the live elements reach 3. The
-        output is STANDARD, so the pass reaches it by the elements per stick on
-        either side rather than by an arrangement.
+        (2 fp8 sticks) take 4 fp16 sticks although the valid elements reach 3.
+        Layout propagation sizes the output this way (``pad_to_whole_groups``), so
+        no pass has to grow it afterwards; the valid extent stays in valid_elements.
         """
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.padding import insert_staggered_ea_padding
+        from torch_spyre._inductor.pass_utils import pad_to_whole_groups
 
-        def padded_sticks(num_fp8_sticks, num_fp16_sticks, extent):
-            op, in_buf, graph = self._conversion_op(
-                torch.float8_e4m3fn,
-                SpyreTensorLayout(
-                    [num_fp8_sticks, 4, 128],
-                    [128, extent, 1],
-                    get_device_dtype(torch.float8_e4m3fn),
-                    {(0, 2): extent, (1,): 4},
-                    ElementArrangement.QFP8CH,
-                ),
-                torch.float16,
-                SpyreTensorLayout(
-                    [num_fp16_sticks, 4, 64],
-                    [64, extent, 1],
-                    get_device_dtype(torch.float16),
-                    {(0, 2): extent, (1,): 4},
-                    ElementArrangement.STANDARD,
-                ),
-                [4, extent],
+        def padded_sticks(num_fp16_sticks, extent):
+            stl = SpyreTensorLayout(
+                [num_fp16_sticks, 4, 64],
+                [64, extent, 1],
+                get_device_dtype(torch.float16),
+                {(0, 2): extent, (1,): 4},
+                ElementArrangement.STANDARD,
             )
-            insert_staggered_ea_padding(graph)
-            # The input is left alone.
-            self.assertEqual(in_buf.layout.device_layout.device_size[0], num_fp8_sticks)
-            self.assertEqual(list(op.layout.device_layout.stride_map), [64, extent, 1])
-            return op.layout.device_layout.device_size[0]
+            padded = pad_to_whole_groups(stl, 128)
+            self.assertEqual(list(padded.stride_map), [64, extent, 1])
+            self.assertEqual(padded.valid_elements, stl.valid_elements)
+            return padded.device_size[0]
 
         self.assertEqual(
-            [padded_sticks(*a) for a in [(1, 2, 128), (2, 3, 192), (3, 5, 320)]],
+            [padded_sticks(*a) for a in [(2, 128), (3, 192), (5, 320)]],
             [2, 4, 6],
         )
 
-    def _staggered_fp32_op(self, device_size, stride_map, host_size, valid_elements):
-        """A mock ComputedBuffer with a DL16_TO_FP32 output."""
-        import unittest.mock as mock
-        from torch._inductor.ir import ComputedBuffer
+    def _staggered_fp32_stl(self, device_size, stride_map, valid_elements):
+        """A DL16_TO_FP32 layout, as layout propagation sizes it before padding."""
         from torch_spyre._C import ElementArrangement
-        from torch_spyre._inductor.ir import FixedTiledLayout
 
-        stl = SpyreTensorLayout(
+        return SpyreTensorLayout(
             list(device_size),
             list(stride_map),
             get_device_dtype(torch.float32),
             valid_elements,
             ElementArrangement.DL16_TO_FP32,
         )
-        layout = FixedTiledLayout(
-            torch.device("spyre"),
-            torch.float32,
-            list(host_size),
-            _contiguous(host_size),
-            stl,
-        )
-        op = mock.MagicMock()
-        rw = mock.MagicMock()
-        rw.writes = [_dep("buf_staggered", host_size)]
-        op.get_read_writes.return_value = rw
-        op.__class__ = ComputedBuffer
-        op.get_layout.return_value = layout
-        op.layout = layout
-        op.get_name.return_value = "buf_staggered"
-        return op
 
     def test_pad_upcast_output_grows_a_sub_stick_dim_to_the_pair(self):
         """A sub-stick DL16_TO_FP32 output still spans both FP32 sticks of its pair.
 
-        ``rescale_stl_for_dtype`` reports the one stick the live elements occupy, so
-        the second half of the pair is capacity this pass adds, as an outermost gap
-        dim since a single stick has no count dim to grow.
+        The valid elements occupy one stick, so the second half of the pair is
+        capacity ``pad_staggered_output`` adds, as an outermost gap dim since a
+        single stick has no count dim to grow.  The gap dim joins the stick's
+        valid_elements group: it covers the same host dim.
         """
-        from torch_spyre._inductor.ir import FixedTiledLayout
-        from torch_spyre._inductor.padding import _pad_upcast_output
+        from torch_spyre._inductor.pass_utils import pad_staggered_output
 
-        op = self._staggered_fp32_op(
-            [1, 1, 32], [5, 0, 1], [1, 5], {(0, 2): 5, (1,): 1}
-        )
-        _pad_upcast_output(op, op.layout, 64)
+        stl = self._staggered_fp32_stl([1, 1, 32], [5, 0, 1], {(0, 2): 5, (1,): 1})
+        padded = pad_staggered_output(stl)
 
-        padded = op.layout
-        self.assertIsInstance(padded, FixedTiledLayout)
-        self.assertEqual(list(padded.device_layout.device_size), [2, 1, 1, 32])
+        self.assertEqual(list(padded.device_size), [2, 1, 1, 32])
         # The added stick holds no host element, so the gap dim steps nothing.
-        self.assertEqual(list(padded.device_layout.stride_map), [0, 5, 0, 1])
+        self.assertEqual(list(padded.stride_map), [0, 5, 0, 1])
+        self.assertEqual(padded.valid_elements, {(0, 1, 3): 5, (2,): 1})
 
     def test_pad_upcast_output_rounds_a_partial_pair_up(self):
         """A stick-stepped dim ending inside a stick pair grows to the whole pair."""
-        from torch_spyre._inductor.padding import _pad_upcast_output
+        from torch_spyre._inductor.pass_utils import pad_staggered_output
 
-        op = self._staggered_fp32_op(
-            [3, 1, 32], [32, 0, 1], [1, 96], {(0, 2): 96, (1,): 1}
-        )
-        _pad_upcast_output(op, op.layout, 64)
+        stl = self._staggered_fp32_stl([3, 1, 32], [32, 0, 1], {(0, 2): 96, (1,): 1})
+        padded = pad_staggered_output(stl)
 
-        self.assertEqual(list(op.layout.device_layout.device_size), [4, 1, 32])
+        self.assertEqual(list(padded.device_size), [4, 1, 32])
         # A dim that already steps sticks keeps its step.
-        self.assertEqual(list(op.layout.device_layout.stride_map), [32, 0, 1])
+        self.assertEqual(list(padded.stride_map), [32, 0, 1])
+        self.assertEqual(padded.valid_elements, stl.valid_elements)
 
     def test_pad_upcast_output_leaves_whole_pairs_alone(self):
         """A stick-stepped dim already covering whole pairs needs no padding."""
-        from torch_spyre._inductor.padding import _pad_upcast_output
+        from torch_spyre._inductor.pass_utils import pad_staggered_output
 
-        op = self._staggered_fp32_op(
-            [4, 1, 32], [32, 0, 1], [1, 96], {(0, 2): 96, (1,): 1}
-        )
-        before = list(op.layout.device_layout.device_size)
-        _pad_upcast_output(op, op.layout, 64)
-
-        self.assertEqual(list(op.layout.device_layout.device_size), before)
+        stl = self._staggered_fp32_stl([4, 1, 32], [32, 0, 1], {(0, 2): 96, (1,): 1})
+        self.assertIs(pad_staggered_output(stl), stl)
 
 
 @instantiate_parametrized_tests
