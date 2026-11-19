@@ -1485,7 +1485,6 @@ class TestStaggeredFp32Consumer(InductorTestCase):
                     device_coordinates=coords,
                     allocation={"hbm": address},
                     element_arrangement=ElementArrangement.DL16_TO_FP32,
-                    stride_map=[32, 64, 1],
                 )
                 for arg_index, (is_input, address) in enumerate(
                     [(True, 0), (False, 0x100000)]

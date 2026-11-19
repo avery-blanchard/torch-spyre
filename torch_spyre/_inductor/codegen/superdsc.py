@@ -546,6 +546,10 @@ def _get_padded_iteration_space(
             effective_stick_size = (
                 stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
             )
+            if op_spec_arg.element_arrangement == ElementArrangement.DL16_TO_FP32:
+                # A DL16_TO_FP32 value spreads each FP16 stick over an FP32 stick
+                # pair, so the pair is the unit: 96 FP32 elements round to 128.
+                effective_stick_size *= 2
             unaligned = sdsc_iteration_space[dim] % effective_stick_size
             if unaligned > 0:
                 sdsc_iteration_space[dim] += effective_stick_size - unaligned
