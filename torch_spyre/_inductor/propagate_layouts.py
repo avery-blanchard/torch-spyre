@@ -95,6 +95,7 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
+    pad_for_downcast_read,
     pad_staggered_output,
     pad_to_whole_groups,
     try_device_coordinates,
@@ -610,6 +611,18 @@ def rescale_stl_for_dtype(
         # ``dim_map_to_stride_map`` writes it: 50 fp32 elements -> entry 50.
         stride_map_entry = valid * elem_step
 
+    if ea == ElementArrangement.DL16_TO_FP32 and out_eps < stl.device_size[-1]:
+        # A DL16_TO_FP32 value holds whole FP16 sticks: each FP16 stick staggers
+        # across a pair of FP32 sticks, so the pair is the unit of the num-sticks
+        # count.  One pair takes the single stick's dim at size two, with the entry
+        # of any dim that steps output sticks; more sticks round up to whole pairs
+        # in place.
+        per_group = ceildiv(stl.device_size[-1], out_eps)
+        if out_sticks == 1:
+            out_sticks = per_group
+            stride_map_entry = out_eps * elem_step
+        else:
+            out_sticks = ceildiv(out_sticks, per_group) * per_group
     out_device_size[num_sticks_dim] = out_sticks
     out_stride_map[num_sticks_dim] = stride_map_entry
     # Clamp each count to the rescaled capacity of its dims; unchanged otherwise.
@@ -2898,7 +2911,9 @@ def _align_single_source_producer(
     producer.layouts = [alt_stl]
 
 
-def _scan_downcast_reads(operations: list[Operation]) -> dict[str, int]:
+def _scan_downcast_reads(
+    operations: list[Operation],
+) -> dict[str, tuple[int, MemoryDep]]:
     """Map each buffer a downcast reads to the elements per stick it converts to.
 
     A downcast packs several input sticks into one output stick (two FP32 sticks
@@ -2907,7 +2922,7 @@ def _scan_downcast_reads(operations: list[Operation]) -> dict[str, int]:
     buffer's layout before the reader is visited, so the readers are collected up
     front, as ``_scan_mutation_layout_inputs`` does for mutation targets.
     """
-    wanted: dict[str, int] = {}
+    wanted: dict[str, tuple[int, MemoryDep]] = {}
     for op in operations:
         if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
             continue
@@ -2932,7 +2947,7 @@ def _scan_downcast_reads(operations: list[Operation]) -> dict[str, int]:
             continue
         out_eps = get_elem_in_stick(layout.dtype)
         if get_elem_in_stick(in_layout.dtype) < out_eps:
-            wanted[reads[0].name] = max(out_eps, wanted.get(reads[0].name, 0))
+            wanted[reads[0].name] = (out_eps, reads[0])
     return wanted
 
 
@@ -3833,9 +3848,13 @@ def propagate_spyre_tensor_layouts(
                 op.restick_cost_fn = AnyInNode.from_args()
             elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
-                if (group_eps := downcast_reads.get(op.get_name())) is not None:
+                if (read := downcast_reads.get(op.get_name())) is not None:
                     # A downcast reads this buffer in whole groups of its sticks.
-                    sized = (pad_to_whole_groups(stl, group_eps) for stl in op.layouts)
+                    group_eps, read_dep = read
+                    sized = (
+                        pad_for_downcast_read(stl, read_dep, group_eps)
+                        for stl in op.layouts
+                    )
                     op.layouts = list(dict.fromkeys(sized))
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")

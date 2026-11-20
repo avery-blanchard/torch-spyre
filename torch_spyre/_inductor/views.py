@@ -1284,6 +1284,9 @@ def align_tensors_pure(
                     term.mod != stick_size[i]
                     or term.var != stick_dim[i]
                     or term.var in repeat_info.keys()
+                    # The range endpoint is always a boundary, even when it equals
+                    # the stick size: a one-stick range has no interior split.
+                    or term.mod == var_ranges.get(term.var)
                 ):
                     # add mod to splits unless stick dim and stick size
                     splits[term.var].add(term.mod)
@@ -1406,12 +1409,16 @@ def align_tensors_pure(
                 coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
-            low = (
-                0
-                if var == stick_dim[j]
+            # An outer stick term is the stick size's count of sticks, not a split:
+            # its den is the stick size unless the range endpoint is also that size,
+            # in which case the endpoint is the split and the stick is implicit.
+            outer_stick = (
+                var == stick_dim[j]
                 and den == stick_size[j]
-                and den not in splits[var]
-                else splits[var].index(den)
+                and (den not in splits[var] or mod == var_ranges.get(var))
+            )
+            low = (
+                0 if outer_stick else splits[var].index(den)
             )  # replace split[var].index(stick_size) with 0 for stick dim
             high = splits[var].index(mod)
             if low == high:
@@ -1426,7 +1433,7 @@ def align_tensors_pure(
                     size.append(splits[var][i + 1] // splits[var][i])
                 coordinates.append(remap[var][i] + offset // splits[var][i])
                 offset %= splits[var][i]
-            if var == stick_dim[j] and den == stick_size[j] and den not in splits[var]:
+            if outer_stick:
                 # outer stick dim
                 size[-1] //= den
                 (offset, rest) = coordinates[-1].as_coeff_Add()

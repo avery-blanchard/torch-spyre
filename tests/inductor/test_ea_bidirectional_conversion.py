@@ -1223,16 +1223,6 @@ def _build_ea_dci_tests():
 EA_D2H_TEST_PARAMS = _build_ea_dci_tests()
 
 
-def _whole_stick_pairs_rejected(expected_ea, shape):
-    # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim of at most one fp32
-    # stick (32 elements) only gets a single fp32 stick, so half of each pair has
-    # nowhere to go. Wider dims are padded to a whole pair by #5048.
-    # Note: shape[-1] is safe for 0-dim shapes () because expected_ea is forced
-    # to STANDARD in those cases, so the expected_ea == DL16_TO_FP32 check
-    # short-circuits and will not reach shape[-1].
-    return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] <= 32
-
-
 def _convert_one_row_per_core(x, dst_dtype):
     """Convert on device with one M row per core.
 
@@ -1269,11 +1259,6 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
 
     y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
-
-    if _whole_stick_pairs_rejected(expected_ea, shape):
-        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
-            y.cpu()
-        return
 
     got = y.cpu()
     assert got.dtype == ref.dtype
@@ -1319,13 +1304,6 @@ def test_ea_restore_h2d(src_dtype, dst_dtype, expected_ea, shape):
     # Create staggered tensor on device
     y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
-
-    if _whole_stick_pairs_rejected(expected_ea, shape):
-        # ea_restore now runs for H2D too and applies the same whole-stick-pair
-        # check as D2H, so the copy_ itself is rejected.
-        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
-            y.copy_(new)
-        return
 
     # H2D `copy_` of new (STANDARD host data) into the staggered y.
     # The EA tag is unchanged, copy_ writes only the data.

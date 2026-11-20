@@ -411,6 +411,32 @@ class TestCoordinates(TestCase):
 
         self.assertTrue(all(size > 0 for tensor in aligned for size in tensor["size"]))
 
+    def test_align_tensors_accepts_range_equal_to_one_stick(self):
+        """An outer stick term over a one-stick range is a range endpoint, not a split.
+
+        A DL16_TO_FP32 pair is ``[gap, rows, stick]`` with the gap bound to
+        ``floor(d1 / 32)``; ``d1`` ranges over one 32-element stick.
+        """
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        iteration_space = {d0: (4, 1), d1: (32, 1)}
+        tensors = [
+            {
+                "size": [2, 4, 32],
+                "coordinates": [
+                    sympy.floor(d1 / 32),
+                    d0,
+                    sympy.Mod(d1, 32),
+                ],
+            }
+        ]
+
+        new_space, aligned, _ = align_tensors(iteration_space, tensors)
+
+        self.assertEqual(aligned[0]["size"], [2, 4, 32])
+        self.assertEqual(new_space[d1][0], 32)
+        self.assertEqual(new_space[d1][1], 1)
+        self.assertEqual(aligned[0]["coordinates"][0], sympy.floor(d1 / 32))
+
     def test_align_tensors_accepts_stick_aligned_source(self):
         """A dense scatter source contributes no sub-stick index boundary."""
         entry, head, width = sympy.symbols(

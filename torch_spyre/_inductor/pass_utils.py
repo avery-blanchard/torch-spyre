@@ -266,8 +266,22 @@ def pad_to_whole_groups(stl: SpyreTensorLayout, group_eps: int) -> SpyreTensorLa
             sizes, smap, stl.device_dtype, valid, stl.element_arrangement
         )
 
+    return _prepend_gap_group(stl, per_group, stick_key)
+
+
+def _prepend_gap_group(
+    stl: SpyreTensorLayout, per_group: int, stick_key: tuple[int, ...] | None = None
+) -> SpyreTensorLayout:
+    """``stl`` with an outermost gap dim of ``per_group`` sticks, stride_map 0.
+
+    The gap joins the stick's ``valid_elements`` group, as it covers the same host
+    dim.  ``stick_key`` is the group holding the stick dim, if it has one.
+    """
+    sizes = list(stl.device_size)
+    smap = list(stl.stride_map)
+    valid = dict(stl.valid_elements)
     shifted = {tuple(d + 1 for d in key): val for key, val in valid.items()}
-    if stick_key in valid:
+    if stick_key is not None and stick_key in valid:
         count = shifted.pop(tuple(d + 1 for d in stick_key))
         shifted[(0, *(d + 1 for d in stick_key))] = count
     return SpyreTensorLayout(
@@ -275,6 +289,62 @@ def pad_to_whole_groups(stl: SpyreTensorLayout, group_eps: int) -> SpyreTensorLa
         [0, *smap],
         stl.device_dtype,
         shifted,
+        stl.element_arrangement,
+    )
+
+
+def pad_for_downcast_read(
+    stl: SpyreTensorLayout, dep: MemoryDep, group_eps: int
+) -> SpyreTensorLayout:
+    """Size ``stl`` to whole groups for the downcast that reads it through ``dep``.
+
+    The num-sticks dim is the one the read's stick coordinate steps, as
+    ``rescale_stl_for_dtype`` finds it.  A single stick there is given a whole
+    group as a gap dim (``_prepend_gap_group``), since the downcast reads its pair.
+    Any other num-sticks dim is grown to whole groups in place.  A read whose
+    coordinates cannot be found falls back to ``pad_to_whole_groups``.
+    """
+    sizes = list(stl.device_size)
+    eps = sizes[-1]
+    if eps >= group_eps or stl.stride_map[-1] <= 0:
+        return stl
+    per_group = -(-group_eps // eps)
+    coords = try_device_coordinates(stl, dep, None)
+    if not coords:
+        return pad_to_whole_groups(stl, group_eps)
+    stick_vars = coords[-1].free_symbols
+    outer = coords[:-1]
+    dim = next(
+        (d for d, c in enumerate(outer) if c.free_symbols & stick_vars),
+        next((d for d, c in enumerate(outer) if c == sympy.S.Zero), None),
+    )
+    if dim is None:
+        return pad_to_whole_groups(stl, group_eps)
+    if sizes[dim] == 1:
+        if stl.stride_map[dim] != 0:
+            # The single stick's dim becomes the pair: it takes the pair's size and
+            # keeps its stride entry.
+            sizes[dim] = per_group
+            return SpyreTensorLayout(
+                sizes,
+                list(stl.stride_map),
+                stl.device_dtype,
+                dict(stl.valid_elements),
+                stl.element_arrangement,
+            )
+        stick_key = next(
+            (key for key in stl.valid_elements if len(sizes) - 1 in key), None
+        )
+        return _prepend_gap_group(stl, per_group, stick_key)
+    grown = -(-sizes[dim] // per_group) * per_group
+    if grown == sizes[dim]:
+        return stl
+    sizes[dim] = grown
+    return SpyreTensorLayout(
+        sizes,
+        list(stl.stride_map),
+        stl.device_dtype,
+        dict(stl.valid_elements),
         stl.element_arrangement,
     )
 
